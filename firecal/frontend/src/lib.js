@@ -1,5 +1,5 @@
 export const api = (p, q = {}) => fetch("/api" + p + "?" + new URLSearchParams(Object.entries(q).filter(([, v]) => v != null)))
-  .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); });
+  .then(r => { if (!r.ok) throw new Error(r.status + " " + r.statusText); return r.json(); });
 
 export const errMsg = async r => { try { const j = await r.json(); return j.detail || r.statusText; } catch { return r.statusText; } };
 

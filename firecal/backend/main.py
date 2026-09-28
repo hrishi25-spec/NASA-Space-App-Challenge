@@ -32,9 +32,8 @@ app = FastAPI(title="Pyro-Harmony — Burning Activity Calendar")
 app.add_middleware(CORSMiddleware,
                    allow_origins=[o.strip() for o in os.environ.get("ALLOW_ORIGINS", "*").split(",") if o.strip()],
                    allow_methods=["*"], allow_headers=["*"])
-DF = pd.DataFrame()
 CONF_MAP = {"l": 20, "low": 20, "n": 60, "nominal": 60, "h": 90, "high": 90}
-REQUIRED = {"latitude", "longitude", "acq_date", "acq_time"}
+REQUIRED = {"latitude", "longitude", "acq_date", "acq_time", "confidence"}
 
 # Live NASA FIRMS open NRT feeds (public, no key needed) — poster pillar 3.
 FIRMS_24H = ("https://firms.modaps.eosdis.nasa.gov/data/active_fire/")
@@ -72,10 +71,11 @@ def harmonize(raw: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"missing required columns: {', '.join(sorted(missing))}")
     viirs = "bright_ti4" in d.columns
+    bt_col = "bright_ti4" if viirs else "brightness"
     sensor = "VIIRS" if viirs else "MODIS"
     if "instrument" in d.columns and d["instrument"].notna().any():
         sensor = str(d["instrument"].dropna().iloc[0]).upper()
-    # numeric confidence if parseable (MODIS 0-100), else l/n/h map (VIIRS); unknown -> dropped
+    #    numeric confidence if parseable (MODIS 0-100), else l/n/h map (VIIRS); unknown -> dropped
     conf = pd.to_numeric(d["confidence"], errors="coerce")
     if conf.isna().any():
         conf = conf.fillna(d["confidence"].astype(str).str.strip().str.lower().map(CONF_MAP))
@@ -92,13 +92,19 @@ def harmonize(raw: pd.DataFrame) -> pd.DataFrame:
         "time": t, "date": t.dt.normalize(),
         "sensor": sensor, "sat": d.get("satellite", pd.Series(sensor, index=d.index)).astype(str),
         "conf": conf, "frp": pd.to_numeric(d.get("frp", 0), errors="coerce").fillna(0),
-        "bt": d["bright_ti4"] if viirs else d["brightness"],
+        "bt": d[bt_col] if bt_col in d.columns else pd.Series(np.nan, index=d.index),
         "scan": scan.clip(0.1, 20), "track": track.clip(0.1, 20),
         "daynight": d.get("daynight", pd.Series(0, index=d.index)),
         "esfp": esfp, "pixel_km2": area})
     out = out.dropna(subset=["lat", "lon", "time", "conf", "bt"])
     out = out[out.lat.between(-90, 90) & out.lon.between(-180, 180)]
     return out[out.conf >= 30]  # drop low-confidence detections for all sensors
+
+
+# Empty-but-typed frame: a cleared store still answers [] instead of 500.
+EMPTY_DF = harmonize(pd.DataFrame(columns=["latitude", "longitude", "acq_date", "acq_time",
+                                           "confidence", "brightness", "frp", "satellite"]))
+DF = EMPTY_DF.copy()
 
 
 @app.post("/upload")
@@ -154,7 +160,7 @@ def _transition_frames():
 
 @app.delete("/data")
 def clear():
-    global DF; DF = pd.DataFrame(); return meta()
+    global DF; DF = EMPTY_DF.copy(); return meta()
 
 
 @app.get("/meta")
@@ -182,6 +188,7 @@ def parse_bbox(bbox):
 def subset(bbox, start=None, end=None):
     d = DF
     box = parse_bbox(bbox)
+    if d.empty: return d
     if box:
         a, b, c, e = box
         d = d[(d.lat >= a) & (d.lat <= c) & (d.lon >= b) & (d.lon <= e)]
@@ -192,7 +199,9 @@ def subset(bbox, start=None, end=None):
 
 def daily(d):
     """Daily counts; sensors rescaled to the best-covered sensor over their overlap period."""
-    if d.empty: return pd.DataFrame(columns=["count", "raw", "frp"])
+    if d.empty:
+        return pd.DataFrame({"count": pd.Series(dtype=float), "raw": pd.Series(dtype=float),
+                             "frp": pd.Series(dtype=float)}, index=pd.DatetimeIndex([]))
     piv = d.groupby(["date", "sensor"]).size().unstack(fill_value=0)
     ref = (piv > 0).sum().idxmax(); adj = piv.astype(float)
     for s in piv.columns:

@@ -47,6 +47,17 @@ start /b "" cmd /c "cd /d firecal\backend && .venv\Scripts\python.exe -m uvicorn
 start /b "" cmd /c "cd /d firecal\frontend && call npm run dev"
 
 timeout /t 5 /nobreak >nul
+
+rem verify the backend actually came up before opening the browser
+curl -s -o nul -m 3 http://localhost:8000/meta
+if errorlevel 1 (
+    echo.
+    echo   WARNING: backend did not respond on http://localhost:8000 within 3s.
+    echo   The app will open but data loading will fail until the backend is up.
+    echo   Check the backend output above for errors.
+    timeout /t 5 /nobreak >nul
+)
+
 start "" http://localhost:5173
 
 rem keep the window open until stopped
