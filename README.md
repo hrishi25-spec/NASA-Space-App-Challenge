@@ -31,7 +31,6 @@ First, clone the repository:
 
 ```bash
 git clone https://github.com/hrishi25-spec/NASA-Space-App-Challenge.git
-cd NASA-Space-App-Challenge
 ```
 
 Then one command installs dependencies (first run) and starts everything:
