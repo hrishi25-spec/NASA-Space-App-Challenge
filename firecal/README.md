@@ -3,6 +3,10 @@
 React + FastAPI app that harmonizes MODIS and VIIRS active-fire hotspots (NASA FIRMS archive CSVs) into a burning calendar.
 
 ## Run
+    ./start.sh                       # one command: installs deps, runs backend :8000 + frontend :5173, Ctrl+C stops both
+
+Manual, two terminals:
+
     cd backend && pip install -r requirements.txt && uvicorn main:app --reload      # :8000
     cd frontend && npm install && npm run dev                                       # :5173
 
