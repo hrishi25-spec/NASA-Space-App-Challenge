@@ -29,15 +29,18 @@ see when and where burning has happened — and spot unusual seasons early.
 
 One command installs dependencies (first run) and starts everything:
 
-```bash
-./start.sh
-```
+| OS | Command |
+|---|---|
+| Linux / macOS | `./start.sh` |
+| Windows | double-click `start.bat` — or run `start.bat` from cmd (``.\start.bat`` in PowerShell) |
 
 Then open **http://localhost:5173** and click **Load demo data** — 4 years of synthetic
-MODIS + VIIRS data appears in ~1 second. Ctrl+C stops both servers.
+MODIS + VIIRS data appears in ~1 second (the Windows script opens your browser
+automatically). Stop with Ctrl+C in the launcher window (Windows asks `Y`), or just
+close it.
 
 <details>
-<summary>Manual run (two terminals)</summary>
+<summary>Manual run (two terminals, Linux/macOS)</summary>
 
 ```bash
 # Terminal 1 — backend on :8000
@@ -55,10 +58,41 @@ npm run dev
 The Vite dev server proxies `/api` → `:8000` automatically (`firecal/frontend/vite.config.js`).
 </details>
 
+<details>
+<summary>Windows manual run (two terminals)</summary>
+
+`start.bat` does all of this for you — use these steps only if you prefer running the
+servers yourself. Open two PowerShell (or cmd) windows.
+
+```powershell
+# Terminal 1 — backend on :8000
+cd firecal\backend
+py -3 -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python -m uvicorn main:app --reload
+
+# Terminal 2 — frontend on :5173
+cd firecal\frontend
+npm install
+npm run dev
+```
+
+Notes for Windows:
+
+- Use `py -3` (standard Python launcher); if it's missing, use `python -m venv .venv`.
+- Run uvicorn as `.venv\Scripts\python -m uvicorn ...` — more reliable than the
+  `uvicorn.exe` shim.
+- If PowerShell blocks scripts, run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
+  once, or use **cmd** instead (commands are identical).
+- Stop both with Ctrl+C in each terminal.
+
+The Vite dev server proxies `/api` → `:8000` automatically (`firecal/frontend/vite.config.js`).
+</details>
+
 ### Requirements
 
-- Python 3.10+ (CI runs 3.12)
-- Node.js 18+ (CI runs 20)
+- Python 3.10+ (CI runs 3.12) — <https://www.python.org/downloads/> (check **Add to PATH**; the `py -3` launcher comes with it)
+- Node.js 18+ (CI runs 20) — <https://nodejs.org/> (LTS is fine; npm is included)
 
 ## Getting FIRMS data
 
@@ -121,7 +155,8 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
 .
 ├── README.md                       ← you are here
 ├── Nasa Space app challenge.md      ← challenge brief + 4 reference papers
-├── start.sh                        ← one-command dev launcher
+├── start.sh                        ← one-command dev launcher (Linux/macOS)
+├── start.bat                       ← one-command dev launcher (Windows)
 ├── .github/workflows/ci.yml        ← CI (pytest + frontend build)
 └── firecal/
     ├── backend/
@@ -186,6 +221,8 @@ missing-column CSV → 400, valid CSV merge, clear).
 - **CORS errors after deploying** — set `ALLOW_ORIGINS` on the backend to your frontend's origin.
 - **Upload rejected** — check the file has FIRMS columns
   (`latitude, longitude, acq_date, acq_time, confidence`); the error message lists what's missing.
+- **`./start.sh` doesn't work on Windows** — use `start.bat` instead (same one-command
+  behavior), or the manual steps in [Quick start](#quick-start).
 
 ---
 
