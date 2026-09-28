@@ -21,6 +21,7 @@ def test_meta():
     assert m["n"] > 1000 and m["start"] <= m["end"]
     assert set(m["sensors"]) == {"MODIS", "VIIRS"}
     assert len(m["bounds"]) == 4
+    assert m["hfi"] > 0 and m["esfp"] > 0 and m["pixels"] == m["n"]
 
 
 def test_calendar_full_and_bbox():
@@ -40,6 +41,62 @@ def test_clusters():
     cl = client.get("/clusters").json()
     assert cl and all(len(c["hull"]) >= 1 and c["n"] >= 3 for c in cl)
     assert len(cl) <= 300
+    assert all("sensors" in c and "duration_h" in c for c in cl)
+
+
+def test_climatology():
+    c = client.get("/climatology").json()
+    assert c["years"] and c["doy"] and len(c["envelope"]) > 20
+    assert all(k in e for e in c["envelope"] for k in ("p10", "p50", "p90", "p95"))
+    s = c["summary"]
+    assert s and 1 <= s["peak_doy"] <= 366
+    assert 1 <= s["onset_doy"] <= s["cessation_doy"] <= 366
+    # envelope percentiles ordered
+    assert all(e["p10"] <= e["p50"] <= e["p90"] <= e["p95"] for e in c["envelope"][:50])
+
+
+def test_diagnostic_standard_demo():
+    """2020-2024 demo has no pre-2012 era: growth is None, stats still work."""
+    d = client.get("/diagnostic").json()
+    assert d["series"] and d["stats"]["hfi"] > 0
+    assert d["observed_growth_pct"] is None
+    assert d["calibration"] is None
+
+
+def test_diagnostic_transition_demo():
+    """2002-2024 transition demo: observed growth >> adjusted growth."""
+    r = client.post("/demo", params={"mode": "transition"})
+    assert r.status_code == 200
+    assert r.json()["n"] > 50000
+    d = client.get("/diagnostic").json()
+    assert d["observed_growth_pct"] is not None
+    assert d["adjusted_growth_pct"] is not None
+    assert d["observed_growth_pct"] > 100          # raw record surges after 2012
+    assert d["adjusted_growth_pct"] < 25           # harmonized record is stable
+    assert d["calibration"] and d["calibration"]["r2"] is not None
+    client.post("/demo")  # restore the standard demo for the remaining tests
+
+
+def test_live():
+    """Hits real NASA FIRMS 24h feeds; skipped if the network is unavailable."""
+    r = client.get("/live", params={"region": "South_America"})
+    if r.status_code == 502:
+        pytest.skip("FIRMS feeds unreachable")
+    j = r.json()
+    assert j["n"] > 0 and j["feeds"]
+    assert all(k in j for k in ("sensors", "hfi", "rows", "clusters"))
+    assert len(j["rows"]) <= 15000
+
+
+def test_briefing_json_and_markdown():
+    b = client.get("/briefing").json()
+    assert b["threat"]["level"] in ("Low", "Watch", "Elevated", "Critical")
+    assert isinstance(b["streaks"], list) and isinstance(b["biomes"], list)
+    assert all(k in s for s in b["streaks"] for k in ("start", "end", "days", "max_z", "total"))
+    assert all(k in x for x in b["biomes"] for k in ("kind", "n", "mean_frp", "centroid"))
+    assert b["recommendations"]
+    r = client.get("/briefing", params={"format": "markdown"})
+    assert r.status_code == 200 and "Briefing" in r.text
 
 
 def test_anomalies():
