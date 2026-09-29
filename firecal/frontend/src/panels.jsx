@@ -1,16 +1,18 @@
 import React, { useEffect, useState } from "react";
-import {
-  LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, BarChart, Bar,
-  CartesianGrid, ReferenceArea, Legend
-} from "recharts";
-import { AreaChart, Area, ComposedChart } from "recharts";
-import { api, doyLabel, errMsg, fmt } from "./lib";
+import { api, errMsg, fmt } from "./lib";
+
+/* Chart panels (climatology, illusion diagnostic) live in charts.jsx so Recharts is
+   only fetched when a chart tab is opened. Everything here is chart-free. */
+
+/* Letter-case rule for this file: micro-labels and prose go in sentence case and let
+   CSS uppercase them (see the contract at the top of styles.css). Acronyms are always
+   written in full caps -- HFII, ESFP, FRP, MODIS, VIIRS, DBSCAN, FIRMS, MW. */
 
 /* ---------------- Hero stats (left rail telemetry) ---------------- */
-export function HeroStats({ meta, diag }) {
+export function HeroStats({ meta }) {
   const items = [
-    { k: "HFII", v: fmt(diag?.stats?.hfi ?? meta?.hfi), cls: "acc", s: "harmonized fire intensity" },
-    { k: "ESFP", v: fmt(diag?.stats?.esfp ?? meta?.esfp), cls: "cyan", s: "equivalent std pixels" },
+    { k: "HFII", v: fmt(meta?.hfi), cls: "acc", s: "harmonized fire intensity" },
+    { k: "ESFP", v: fmt(meta?.esfp), cls: "cyan", s: "equivalent std pixels" },
     { k: "Hotspots", v: fmt(meta?.n), cls: "", s: `${Object.keys(meta?.sensors || {}).length} sensor record(s)` },
     { k: "Span", v: meta?.start ?? "—", cls: "", s: meta?.end ? `→ ${meta.end}` : "upload CSVs" },
   ];
@@ -26,102 +28,7 @@ export function HeroStats({ meta, diag }) {
   </div>;
 }
 
-/* ------------- 1. Multi-decadal DOY climatology + percentile envelope ------------- */
-export function ClimatologyPanel({ bbox, onPickDay, refreshKey, embedded }) {
-  const [c, setC] = useState(null);
-  const [err, setErr] = useState(null);
-  useEffect(() => {
-    let dead = false;
-    api("/climatology", { bbox }).then(r => { if (!dead) { setC(r); setErr(null); } })
-      .catch(() => !dead && setErr("Climatology unavailable (need ≥60 days of data)."));
-    return () => { dead = true; };
-  }, [bbox, refreshKey]);
-  const body = () => {
-    if (err) return <span className="hint">{err}</span>;
-    if (!c || !c.summary) return <span className="hint">Analyzing…</span>;
-    const peak = c.summary.peak_doy;
-    const chartData = c.envelope.map(e => ({ ...e, label: doyLabel(e.doy) }));
-    return <>
-      <div className="hint" style={{ marginBottom: 6 }}>
-        peak <b style={{ color: "var(--acc)" }}>{peak ? doyLabel(peak) : "—"}</b> · onset {c.summary.onset_doy ? doyLabel(c.summary.onset_doy) : "—"} ·
-        cessation {c.summary.cessation_doy ? doyLabel(c.summary.cessation_doy) : "—"} · 10th/50th/90th/95th percentiles, 15-day window
-      </div>
-      <div style={{ height: 250 }}>
-        <ResponsiveContainer>
-          <AreaChart data={chartData} margin={{ top: 8, right: 12, bottom: 0, left: -10 }}>
-            <CartesianGrid stroke="#141c30" />
-            <XAxis dataKey="doy" tickFormatter={doyLabel} minTickGap={30} />
-            <YAxis />
-            <Tooltip labelFormatter={d => "DOY " + d + " · " + doyLabel(d)} contentStyle={{ background: "#0a0f1aee", border: "1px solid #26334f" }} />
-            <Legend />
-            <Area type="monotone" dataKey="p95" stackId="env" stroke="none" fill="#3a1d10" fillOpacity={0.7} name="95th pct band" baseLine={0} />
-            <Area type="monotone" dataKey="p90" stackId="env" stroke="none" fill="#57240f" fillOpacity={0.8} name="90th pct band" baseLine={0} />
-            <Area type="monotone" dataKey="p50" stroke="#ff7a2f" fill="none" strokeWidth={2} name="median" dot={false} />
-            <Area type="monotone" dataKey="p10" stroke="#37e5ff" fill="none" strokeDasharray="4 3" name="10th pct" dot={false} />
-          </AreaChart>
-        </ResponsiveContainer>
-      </div>
-      <div className="hint" style={{ marginTop: 6 }}>
-        Shaded band = {`\u226590th`} percentile envelope (extreme fire days).
-        Fire season {c.summary.onset_doy ? `${doyLabel(c.summary.onset_doy)} \u2192 ${doyLabel(c.summary.cessation_doy)}` : "n/a"}.
-      </div>
-    </>;
-  };
-  if (embedded) return body();
-  return <div className="panel wide"><h3>Seasonal climatology</h3>{body()}</div>;
-}
-
-/* ------------- 2. Sensor Transition Illusion diagnostic ------------- */
-export function DiagnosticPanel({ bbox, refreshKey, embedded }) {
-  const [d, setD] = useState(null);
-  useEffect(() => { api("/diagnostic", { bbox }).then(setD).catch(() => setD({ series: [] })); }, [bbox, refreshKey]);
-  const body = () => {
-    if (!d || !d.series?.length) return <span className="hint">No data loaded.</span>;
-    const data = d.series.map(s => ({ ...s, rawM: s.modis / 1000, viirsM: s.viirs / 1000, adjM: s.adjusted / 1000 }));
-    const hasPre = d.pre_2012_days > 0;
-    return <>
-      <div style={{ height: 260 }}>
-        <ResponsiveContainer>
-          <ComposedChart data={data} margin={{ top: 8, right: 12, bottom: 0, left: -10 }}>
-            <CartesianGrid stroke="#141c30" />
-            <XAxis dataKey="year" />
-            <YAxis label={{ value: "detections (k)", angle: -90, position: "insideLeft", fill: "#5f6b85", fontSize: 10 }} />
-            <Tooltip contentStyle={{ background: "#0a0f1aee", border: "1px solid #26334f" }} />
-            <Legend />
-            <Bar dataKey="modis" name="MODIS raw" fill="#37e5ff" fillOpacity={0.8} />
-            <Bar dataKey="viirs" name="VIIRS raw" fill="#ff5c6c" fillOpacity={0.8} />
-            <Line type="monotone" dataKey="adjusted" name="harmonized" stroke="#ff7a2f" strokeWidth={2.5} dot={false} />
-          </ComposedChart>
-        </ResponsiveContainer>
-      </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 8, marginTop: 10 }}>
-        <Stat k="Observed post-2012 surge" v={d.observed_growth_pct == null ? "n/a (no pre-2012 era)" : `+${d.observed_growth_pct}%`} bad={d.observed_growth_pct > 100} />
-        <Stat k="After harmonization" v={d.adjusted_growth_pct == null ? "—" : `+${d.adjusted_growth_pct}%`} bad={false} />
-        <Stat k="Artifact removed" v={d.artifact_pct == null ? "—" : `${d.artifact_pct} pp`} />
-        <Stat k="VIIRS scaling factor" v={d.viirs_scaling ?? "—"} />
-      </div>
-      {d.calibration && <div className="hint" style={{ marginTop: 8 }}>
-        Cross-calibration (2012–2015 overlap, {d.calibration.matched_fires.toLocaleString()} matchups): daily-count R² = {d.calibration.r2 ?? "—"},
-        RMSE {d.calibration.rmse_mw ?? "—"} MW, VIIRS/MODIS FRP ratio {d.calibration.frp_ratio_viirs_to_modis},
-        ESFP ratio {d.calibration.esfp_ratio_viirs_to_modis}.
-      </div>}
-      {!hasPre && <div className="hint" style={{ marginTop: 6 }}>
-        This dataset starts after 2012, so the illusion can't be measured. Load the transition demo (or 2002+ archives) to see it.
-      </div>}
-    </>;
-  };
-  if (embedded) return body();
-  return <div className="panel wide"><h3>Sensor Transition Illusion</h3>{body()}</div>;
-}
-
-function Stat({ k, v, bad }) {
-  return <div className="stat">
-    <div className="k">{k}</div>
-    <div style={{ fontWeight: 700, fontSize: 16, color: bad ? "#ff5c6c" : "#3dffb0" }}>{v}</div>
-  </div>;
-}
-
-/* ------------- 3. Live FIRMS feed panel ------------- */
+/* ------------- Live FIRMS feed panel ------------- */
 const REGIONS = ["Global", "South_East_Asia", "South_America", "North_and_Central_America",
   "Africa", "Europe", "Northern_and_Central_Australia", "South_Asia"];
 
@@ -143,8 +50,12 @@ export function LivePanel({ onLoaded, wide }) {
     setBusy(false);
   }
 
+  const clusters = res?.clusters || [];
+  const feeds = res?.feeds || [];
+  const sensors = Object.entries(res?.sensors || {});
+
   return <div className="panel" style={wide ? { gridColumn: "1/-1" } : null}>
-    <h3>Live FIRMS 24h feed
+    <h3>Live FIRMS 24 h feed
       <span className="mut">MODIS C6.1 + VIIRS S-NPP/NOAA-20/NOAA-21 · on-the-fly harmonization + DBSCAN</span>
       <span className="tools">
         <select value={region} onChange={e => setRegion(e.target.value)}>
@@ -155,31 +66,48 @@ export function LivePanel({ onLoaded, wide }) {
         </button>
       </span>
     </h3>
-    {busy && <div className="hint">Downloading 24h CSVs from FIRMS, harmonizing, clustering…</div>}
+    {busy && <div className="hint">Downloading 24 h CSVs from FIRMS, harmonizing, clustering…</div>}
     {err && <div className="errbox">⚠ {err}</div>}
     {res && <>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 8, marginBottom: 8 }}>
-        <div className="stat"><div className="k">Feeds OK</div><div style={{ fontWeight: 700, fontSize: 14, color: "#3dffb0" }}>{res.feeds.join(", ")}</div></div>
-        <div className="stat"><div className="k">HFII (24h)</div><div className="v acc" style={{ fontSize: 18 }}>{fmt(res.hfi)}</div></div>
-        <div className="stat"><div className="k">Fire clusters (DBSCAN)</div><div className="v cyan" style={{ fontSize: 18 }}>{res.clusters.length}</div></div>
-        <div className="stat"><div className="k">Detections</div><div style={{ fontWeight: 700, fontSize: 18 }}>{res.n.toLocaleString()}</div>
-          <div className="s">{Object.entries(res.sensors).map(([k, v]) => `${k}: ${fmt(v)}`).join(" · ")}</div></div>
+        <div className="stat"><div className="k">Feeds online</div>
+          <div style={{ fontWeight: 700, fontSize: 14, color: "#8fd6a4" }}>{feeds.join(", ") || "none"}</div></div>
+        <div className="stat"><div className="k">HFII (24 h)</div><div className="v acc" style={{ fontSize: 18 }}>{fmt(res.hfi)}</div></div>
+        <div className="stat"><div className="k">Clusters (DBSCAN)</div><div className="v cyan" style={{ fontSize: 18 }}>{clusters.length}</div></div>
+        <div className="stat"><div className="k">Detections</div><div style={{ fontWeight: 700, fontSize: 18 }}>{fmt(res.n)}</div>
+          <div className="s">{sensors.map(([k, v]) => `${k}: ${fmt(v)}`).join(" · ")}</div></div>
       </div>
       {res.errors?.length > 0 && <div className="hint">Feed errors: {res.errors.join("; ")}</div>}
       <div className="hint">
-        Top clusters: {res.clusters.slice(0, 3).map(c => `(${c.lat.toFixed(2)}, ${c.lon.toFixed(2)}) ×${c.n}`).join(" · ") || "none"}
+        Top clusters: {clusters.slice(0, 3).map(c => `(${c.lat.toFixed(2)}, ${c.lon.toFixed(2)}) ×${c.n}`).join(" · ") || "none"}
       </div>
     </>}
   </div>;
 }
 
-/* ------------- 4. Incident Commander briefing ------------- */
+/* ------------- Incident Commander briefing ------------- */
+
+// Threat ladder -> colour. A lookup beats a nested ternary: adding a level later can't
+// silently fall through to the wrong colour.
+const THREAT_COLOR = { Critical: "#e88a8a", Elevated: "#e9c46a", Watch: "#f2a65a" };
+const OK_COLOR = "#8fd6a4";
+
+/** The four sections of the report, shown one at a time so a long briefing stays readable. */
+const BRIEFING_TABS = [
+  { id: "situation", label: "Situation" },
+  { id: "streaks", label: "Critical streaks" },
+  { id: "fuel", label: "Fuel types" },
+  { id: "actions", label: "Actions" },
+];
+
 export function BriefingPanel({ bbox, onPickDay, refreshKey, mini, detail }) {
   const [b, setB] = useState(null);
   const [note, setNote] = useState(null);
   const [copied, setCopied] = useState(false);
-  const load = (fmt2, cb) => api("/briefing", { bbox, format: fmt2 }).then(cb).catch(() => setNote("Briefing needs ≥60 days of data."));
-  useEffect(() => { setNote(null); load("json", setB); }, [bbox, refreshKey]);
+  const [sub, setSub] = useState("situation");
+  const load = (format, cb) => api("/briefing", { bbox, format }).then(cb)
+    .catch(() => setNote("Briefing needs ≥ 60 days of data."));
+  useEffect(() => { setNote(null); setB(null); load("json", setB); }, [bbox, refreshKey]);
 
   async function copyMd() {
     try {
@@ -191,46 +119,132 @@ export function BriefingPanel({ bbox, onPickDay, refreshKey, mini, detail }) {
     } catch { setNote("Could not fetch markdown."); }
   }
 
-  if (note) return mini ? <div className="panel"><h3>IC Briefing</h3><span className="hint">{note}</span></div> : note;
-  if (!b) return mini ? <div className="panel"><h3>IC Briefing</h3><span className="hint">Analyzing…</span></div> : null;
-  const threatColor = b.threat.level === "Critical" ? "#ff5c6c" : b.threat.level === "Elevated" ? "#ffcf5c" : b.threat.level === "Watch" ? "#ff7a2f" : "#3dffb0";
-  const recs = mini ? b.recommendations.slice(0, 2) : b.recommendations;
-  const streaks = mini ? b.streaks.slice(0, 3) : b.streaks;
+  const shell = body => mini
+    ? <div className="panel"><h3>IC Briefing <span className="mut">incident commander</span></h3>{body}</div>
+    : body;
 
-  const content = <>
+  if (note) return shell(<span className="hint">{note}</span>);
+  if (!b) return shell(<span className="hint">Analyzing the record…</span>);
+
+  // A thin window returns {note, threat, streaks, biomes, recommendations} with no record
+  // or recent block, so every optional block is read defensively.
+  if (b.note) return shell(<span className="hint">{b.note} — load a longer record to brief on it.</span>);
+
+  const level = b.threat?.level ?? "Unknown";
+  const threatColor = THREAT_COLOR[level] || OK_COLOR;
+  const recs = b.recommendations || [];
+  const streaks = b.streaks || [];
+  const biomes = b.biomes || [];
+
+  const threatCard = <div className="stat" style={{ flex: "0 0 auto", minWidth: 130 }}>
+    <div className="k">Threat</div>
+    <div style={{ fontWeight: 700, fontSize: 17, color: threatColor, textShadow: `0 0 14px ${threatColor}44` }}>{level}</div>
+    <div className="s">score {b.threat?.score ?? "—"}</div>
+  </div>;
+
+  const recordRows = <>
+    <div className="kv"><span className="mut">Record mean</span><b>{b.record?.mean_daily ?? "—"}/day over {b.record?.days ?? "—"} d</b></div>
+    <div className="kv"><span className="mut">Last 30 days</span><b>{b.recent?.mean_daily ?? "—"}/day · peak {b.recent?.max_daily ?? "—"}</b></div>
+  </>;
+
+  const streakList = (limit, height) => <div className="list" style={{ maxHeight: height }}>
+    {streaks.length === 0 && <div className="hint">None detected at this threshold — routine monitoring is sufficient.</div>}
+    {streaks.slice(0, limit).map(s => <div key={s.start} className="row" onClick={() => onPickDay?.(s.start)}
+      title={`Jump the map to ${s.start}`}>
+      <span>{s.start} → {s.end} · {s.days} d</span><span className="mut">peak z {s.max_z} · {s.total} fires</span>
+    </div>)}
+  </div>;
+
+  const biomeList = <div className="list" style={{ maxHeight: 200 }}>
+    {biomes.length === 0 && <div className="hint">Not enough clustered detections to stratify.</div>}
+    {biomes.map((x, i) => <div key={i} className="row" style={{ cursor: "default" }}>
+      <span><b style={{ color: "#7fd1c8" }}>{x.kind}</b> · {x.n.toLocaleString()} fires</span>
+      <span className="mut">mean FRP {x.mean_frp} MW · spread ~{x.spread_km} km</span>
+    </div>)}
+  </div>;
+
+  /* ---- compact rail version: the headline only, no sub-tabs ---- */
+  if (mini) return shell(<>
     <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8, flexWrap: "wrap" }}>
-      <div className="stat" style={{ flex: "0 0 auto", minWidth: 130 }}>
-        <div className="k">Threat</div>
-        <div style={{ fontWeight: 700, fontSize: 17, color: threatColor, textShadow: `0 0 14px ${threatColor}44` }}>{b.threat.level}</div>
-        <div className="s">score {b.threat.score}</div>
-      </div>
-      <div className="hint">
-        record {b.record.mean_daily}/day · {b.record.days}d<br />
-        last 30d {b.recent.mean_daily}/day (peak {b.recent.max_daily})
-      </div>
+      {threatCard}
+      <div style={{ flex: "1 1 130px", minWidth: 0 }}>{recordRows}</div>
+    </div>
+    <div className="hint" style={{ margin: "2px 0" }}>Critical streaks (z ≥ 2σ)</div>
+    {streakList(3, 120)}
+    <div className="recs" style={{ marginTop: 8 }}>
+      {recs.slice(0, 2).map((r, i) => <div key={i}>{r}</div>)}
+    </div>
+  </>);
+
+  /* ---- drawer version: the whole report, split across sub-tabs ---- */
+  const body = <div style={{ maxWidth: 900 }}>
+    <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
+      {threatCard}
+      <div style={{ flex: "1 1 240px", minWidth: 0 }}>{recordRows}</div>
       <span className="tools" style={{ marginLeft: "auto" }}>
         <button className="btn sm" onClick={copyMd}>{copied ? "Copied ✓" : "Copy MD"}</button>
       </span>
     </div>
-    <div className="hint" style={{ margin: "2px 0" }}>Critical streaks (Z ≥ 2σ):</div>
-    <div className="list" style={{ maxHeight: mini ? 120 : 180 }}>
-      {streaks.length === 0 && <div className="hint">None at this threshold.</div>}
-      {streaks.map(s => <div key={s.start} className="row" onClick={() => onPickDay && onPickDay(s.start)}>
-        <span>{s.start} → {s.end} ({s.days}d)</span><span className="mut">z {s.max_z} · {s.total}</span>
-      </div>)}
-    </div>
-    {!mini && b.biomes.length > 0 && <div style={{ marginTop: 8 }}>
-      <div className="hint">Dominant fuel biomes (K-means on location + FRP):</div>
-      {b.biomes.slice(0, 4).map((x, i) => <div key={i} style={{ fontSize: 12 }}>
-        <b style={{ color: "var(--acc2)" }}>{x.kind}</b> — {x.n} fires, mean FRP {x.mean_frp} MW, spread ~{x.spread_km} km
-      </div>)}
-    </div>}
-    <div className="recs" style={{ marginTop: 8 }}>
-      {recs.map((r, i) => <div key={i}>{r}</div>)}
-    </div>
-  </>;
 
-  if (mini) return <div className="panel"><h3>IC Briefing <span className="mut">incident commander</span></h3>{content}</div>;
-  if (detail) return content;
-  return <div className="panel"><h3>IC Briefing</h3>{content}</div>;
+    <div className="tabs sub" role="tablist" aria-label="Briefing sections">
+      {BRIEFING_TABS.map(t => {
+        const n = t.id === "streaks" ? streaks.length : t.id === "fuel" ? biomes.length : t.id === "actions" ? recs.length : null;
+        return <button key={t.id} role="tab" aria-selected={sub === t.id}
+          className={"tab" + (sub === t.id ? " on" : "")} onClick={() => setSub(t.id)}>
+          {t.label}{n !== null && <span className="count">{n}</span>}
+        </button>;
+      })}
+    </div>
+
+    {sub === "situation" && <div>
+      <div className="hint" style={{ marginBottom: 9 }}>
+        Threat is a blend of the strongest anomaly, how long burning conditions persisted, and how
+        hard the last 30 days are running against the multi-year record.
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 8 }}>
+        <div className="stat"><div className="k">Strongest anomaly</div>
+          <div className="v acc" style={{ fontSize: 18 }}>{streaks[0] ? `z ${streaks[0].max_z}` : "—"}</div></div>
+        <div className="stat"><div className="k">Anomalous days</div>
+          <div className="v" style={{ fontSize: 18 }}>{streaks.reduce((s, x) => s + x.days, 0)}</div></div>
+        <div className="stat"><div className="k">Critical windows</div>
+          <div className="v cyan" style={{ fontSize: 18 }}>{streaks.length}</div></div>
+        <div className="stat"><div className="k">Recent vs record</div>
+          <div className="v" style={{ fontSize: 18 }}>{ratioLabel(b.recent?.mean_daily, b.record?.mean_daily)}</div></div>
+      </div>
+      <div className="hint" style={{ marginTop: 9 }}>
+        Record window {b.record?.days ?? "—"} d · mean {b.record?.mean_daily ?? "—"} fires/day ·
+        last 30 d mean {b.recent?.mean_daily ?? "—"}/day, peak {b.recent?.max_daily ?? "—"}.
+      </div>
+    </div>}
+
+    {sub === "streaks" && <>
+      <div className="hint" style={{ marginBottom: 9 }}>
+        Consecutive days where burning ran at z ≥ 2σ above the seasonal norm, longest gap 2 days. Click a window to jump the map to it.
+      </div>
+      {streakList(10, 260)}
+    </>}
+
+    {sub === "fuel" && <>
+      <div className="hint" style={{ marginBottom: 9 }}>
+        Dominant fuel biomes — K-means stratified on location and fire radiative power.
+      </div>
+      {biomeList}
+    </>}
+
+    {sub === "actions" && <>
+      <div className="hint" style={{ marginBottom: 9 }}>Recommended actions, highest priority first.</div>
+      <div className="recs">{recs.map((r, i) => <div key={i}>{r}</div>)}</div>
+      {recs.length === 0 && <div className="hint">No actions flagged — conditions are within climatological norms.</div>}
+    </>}
+  </div>;
+
+  return detail ? body : <div className="panel"><h3>IC Briefing</h3>{body}</div>;
+}
+
+/** Recent-vs-record mean, phrased as a percentage swing: "+41%", "−12%", or "—". */
+function ratioLabel(recent, record) {
+  if (!record || recent == null) return "—";
+  const pct = Math.round((recent / record - 1) * 100);
+  const arrow = pct > 0 ? "+" : "−";
+  return `${arrow}${Math.abs(pct)}%`;
 }

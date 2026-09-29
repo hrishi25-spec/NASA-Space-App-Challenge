@@ -1,29 +1,35 @@
-import React, { useEffect, useMemo, useState } from "react";
-import { MapContainer, TileLayer, CircleMarker, Polygon, Rectangle, useMapEvents } from "react-leaflet";
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
-import { api, errMsg, ramp, fmt } from "./lib";
-import { HeroStats, ClimatologyPanel, DiagnosticPanel, LivePanel, BriefingPanel } from "./panels";
-import LiveMapLayer from "./liveMapLayer";
-import GlobeLayer from "./GlobeLayer";
+import React, { useEffect, useMemo, useState, Suspense, lazy } from "react";
+import { api, errMsg, ramp, fmt, invalidateApiCache } from "./lib";
+import { HeroStats, LivePanel, BriefingPanel } from "./panels";
 
-const TILES = {
-  dark: "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
-  sat: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-};
-const TILE_ATTR = {
-  dark: "© Esri Dark Gray Canvas",
-  sat: "© Esri World Imagery",
-};
+// Code-split the heavy optional pieces so a low-end machine can paint the console
+// before it downloads a map engine or a charting library. MissionMap drags in
+// MapLibre (~450 KB gzipped), charts/ForecastChart drag in Recharts — none of them
+// are needed to show the shell, and Recharts is not needed until a chart tab opens.
+const MissionMap = lazy(() => import("./MissionMap"));
+// charts.jsx exposes NAMED exports only, and React.lazy resolves `module.default`.
+// Wrapping a multi-export module directly yields `undefined` as a component type,
+// which throws inside <Suspense> and (without a boundary) blanks the whole console.
+const ClimatologyPanel = lazy(() => import("./charts").then(m => ({ default: m.ClimatologyPanel })));
+const DiagnosticPanel = lazy(() => import("./charts").then(m => ({ default: m.DiagnosticPanel })));
+const ForecastChart = lazy(() => import("./ForecastChart"));
 
-function Picker({ on, onBox }) {
-  const [a, setA] = useState(null);
-  useEffect(() => { if (!on) setA(null); }, [on]);  // reset stale first corner when picker toggles off
-  useMapEvents({ click(e) {
-    if (!on) return;
-    if (!a) return setA(e.latlng);
-    onBox([Math.min(a.lat, e.latlng.lat), Math.min(a.lng, e.latlng.lng), Math.max(a.lat, e.latlng.lat), Math.max(a.lng, e.latlng.lng)]); setA(null);
-  } });
-  return null;
+/**
+ * Keeps a single failing tab from taking the entire mission console down with it:
+ * a render error in one lazy chart shows an inline message instead of a blank page.
+ */
+class PanelBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(error) { return { error }; }
+  componentDidCatch(error) { console.error("[panel]", this.props.name, error); }
+  componentDidUpdate(prev) { if (prev.resetKey !== this.props.resetKey && this.state.error) this.setState({ error: null }); }
+  render() {
+    if (!this.state.error) return this.props.children;
+    return <div className="hint">
+      This panel hit an error and was contained so the rest of the console keeps working.
+      <div className="mut" style={{ marginTop: 4 }}>{String(this.state.error && this.state.error.message || this.state.error)}</div>
+    </div>;
+  }
 }
 
 function Heatmap({ data, onPick, focus, year }) {
@@ -35,11 +41,10 @@ function Heatmap({ data, onPick, focus, year }) {
   if (year && year !== "all" && years[year]) return <YearView year={year} days={years[year]} onPick={onPick} focus={focus} />;
   return <div className="scroll">{Object.entries(years).map(([y, days]) => {
     const off = new Date(y + "-01-01").getUTCDay();
-    return <div key={y} style={{ display: "flex", gap: 10, marginBottom: 6, alignItems: "center" }}>
-      <b style={{ width: 34 }} className="mut">{y}</b>
+    return <div key={y} style={{ display: "flex", gap: 10, marginBottom: 6, alignItems: "center" }}>          <b style={{ width: 34 }} className="mut">{y}</b>
       <svg width={Math.ceil((days.length + off) / 7) * 12 + 2} height={7 * 12}>
         {days.map((d, i) => { const k = i + off; return <rect key={d.date} x={Math.floor(k / 7) * 12} y={(k % 7) * 12} width="10" height="10" rx="2"
-          fill={ramp[d.lvl]} stroke={d.date === focus ? "#37e5ff" : "none"} onClick={() => onPick(d.date)}><title>{d.date}: {d.count} (raw {d.raw})</title></rect>; })}
+          fill={ramp[d.lvl]} stroke={d.date === focus ? "#7fd1c8" : "none"} onClick={() => onPick(d.date)}><title>{d.date}: {d.count} (raw {d.raw})</title></rect>; })}
       </svg></div>;
   })}</div>;
 }
@@ -79,25 +84,38 @@ function YearView({ year, days, onPick, focus }) {
     </div>
     <div className="scroll">
       <svg width={W} height={H}>
-        {mlabels.map(l => <text key={l.m} x={labelW + l.col * pitch} y={11} fontSize={9} fill="#5f6b85" style={{ letterSpacing: 1 }}>{MONTHS[l.m].toUpperCase()}</text>)}
-        {["M", "W", "F"].map((w, i) => <text key={w} x={4} y={top + (i * 2 + 1) * pitch + 11} fontSize={8} fill="#5f6b85">{w}</text>)}
+        {mlabels.map(l => <text key={l.m} x={labelW + l.col * pitch} y={11} fontSize={9} fill="#7b8c92" style={{ letterSpacing: 1 }}>{MONTHS[l.m].toUpperCase()}</text>)}
+        {["M", "W", "F"].map((w, i) => <text key={w} x={4} y={top + (i * 2 + 1) * pitch + 11} fontSize={8} fill="#7b8c92">{w}</text>)}
         {cells.map(d => <rect key={d.date} x={d.x} y={d.y} width={size} height={size} rx={2} fill={ramp[d.lvl]}
-          stroke={d.date === focus ? "#37e5ff" : "none"} strokeWidth={2} style={{ cursor: "pointer" }} onClick={() => onPick(d.date)}>
+          stroke={d.date === focus ? "#7fd1c8" : "none"} strokeWidth={2} style={{ cursor: "pointer" }} onClick={() => onPick(d.date)}>
           <title>{d.date}: {d.count} (raw {d.raw} · FRP {d.frp})</title></rect>)}
       </svg>
     </div>
   </>;
 }
 
-const DRAWER_TABS = ["calendar", "forecast", "climatology", "diagnostic", "briefing"];
+// Tab id + source-case label in one place, so the casing pass can never miss one of them
+// (styles.css uppercases .tab). The expensive chart chunks are also warmed on hover/focus:
+// opening a cold tab otherwise means downloading Recharts (~108 kB gzipped) before anything
+// appears, and the module registry makes a repeated prefetch free.
+const DRAWER_TABS = [
+  { id: "calendar", label: "Burning calendar" },
+  { id: "forecast", label: "Forecast", prefetch: () => import("./ForecastChart") },
+  { id: "climatology", label: "Climatology", prefetch: () => import("./charts") },
+  { id: "diagnostic", label: "Illusion diagnostic", prefetch: () => import("./charts") },
+  { id: "briefing", label: "Briefing detail" },
+];
 
 export default function App() {
   const [meta, setMeta] = useState({ n: 0 }), [bbox, setBbox] = useState(null), [pick, setPick] = useState(false);
   const [cal, setCal] = useState([]), [pts, setPts] = useState([]), [cl, setCl] = useState([]), [an, setAn] = useState(null), [fc, setFc] = useState(null);
   const [day, setDay] = useState(null), [span, setSpan] = useState(1), [busy, setBusy] = useState(false), [err, setErr] = useState(null);
   const [live, setLive] = useState(null), [diagKey, setDiagKey] = useState(0), [yearSel, setYearSel] = useState("all");
-  const [tiles, setTiles] = useState("dark"), [tab, setTab] = useState("calendar");
-  const [globe, setGlobe] = useState(true);   // start on the globe; zooming in flips to the flat map
+  // Bumped whenever the dataset itself is replaced. The reload effect keyed on meta.n alone
+  // would not re-run when you load a demo with the same hotspot count, leaving the cursor day
+  // null and the calendar empty, so the dataset gets its own version counter.
+  const [dataKey, setDataKey] = useState(0);
+  const [tiles, setTiles] = useState("sat"), [tab, setTab] = useState("calendar");
   const bb = bbox?.join(",");
 
   useEffect(() => { api("/meta").then(setMeta).catch(() => { /* intro card covers the down state */ }); }, []);
@@ -110,7 +128,7 @@ export default function App() {
     setFc(null); api("/forecast", { bbox: bb }).then(setFc).catch(() => setFc(null));
     setYearSel("all");
     setDiagKey(k => k + 1);
-  }, [meta.n, bb]);
+  }, [meta.n, dataKey, bb]);
   async function loadDemo(mode) {
     setBusy(true); setDay(null); setBbox(null); setErr(null);
     try {
@@ -120,6 +138,8 @@ export default function App() {
         throw new Error(msg === "Method Not Allowed" ? "wrong HTTP method" : msg);
       }
       setMeta(await r.json());
+      invalidateApiCache();          // the dataset changed: every cached query is stale
+      setDataKey(k => k + 1);
       setDiagKey(k => k + 1);
     } catch (e) { setErr("Could not load demo data — " + (e && e.message && e.message !== "Failed to fetch" ? e.message : "the API server isn't reachable on :8000. Start it with start.bat / start.sh (backend: uvicorn main:app --port 8000), then try again.")); }
     setBusy(false);
@@ -140,18 +160,12 @@ export default function App() {
     try {
       const r = await fetch("/api/upload", { method: "POST", body: fd });
       if (!r.ok) setErr("Upload failed: " + await errMsg(r));
-      else { setMeta(await r.json()); setDay(null); setDiagKey(k => k + 1); }
+      else { setMeta(await r.json()); invalidateApiCache(); setDay(null); setDataKey(k => k + 1); setDiagKey(k => k + 1); }
     } catch { setErr("Upload failed — could not reach the backend."); }
     setBusy(false); e.target.value = "";
   }
   const series = useMemo(() => cal.slice(-365).map(d => ({ date: d.date, actual: d.count })).concat((fc?.forecast || []).map(d => ({ date: d.date, forecast: d.count }))), [cal, fc]);
   const center = meta.bounds ? [(meta.bounds[0] + meta.bounds[2]) / 2, (meta.bounds[1] + meta.bounds[3]) / 2] : [0, 0];
-  // globe markers: live feed if pulled, else the day's cluster centroids, else dataset centroid
-  const globeMarkers = useMemo(() => {
-    if (live?.rows?.length) return live.rows.map(p => ({ lat: p.lat, lon: p.lon, frp: p.frp }));
-    if (cl.length) return cl.map(c => ({ lat: c.lat, lon: c.lon, frp: c.frp }));
-    return meta.n ? [{ lat: center[0], lon: center[1], frp: meta.hfi }] : [];
-  }, [live, cl, meta.n, center[0], center[1]]);
 
   return <>
     <header className="cmd">
@@ -213,35 +227,22 @@ export default function App() {
 
         {/* ------- center: globe <-> map stage ------- */}
         <div className="stage">
-          {globe ? <GlobeLayer markers={globeMarkers} center={center} onZoomIn={() => setGlobe(false)} /> : <>
-            <div className="zoomOutHint" style={{ position: "absolute", top: 10, right: 10, zIndex: 3 }}>
-              <button className="btn sm" onClick={() => setGlobe(true)}>⤢ Globe view</button>
-            </div>
-          <div className="chip tl">
-            <span className="dot" style={{ background: "#ff4d4d" }} />MODIS
-            <span className="dot" style={{ background: "#ffb347" }} />VIIRS
-            <span className="dot" style={{ background: "#ffd166" }} />LIVE
-            <span className="dot" style={{ background: "#fff" }} />CLUSTER
-          </div>
-          <MapContainer key={center.join(",") + tiles} center={center} zoom={5} className="map" preferCanvas>
-            <TileLayer url={TILES[tiles]} attribution={TILE_ATTR[tiles]} />
-            <Picker on={pick} onBox={b => { setBbox(b); setPick(false); }} />
-            {bbox && <Rectangle bounds={[[bbox[0], bbox[1]], [bbox[2], bbox[3]]]} pathOptions={{ color: "#37e5ff", weight: 1.5, fill: false, dashArray: "4 4" }} />}
-            {pts.map((p, i) => <CircleMarker key={i} center={[p.lat, p.lon]} radius={2} pathOptions={{ color: p.sensor === "VIIRS" ? "#ffb347" : "#ff4d4d", weight: 1, fillOpacity: 0.85 }} />)}
-            {cl.map(c => <Polygon key={c.id} positions={c.hull} pathOptions={{ color: "#e8e6e3", weight: 1, fillOpacity: 0.18 }} />)}
-            <LiveMapLayer live={live} />
-          </MapContainer>
-          <div className="scan" />
-          <div className="chip br">
-            <b>{day || "—"}</b>{span > 1 && <>→ <b>{end}</b></>}
-            <span>· {fmt(pts.length)} pts · {cl.length} clusters</span>
-            <span className="tools" style={{ marginLeft: 6 }}>
-              <button className={"btn sm" + (tiles === "dark" ? " on" : "")} onClick={() => setTiles("dark")}>Dark</button>
-              <button className={"btn sm" + (tiles === "sat" ? " on" : "")} onClick={() => setTiles("sat")}>Sat</button>
-            </span>
-          </div>
-          </>
-          }
+          <Suspense fallback={<div className="mapFallback"><span className="hint">starting the map engine…</span></div>}>
+            <MissionMap
+              center={center}
+              points={pts}
+              clusters={cl}
+              live={live}
+              bbox={bbox}
+              picking={pick}
+              onSelectBounds={bounds => { setBbox(bounds); setPick(false); }}
+              tiles={tiles}
+              onTilesChange={setTiles}
+              day={day}
+              span={span}
+              end={end}
+            />
+          </Suspense>
         </div>
 
         {/* ------- right rail: conditions ------- */}
@@ -257,7 +258,8 @@ export default function App() {
                 {!an.anomalies.length && <span className="hint">No anomalous days at this threshold.</span>}
               </div>
               <div className="hint" style={{ marginTop: 6 }}>
-                Critical months (avg + 1σ): {an.critical.map(c => c.month).join(", ") || "none"}
+                {/* The API reports months as 1-12; spell them or the line reads "3" instead of "Mar". */}
+                Critical months (avg + 1σ): {an.critical.map(c => MONTHS[c.month - 1] ?? c.month).join(", ") || "none"}
               </div>
             </>}
           </div>
@@ -266,8 +268,10 @@ export default function App() {
         {/* ------- drawer: analytics tabs ------- */}
         <div className="drawer panel">
           <div className="tabs">
-            {DRAWER_TABS.map(t => <button key={t} className={"tab" + (tab === t ? " on" : "")} onClick={() => setTab(t)}>
-              {t === "calendar" ? "Burning calendar" : t === "climatology" ? "Climatology" : t === "diagnostic" ? "Illusion diagnostic" : t === "briefing" ? "Briefing detail" : "Forecast"}
+            {DRAWER_TABS.map(t => <button key={t.id} role="tab" aria-selected={tab === t.id}
+              className={"tab" + (tab === t.id ? " on" : "")} onClick={() => setTab(t.id)}
+              onMouseEnter={() => t.prefetch?.()} onFocus={() => t.prefetch?.()}>
+              {t.label}
             </button>)}
             {tab === "calendar" && <span className="tools" style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
               <span className="hint">Year</span>
@@ -277,18 +281,16 @@ export default function App() {
               </select>
             </span>}
           </div>
-          {tab === "calendar" && <Heatmap data={cal} onPick={setDay} focus={day} year={yearSel} />}
-          {tab === "forecast" && <>
-            <div className="hint" style={{ marginBottom: 6 }}>Last year + 30-day forecast {fc?.model ? `· ${fc.model}` : ""}</div>
-            <div style={{ height: 240 }}><ResponsiveContainer><LineChart data={series}>
-              <CartesianGrid stroke="#141c30" /><XAxis dataKey="date" minTickGap={40} /><YAxis />
-              <Tooltip contentStyle={{ background: "#0a0f1aee", border: "1px solid #26334f" }} />
-              <Line dataKey="actual" stroke="#ff7a2f" dot={false} strokeWidth={2} />
-              <Line dataKey="forecast" stroke="#37e5ff" strokeDasharray="5 3" dot={false} strokeWidth={2} />
-            </LineChart></ResponsiveContainer></div>
-          </>}
-          {tab === "climatology" && <ClimatologyPanel bbox={bb} onPickDay={setDay} refreshKey={diagKey} embedded />}
-          {tab === "diagnostic" && <DiagnosticPanel bbox={bb} refreshKey={diagKey} embedded />}
+          {tab === "calendar" && <PanelBoundary name="calendar" resetKey={tab}><Heatmap data={cal} onPick={setDay} focus={day} year={yearSel} /></PanelBoundary>}
+          {tab === "forecast" && <PanelBoundary name="forecast" resetKey={tab}><Suspense fallback={<span className="hint">Loading chart…</span>}>
+            <ForecastChart series={series} model={fc?.model} />
+          </Suspense></PanelBoundary>}
+          {tab === "climatology" && <PanelBoundary name="climatology" resetKey={tab}><Suspense fallback={<span className="hint">Loading chart…</span>}>
+            <ClimatologyPanel bbox={bb} refreshKey={diagKey} embedded />
+          </Suspense></PanelBoundary>}
+          {tab === "diagnostic" && <PanelBoundary name="diagnostic" resetKey={tab}><Suspense fallback={<span className="hint">Loading chart…</span>}>
+            <DiagnosticPanel bbox={bb} refreshKey={diagKey} embedded />
+          </Suspense></PanelBoundary>}
           {tab === "briefing" && <BriefingPanel bbox={bb} onPickDay={setDay} refreshKey={diagKey} detail />}
         </div>
 

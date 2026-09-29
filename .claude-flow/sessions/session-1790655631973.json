@@ -1,0 +1,14 @@
+{
+  "id": "session-1790655631973",
+  "startedAt": "2026-09-29T04:20:31.973Z",
+  "cwd": "/home/hriishiibanerjee/Documents/NASA-Space-App-Challenge",
+  "context": {},
+  "metrics": {
+    "edits": 0,
+    "commands": 0,
+    "tasks": 0,
+    "errors": 0
+  },
+  "endedAt": "2026-09-29T04:20:40.231Z",
+  "duration": 8259
+}

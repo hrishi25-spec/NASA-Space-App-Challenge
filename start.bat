@@ -1,64 +1,24 @@
 @echo off
+rem One-command dev startup (Windows): backend :8000 + frontend :5173.
+rem All the real work lives in run.py so Windows, macOS and Linux share one code path.
 setlocal
 cd /d "%~dp0"
-title Burning Activity Calendar
+title Pyro-Harmony
 
-rem --- checks ---
-where npm >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: Node.js not found. Install the LTS from https://nodejs.org/ and retry.
-    pause
-    exit /b 1
-)
+set "PYCMD=python"
+rem prefer the py launcher, but only if it really has Python 3
+py -3 -V >nul 2>&1 && set "PYCMD=py -3"
 
-if not exist "firecal\backend\.venv\Scripts\python.exe" (
-    echo Creating Python virtualenv...
-    py -3 -m venv "firecal\backend\.venv" 2>nul
-    if errorlevel 1 python -m venv "firecal\backend\.venv" 2>nul
-)
-if not exist "firecal\backend\.venv\Scripts\python.exe" (
-    echo ERROR: Python not found. Install 3.10+ from https://www.python.org/downloads/ ^(tick "Add to PATH"^) and retry.
-    pause
-    exit /b 1
-)
+%PYCMD% "%~dp0run.py" %*
+set "RC=%ERRORLEVEL%"
 
-rem --- first-run dependency install ---
-"firecal\backend\.venv\Scripts\python.exe" -c "import fastapi" >nul 2>&1
-if errorlevel 1 (
-    echo Installing backend packages, this may take a minute...
-    "firecal\backend\.venv\Scripts\python.exe" -m pip install -q -r firecal\backend\requirements.txt
-)
-
-if not exist "firecal\frontend\node_modules" (
-    echo Installing frontend packages...
-    pushd firecal\frontend
-    call npm install --no-audit --no-fund
-    popd
-)
-
-rem --- start both (shared console: logs appear here) ---
-echo.
-echo   backend  http://localhost:8000
-echo   frontend http://localhost:5173  ^<- open this
-echo.
-echo   Stop: close this window, or press Ctrl+C then Y
-echo.
-start /b "" cmd /c "cd /d firecal\backend && .venv\Scripts\python.exe -m uvicorn main:app --port 8000"
-start /b "" cmd /c "cd /d firecal\frontend && call npm run dev"
-
-timeout /t 5 /nobreak >nul
-
-rem verify the backend actually came up before opening the browser
-curl -s -o nul -m 3 http://localhost:8000/meta
-if errorlevel 1 (
+if not "%RC%"=="0" (
     echo.
-    echo   WARNING: backend did not respond on http://localhost:8000 within 3s.
-    echo   The app will open but data loading will fail until the backend is up.
-    echo   Check the backend output above for errors.
-    timeout /t 5 /nobreak >nul
+    echo   The launcher exited with code %RC%.
+    echo   If Python or Node.js is missing, install them and run this file again:
+    echo     Python 3.10+  https://www.python.org/downloads/
+    echo     Node.js 18+   https://nodejs.org/
+    echo.
+    pause
 )
-
-start "" http://localhost:5173
-
-rem keep the window open until stopped
-timeout /t 86400 /nobreak >nul
+endlocal & exit /b %RC%

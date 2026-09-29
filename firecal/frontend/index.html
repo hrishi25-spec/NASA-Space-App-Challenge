@@ -1,2 +1,12 @@
-<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Burning Activity Calendar</title></head>
-<body><div id="root"></div><script type="module" src="/src/main.jsx"></script></body></html>
+<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Pyro-Harmony — fire intelligence console</title>
+<!-- Warm up the tile host while the bundle downloads: removes a DNS + TCP + TLS round
+     trip from the first map tiles. -->
+<link rel="preconnect" href="https://server.arcgisonline.com" crossorigin><link rel="dns-prefetch" href="https://server.arcgisonline.com">
+<!-- Paint the console's own colours immediately instead of a white flash on slow machines. -->
+<style>
+  html,body{background:#141a1d;margin:0}
+  #boot{color:#8a9aa0;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.2px;padding:22px}
+</style>
+</head>
+<body><div id="root"><div id="boot">Pyro-Harmony — starting…</div></div><script type="module" src="/src/main.jsx"></script></body>
+</html>

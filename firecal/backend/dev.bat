@@ -1,4 +1,6 @@
 @echo off
-rem Dev helper: runs the FastAPI backend in its own minimized window (survives the shell that launched it).
+rem Dev helper: runs the FastAPI backend in this window.
 cd /d "%~dp0"
-python -m uvicorn main:app --port 8000
+set "PY=python"
+if exist ".venv\Scripts\python.exe" set "PY=.venv\Scripts\python.exe"
+"%PY%" -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload

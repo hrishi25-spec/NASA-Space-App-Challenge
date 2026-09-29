@@ -1,148 +1,282 @@
+/* ============================================================
+   Pyro-Harmony — "ember dusk" soft UI
+
+   Palette intent: soothing, low-glare, but instantly legible. The base is a
+   warm charcoal-teal (not cold navy) and every accent is desaturated one step
+   down from full saturation — no neon. The ember amber still reads as fire and
+   still clears ~7:1 on the base, so the important numbers pop the moment the
+   page paints while a long shift in front of it stays comfortable.
+
+   Material: one surface colour extruded by a light shadow from the top-left and
+   a dark one from the bottom-right; "pressed" things invert to an inset shadow of
+   the same pair. No hard borders, no scanlines.
+
+   ---- letter-case contract (keep source strings readable, let CSS do the casing) ----
+     UPPERCASE via text-transform: section headings (h3), micro-labels (.k, .kv
+       label, .readout, .tab, .btn, map legend items, sub-tabs).
+     AS WRITTEN, sentence case in source: prose, hints, values, chart legend
+       names, list rows, buttons' sibling descriptions.
+     ALWAYS UPPERCASE IN SOURCE: acronyms — AOI, HFII, ESFP, FRP, MODIS, VIIRS,
+       DBSCAN, FIRMS, CSV, MW, DOY, IC, and the statistic symbol z stays lowercase.
+     Never hard-code an all-caps word just to look like a label: add the label
+     class instead, so capitalisation lives in exactly one place.
+   ============================================================ */
 :root{
-  --bg:#05070d;--bg2:#080b14;--card:#0b101ccf;--card-solid:#0b101c;
-  --fg:#d9e2f2;--mut:#5f6b85;--acc:#ff7a2f;--acc2:#37e5ff;--ok:#3dffb0;--warn:#ffcf5c;--bad:#ff5c6c;
-  --bd:#1c2740;--bd2:#26334f;--glow:0 0 12px #ff7a2f55,0 0 28px #ff7a2f18;
+  --bg:#141a1d;              /* page base — warm charcoal-teal */
+  --surface:#1a2226;         /* the soft-UI material */
+  --surface-hi:#222b30;      /* raised gradient end */
+  --surface-lo:#161d21;      /* raised gradient start */
+  --sh-dark:#080b0d;         /* shadow, bottom-right */
+  --sh-lite:#2a343a;         /* highlight, top-left */
+  --fg:#d6e0e2;--mut:#8a9aa0;
+  --acc:#f2a65a;             /* ember amber — primary */
+  --acc2:#7fd1c8;            /* soft teal — secondary */
+  --ok:#8fd6a4;--warn:#e9c46a;--bad:#e88a8a;
+  --r:18px;--r-sm:12px;--r-pill:999px;
+  /* Shadow blur radii are kept modest on purpose: large-blur shadows are expensive to
+     rasterize, and the compositor repaints them on a weak GPU. */
+  --raise:8px 8px 14px var(--sh-dark), -6px -6px 12px var(--sh-lite), inset 0 1px 0 #ffffff0d;
+  --raise-sm:4px 4px 8px var(--sh-dark), -4px -4px 8px var(--sh-lite), inset 0 1px 0 #ffffff0d;
+  --inset:inset 5px 5px 10px var(--sh-dark), inset -4px -4px 9px var(--sh-lite);
+  --inset-sm:inset 3px 3px 6px var(--sh-dark), inset -3px -3px 6px var(--sh-lite);
   --font:"SFMono-Regular",ui-monospace,Menlo,Consolas,"Liberation Mono",monospace;
 }
 *{box-sizing:border-box}
 html,body{background:var(--bg)}
 body{
   margin:0;color:var(--fg);
-  font:13px/1.5 var(--font);
+  font:13px/1.55 var(--font);
   letter-spacing:.2px;
-  background:
-    repeating-linear-gradient(0deg,transparent 0 39px,#ffffff05 39px 40px),
-    repeating-linear-gradient(90deg,transparent 0 39px,#ffffff05 39px 40px),
-    radial-gradient(1200px 600px at 70% -10%,#0d1b3355,transparent 60%),
-    radial-gradient(900px 500px at -10% 110%,#33160755,transparent 60%),
-    var(--bg);
+  background-color:var(--bg);
+  background-image:
+    radial-gradient(1100px 680px at 78% -12%,#232e33cc,transparent 62%),
+    radial-gradient(900px 620px at -8% 112%,#1d262acc,transparent 62%);
+  /* No background-attachment:fixed -- it forces a full-page repaint on every scroll
+     tick, which is exactly the jank you notice on low-end machines. */
   min-height:100vh;
 }
-::-webkit-scrollbar{width:8px;height:8px}
-::-webkit-scrollbar-thumb{background:#1c2740;border-radius:4px}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:#253035;border-radius:var(--r-pill);border:2px solid var(--bg)}
+::-webkit-scrollbar-thumb:hover{background:#2c383e}
 ::-webkit-scrollbar-track{background:transparent}
 
 /* ---------- command bar ---------- */
 header.cmd{
-  display:flex;align-items:center;gap:14px;flex-wrap:wrap;
-  padding:10px 18px;
-  background:linear-gradient(180deg,#0a1020ee,#0a1020bb);
-  border-bottom:1px solid var(--bd);
-  backdrop-filter:blur(8px);
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap;row-gap:10px;
+  padding:12px 20px;
+  background:var(--bg);
+  box-shadow:0 10px 24px #070a0ccc;
   position:sticky;top:0;z-index:1200;
 }
 header.cmd .logo{display:flex;align-items:center;gap:10px;min-width:0}
 header.cmd .logo b{font-size:15px;letter-spacing:1.2px;text-transform:uppercase;color:var(--fg)}
 header.cmd .logo .sub{font-size:10px;color:var(--mut);letter-spacing:2px;text-transform:uppercase}
-header.cmd .sig{width:10px;height:10px;border-radius:50%;background:var(--ok);box-shadow:0 0 10px var(--ok);animation:pulse 2.2s infinite}
-header.cmd .sig.down{background:var(--bad);box-shadow:0 0 10px var(--bad);animation:none}
+header.cmd .sig{width:11px;height:11px;border-radius:50%;background:var(--ok);box-shadow:0 0 10px var(--ok),var(--raise-sm);animation:pulse 2.2s infinite}
+header.cmd .sig.down{background:var(--bad);box-shadow:0 0 10px var(--bad),var(--raise-sm);animation:none}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
 header.cmd .spacer{flex:1}
-header.cmd .readout{font-size:11px;color:var(--mut);display:flex;gap:14px;flex-wrap:wrap}
-header.cmd .readout b{color:var(--fg)}
-.btn{
-  background:#0d1526;color:var(--fg);border:1px solid var(--bd2);border-radius:6px;
-  padding:7px 12px;font:inherit;font-size:12px;letter-spacing:.6px;text-transform:uppercase;
-  cursor:pointer;transition:border-color .15s,box-shadow .15s,color .15s;white-space:nowrap;
+header.cmd .readout{
+  font-size:11px;color:var(--mut);display:flex;gap:11px;flex-wrap:wrap;
+  background:var(--surface);border-radius:var(--r-pill);padding:7px 13px;box-shadow:var(--inset-sm);
+  text-transform:uppercase;letter-spacing:.9px;
 }
-.btn:hover{border-color:var(--acc);color:#fff}
-.btn.primary{border-color:var(--acc);color:var(--acc);box-shadow:var(--glow)}
-.btn.primary:hover{background:#1a1207}
-.btn.on{border-color:var(--acc2);color:var(--acc2);box-shadow:0 0 10px #37e5ff44}
-.btn:disabled{opacity:.45;cursor:wait}
+header.cmd .readout b{color:var(--fg)}
+
+/* ---------- pressable things ---------- */
+.btn{
+  background:linear-gradient(145deg,var(--surface-hi),var(--surface-lo));
+  color:var(--fg);border:0;border-radius:var(--r-sm);
+  box-shadow:var(--raise-sm);
+  padding:9px 12px;font:inherit;font-size:12px;letter-spacing:.5px;text-transform:uppercase;
+  cursor:pointer;transition:box-shadow .16s,color .16s,transform .16s;white-space:nowrap;
+}
+.btn:hover{color:#fff;transform:translateY(-1px);box-shadow:9px 9px 20px var(--sh-dark),-7px -7px 16px var(--sh-lite),inset 0 1px 0 #ffffff12}
+.btn:active{transform:translateY(0);box-shadow:var(--inset-sm)}
+.btn.on{box-shadow:var(--inset-sm);color:var(--acc2)}
+.btn.primary{color:var(--acc);box-shadow:var(--raise-sm),0 0 0 1px #f2a65a2e}
+.btn.primary:hover{color:#f7c08a;box-shadow:9px 9px 20px var(--sh-dark),-7px -7px 16px var(--sh-lite),0 0 0 1px #f2a65a55}
+.btn:disabled{opacity:.45;cursor:wait;transform:none}
+.btn.sm{padding:6px 10px;font-size:11px;border-radius:10px}
 input[type=file]{display:none}
+.filebtn{display:inline-flex}
 
 /* ---------- banner ---------- */
 .banner{
-  margin:12px 18px;padding:10px 14px;border:1px solid #5c1d1d;border-radius:8px;
-  background:#200c0eee;color:#ffb4ae;font-size:12px;letter-spacing:.4px;
+  margin:14px 20px;padding:14px 16px;border-radius:var(--r-sm);
+  background:linear-gradient(145deg,#261b1c,#1f1617);color:#f2b8b3;font-size:12px;
+  letter-spacing:.4px;box-shadow:var(--inset-sm);
 }
 
 /* ---------- layout ---------- */
-.deck{display:grid;grid-template-columns:250px minmax(0,1fr) 250px;gap:14px;padding:14px 18px;align-items:start}
+.deck{display:grid;grid-template-columns:250px minmax(0,1fr) 250px;gap:18px;padding:18px 20px;align-items:start}
 @media(max-width:1150px){.deck{grid-template-columns:1fr}.stage{order:-1}}  /* map first when stacked */
-.rail{display:flex;flex-direction:column;gap:14px;min-width:0}
+.rail{display:flex;flex-direction:column;gap:18px;min-width:0}
 
-/* ---------- panels ---------- */
+/* ---------- panels: the extruded slabs ---------- */
 .panel{
-  position:relative;background:var(--card);border:1px solid var(--bd);border-radius:10px;
-  padding:12px;backdrop-filter:blur(6px);min-width:0;
+  position:relative;background:linear-gradient(145deg,var(--surface-hi),var(--surface-lo));
+  border-radius:var(--r);box-shadow:var(--raise);
+  padding:16px;min-width:0;
 }
-.panel::before,.panel::after{
-  content:"";position:absolute;width:10px;height:10px;pointer-events:none;
-}
-.panel::before{top:-1px;left:-1px;border-top:2px solid var(--acc);border-left:2px solid var(--acc);border-top-left-radius:10px;opacity:.8}
-.panel::after{bottom:-1px;right:-1px;border-bottom:2px solid var(--acc2);border-right:2px solid var(--acc2);border-bottom-right-radius:10px;opacity:.5}
 .panel>h3{
-  margin:0 0 10px;font-size:11px;font-weight:600;letter-spacing:1.6px;text-transform:uppercase;color:var(--acc2);
-  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  margin:0 0 12px;font-size:11px;font-weight:600;letter-spacing:1.8px;text-transform:uppercase;
+  color:#a9bcbf;display:flex;align-items:center;gap:8px;flex-wrap:wrap;
 }
+/* the one documented exception: an h3 subtitle reads as prose, so sentence case stays. */
 .panel>h3 .mut{letter-spacing:.4px;text-transform:none;color:var(--mut);font-weight:400}
-.panel .tools{margin-left:auto;display:flex;gap:6px;align-items:center}
-select,.btn.sm{padding:4px 8px;font-size:11px;border-radius:5px}
-select{background:#0d1526;color:var(--fg);border:1px solid var(--bd2);font:inherit}
+.panel .tools{margin-left:auto;display:flex;gap:8px;align-items:center}
+.wide{grid-column:1/-1}
 
-/* ---------- stat blocks ---------- */
-.stats{display:grid;gap:10px}
-.stat{border:1px solid var(--bd);border-radius:8px;background:#0a0f1acc;padding:9px 11px}
-.stat .k{font-size:9.5px;letter-spacing:1.4px;text-transform:uppercase;color:var(--mut)}
-.stat .v{font-size:21px;font-weight:700;color:var(--fg);margin:2px 0;line-height:1.15}
-.stat .v.acc{color:var(--acc);text-shadow:0 0 14px #ff7a2f44}
-.stat .v.cyan{color:var(--acc2);text-shadow:0 0 14px #37e5ff33}
+select{
+  background:var(--surface);color:var(--fg);border:0;border-radius:10px;
+  padding:6px 10px;font:inherit;font-size:11px;box-shadow:var(--inset-sm);cursor:pointer;
+}
+
+/* ---------- stat blocks: recessed readouts ---------- */
+.stats{display:grid;gap:12px}
+.stat{
+  background:var(--surface);border-radius:14px;padding:12px 14px;box-shadow:var(--inset);
+}
+.stat .k{font-size:9.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--mut)}
+.stat .v{font-size:21px;font-weight:700;color:var(--fg);margin:3px 0;line-height:1.15}
+.stat .v.acc{color:var(--acc);text-shadow:0 0 14px #f2a65a3d}
+.stat .v.cyan{color:var(--acc2);text-shadow:0 0 14px #7fd1c833}
 .stat .s{font-size:10px;color:var(--mut)}
-.bars{display:flex;gap:3px;align-items:center;margin-top:2px}
-.bars i{width:10px;height:11px;border-radius:2px;display:inline-block}
+.bars{display:flex;gap:4px;align-items:center;margin-top:4px}
+.bars i{width:10px;height:11px;border-radius:3px;display:inline-block;box-shadow:1px 1px 3px var(--sh-dark)}
 
-/* ---------- map stage ---------- */
+/* ---------- the carved-out map well ---------- */
 .stage{position:relative}
-.stage .map{height:calc(100vh - 300px);min-height:430px;border-radius:8px;border:1px solid var(--bd);z-index:1}
+.missionMap,.globeStage{
+  position:relative;height:calc(100vh - 300px);min-height:430px;
+  border-radius:var(--r);overflow:hidden;z-index:1;
+  background:#0f1518;box-shadow:var(--inset),0 0 0 1px #ffffff08;
+}
+.mapCanvas,.globeCanvas{width:100%;height:100%}
+.globeStage{background:radial-gradient(80% 80% at 50% 45%,#151d21 0%,#0c1113 70%)}
+.globeCanvas{cursor:grab;display:block}
+.globeCanvas:active{cursor:grabbing}
+/* soft vignette instead of the old scanline overlay: a gradient rasterizes once,
+   while a big blurred inset shadow is re-painted over the animating canvas */
 .stage .scan{
-  position:absolute;inset:0;border-radius:8px;pointer-events:none;z-index:2;
-  background:repeating-linear-gradient(0deg,transparent 0 5px,#0a0f1a0d 5px 6px);
-  mix-blend-mode:overlay;
+  position:absolute;inset:0;border-radius:var(--r);pointer-events:none;z-index:2;
+  background:radial-gradient(120% 120% at 50% 50%,transparent 58%,#060a0cb3 100%);
 }
+/* placeholder while the lazy map chunk downloads -- same box, so nothing shifts */
+.mapFallback{
+  position:relative;height:calc(100vh - 300px);min-height:430px;border-radius:var(--r);
+  display:flex;align-items:center;justify-content:center;
+  background:#0f1518;box-shadow:var(--inset),0 0 0 1px #ffffff08;
+}
+
+/* ---------- floating chips over the map ---------- */
 .stage .chip{
-  position:absolute;z-index:3;display:flex;gap:8px;align-items:center;flex-wrap:wrap;
-  background:#0a0f1ad9;border:1px solid var(--bd2);border-radius:7px;padding:6px 9px;
-  font-size:11px;color:var(--mut);backdrop-filter:blur(6px);
+  position:absolute;z-index:3;display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+  background:linear-gradient(145deg,#1f282df2,#161d21f2);
+  border-radius:14px;padding:8px 12px;
+  font-size:11px;color:var(--mut);
+  box-shadow:7px 7px 16px #05080ad9,-4px -4px 12px #ffffff10,inset 0 1px 0 #ffffff12;
 }
-.stage .chip.tl{top:10px;left:10px}
-.stage .chip.br{bottom:30px;right:10px}
+/* Reserve room for the top-right tool cluster so the legend chip can never slide under
+   it; the chip already wraps, so the gesture hint just drops to a second line. */
+.stage .chip.tl{top:12px;left:12px;max-width:calc(100% - 310px)}
+/* Lifted clear of the bottom row: at narrow widths the Esri attribution needs the whole
+   bottom edge, and it must stay readable rather than sliding under the readout. */
+.stage .chip.bl{bottom:52px;left:12px}
+.stage .chip.br{bottom:12px;right:12px}
 .stage .chip b{color:var(--fg)}
-.stage .chip .dot{width:7px;height:7px;border-radius:50%}
+.stage .chip .dot{width:8px;height:8px;border-radius:50%;box-shadow:0 0 8px currentColor,1px 1px 2px var(--sh-dark)}
+.stage .chip .viewBadge{display:inline-flex;align-items:center;gap:7px;color:var(--fg);font-weight:600;letter-spacing:1px;text-transform:uppercase}
+.stage .chip .viewOrb{width:9px;height:9px;border-radius:50%;background:var(--acc2);box-shadow:0 0 10px var(--acc2),2px 2px 5px var(--sh-dark)}
+.stage .chip .mapLegendItem{display:inline-flex;align-items:center;gap:6px;text-transform:uppercase;letter-spacing:.8px}
+.missionMap .viewBadge{display:inline-flex;align-items:center;gap:7px;color:var(--fg);font-weight:600;letter-spacing:1px;text-transform:uppercase}
+.missionMap .viewOrb{width:9px;height:9px;border-radius:50%;background:var(--acc2);box-shadow:0 0 10px var(--acc2),2px 2px 5px var(--sh-dark)}
+.missionMap .mapLegendItem{display:inline-flex;align-items:center;gap:6px;text-transform:uppercase;letter-spacing:.8px}
+.missionMap .mapGestureHint{opacity:.85}
+.missionMap .mapLayerTools{display:flex;gap:8px;align-items:center}
+.missionMap .mapTopTools .btn.sm{background:linear-gradient(145deg,#232d33f2,#1a2226f2)}
+.missionMap .mapPickHint{color:var(--acc2)}
+.missionMap .mapTopTools{position:absolute;z-index:4;top:12px;right:12px;display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+/* On a narrow map, stack the tools vertically: a tall thin rail clashes far less with the
+   legend chip than a wide row does. */
+@media(max-width:900px){
+  .stage .chip.tl{max-width:calc(100% - 196px)}
+  .missionMap .mapTopTools{flex-direction:column;align-items:flex-end}
+}
 
 /* ---------- drawer tabs ---------- */
 .drawer{grid-column:1/-1}
-.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
 .tab{
-  background:#0d1526;border:1px solid var(--bd2);border-radius:6px;color:var(--mut);
-  padding:6px 11px;font:inherit;font-size:11px;letter-spacing:.8px;text-transform:uppercase;cursor:pointer;
+  background:linear-gradient(145deg,var(--surface-hi),var(--surface-lo));
+  border:0;border-radius:var(--r-sm);color:var(--mut);
+  box-shadow:var(--raise-sm);
+  padding:8px 13px;font:inherit;font-size:11px;letter-spacing:.9px;text-transform:uppercase;cursor:pointer;
+  transition:box-shadow .16s,color .16s,background .16s;
 }
-.tab.on{border-color:var(--acc);color:var(--acc);box-shadow:var(--glow)}
+.tab:hover{color:var(--fg)}
+.tab.on{box-shadow:var(--inset-sm);color:var(--acc)}
+
+/* secondary tab row, used inside the briefing to split one long report */
+.tabs.sub{
+  gap:5px;margin:0 0 12px;padding:6px;width:fit-content;max-width:100%;
+  border-radius:var(--r-sm);background:var(--surface-lo);box-shadow:var(--inset-sm);
+}
+.tabs.sub .tab{background:transparent;box-shadow:none;padding:6px 11px;font-size:10.5px;letter-spacing:1px;border-radius:9px}
+.tabs.sub .tab:hover{background:var(--surface-hi)}
+.tabs.sub .tab.on{background:linear-gradient(145deg,var(--surface-hi),var(--surface-lo));box-shadow:var(--raise-sm);color:var(--acc)}
+.tab .count{
+  margin-left:7px;font-size:9.5px;letter-spacing:0;padding:1px 6px;border-radius:var(--r-pill);
+  background:#ffffff10;color:var(--mut);
+}
+.tab.on .count{background:#f2a65a1f;color:var(--acc)}
 
 /* ---------- misc ---------- */
 .mut{color:var(--mut)}
-.errbox{border-color:#5c1d1d;background:#200c0ecc;color:#ffb4ae;border-radius:8px;padding:8px 10px;font-size:12px}
-.list{max-height:220px;overflow:auto}
-.row{display:flex;justify-content:space-between;gap:10px;padding:4px 0;border-bottom:1px solid #141c30;cursor:pointer;font-size:12px}
-.row:hover{color:#fff;background:#0d152699}
+.errbox{
+  background:linear-gradient(145deg,#261b1c,#1f1617);color:#f2b8b3;
+  border-radius:var(--r-sm);padding:10px 12px;font-size:12px;box-shadow:var(--inset-sm);
+}
+.list{max-height:220px;overflow:auto;border-radius:var(--r-sm);padding:6px;box-shadow:var(--inset-sm)}
+.row{
+  display:flex;justify-content:space-between;gap:10px;padding:8px 10px;margin-bottom:4px;
+  border-radius:10px;cursor:pointer;font-size:12px;transition:box-shadow .16s,background .16s;
+}
+.row:last-child{margin-bottom:0}
+.row:hover{background:var(--surface-hi);box-shadow:var(--raise-sm);color:#fff}
 .row.zero{color:var(--mut);cursor:default}
 .scroll{overflow-x:auto}
 .hint{font-size:11px;color:var(--mut)}
-.kv{display:flex;justify-content:space-between;gap:8px;font-size:12px;padding:2px 0}
+.kv{display:flex;justify-content:space-between;gap:8px;font-size:12px;padding:3px 0}
+.kv .mut{text-transform:uppercase;font-size:10.5px;letter-spacing:1.1px}
 .kv b{color:var(--fg)}
-.recs>div{font-size:12px;padding:3px 0;color:#c7d3e8}
+.recs>div{font-size:12px;padding:4px 0;color:#ccd9d9}
 .recs>div::before{content:"▸ ";color:var(--acc)}
 
-/* ---------- 3D globe stage ---------- */
-.globeStage{position:relative;height:calc(100vh - 300px);min-height:430px;border-radius:8px;border:1px solid var(--bd);overflow:hidden;background:radial-gradient(80% 80% at 50% 45%,#0a1226 0%,#05070d 70%)}
-.globeCanvas{width:100%;height:100%;display:block;cursor:grab}
-.globeCanvas:active{cursor:grabbing}
+/* ---------- maplibre control chrome ---------- */
+.maplibregl-ctrl-group{
+  background:var(--surface)!important;border:0!important;border-radius:14px!important;
+  box-shadow:var(--raise-sm)!important;overflow:hidden;
+}
+.maplibregl-ctrl-group button{width:32px!important;height:32px!important;background:transparent!important}
+.maplibregl-ctrl-group button:hover{background:#253035!important}
+.maplibregl-ctrl-group button+button{border-top:1px solid #111716!important}
+.maplibregl-ctrl-group button .maplibregl-ctrl-icon{filter:invert(.9) hue-rotate(180deg)}
+.maplibregl-ctrl-attrib{
+  background:#1a2226d9!important;color:var(--mut)!important;
+  border-radius:var(--r-pill)!important;box-shadow:var(--raise-sm)!important;
+}
+.maplibregl-ctrl-attrib a{color:#a7b6b9!important}
 
-/* leaflet + recharts dark fitting */
-.leaflet-container{background:#070a12;font:inherit}
-.leaflet-control-attribution{background:#0a0f1acc!important;color:#3d4a5e!important}
-.leaflet-bar a{background:#0d1526!important;color:var(--fg)!important;border-color:var(--bd2)!important}
-.recharts-default-tooltip{background:#0a0f1aee!important;border:1px solid var(--bd2)!important;border-radius:6px}
-.recharts-cartesian-axis-tick text{fill:#5f6b85;font-size:10px}
-.recharts-legend-item-text{color:#8fa0c0!important;font-size:11px}
+/* ---------- recharts, matched to the soft surfaces ---------- */
+.recharts-default-tooltip{
+  background:#1a2226f7!important;border:0!important;border-radius:var(--r-sm)!important;
+  box-shadow:7px 7px 16px #05080ad9!important;
+}
+.recharts-cartesian-axis-tick text{fill:#8a9aa0;font-size:10px}
+.recharts-legend-item-text{color:#a7b6b9!important;font-size:11px}
+
+/* Respect users who ask for less motion (and save the work on weak devices). */
+@media (prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+}

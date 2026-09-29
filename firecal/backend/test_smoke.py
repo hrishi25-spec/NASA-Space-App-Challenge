@@ -132,6 +132,57 @@ def test_good_csv_merges():
     assert r.status_code == 200 and r.json()["n"] == before + 1
 
 
+def test_upload_cp1252_csv():
+    """Excel on Windows exports cp1252: that must not be rejected as unreadable."""
+    before = client.get("/meta").json()["n"]
+    text = ("latitude,longitude,acq_date,acq_time,confidence,frp,brightness,satellite\n"
+            "3.0,4.0,2022-02-02,0900,80,12.5,340,AQUA-VIIRS \u00e9\n")
+    csv = ("files", ("cp1252.csv", io.BytesIO(text.encode("cp1252")), "text/csv"))
+    r = client.post("/upload", files=[csv])
+    assert r.status_code == 200, r.text
+    assert r.json()["n"] == before + 1
+
+
+def test_upload_utf16_csv():
+    """Excel on macOS can emit UTF-16 with a BOM."""
+    before = client.get("/meta").json()["n"]
+    text = ("latitude,longitude,acq_date,acq_time,confidence,frp,brightness,satellite\n"
+            "5.0,6.0,2022-03-03,1015,70,9.5,320,NOAA-20\n")
+    csv = ("files", ("utf16.csv", io.BytesIO(text.encode("utf-16")), "text/csv"))
+    r = client.post("/upload", files=[csv])
+    assert r.status_code == 200, r.text
+    assert r.json()["n"] == before + 1
+
+
 def test_clear():
     assert client.delete("/data").json()["n"] == 0
     assert client.get("/meta").json()["n"] == 0
+
+
+def test_responses_are_gzipped():
+    """The analytics payloads are big; they must go over the wire compressed.
+
+    (test_clear runs just before this, so load data again -- the middleware has a
+    1 KiB floor under which compressing costs more than it saves.)
+    """
+    client.post("/demo")
+    big = client.get("/calendar", headers={"Accept-Encoding": "gzip"})
+    assert big.status_code == 200
+    assert len(big.json()) > 400
+    # httpx decodes transparently, so compare headers rather than len(big.content):
+    # the middleware only sets this header when it actually compressed (~87 KB -> ~9 KB).
+    assert big.headers.get("content-encoding") == "gzip"
+    # ...and it must leave tiny payloads alone (the 1 KiB floor).
+    small = client.get("/meta", headers={"Accept-Encoding": "gzip"})
+    assert small.headers.get("content-encoding") is None
+
+
+def test_cached_analytics_not_stale_after_data_change():
+    """A memoized response must never outlive the dataset it was computed from."""
+    client.post("/demo")
+    assert len(client.get("/calendar").json()) > 400      # fills the cache
+    client.delete("/data")                                # must bust it
+    assert client.get("/meta").json()["n"] == 0
+    assert client.get("/calendar").json() == []            # a stale cache would answer here
+    client.post("/demo")
+    assert len(client.get("/calendar").json()) > 400      # and it refills correctly

@@ -7,30 +7,71 @@ Harmonizes FIRMS MODIS + VIIRS CSVs and serves the four poster pillars:
   4. Incident Commander wildfire briefing       -> /briefing
 plus the original calendar / map / anomaly / forecast endpoints.
 """
+import functools
 import io
 import math
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
 import numpy as np
 import pandas as pd
 import requests
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse
 from scipy.spatial import ConvexHull
 from sklearn.cluster import DBSCAN, KMeans
 
 from demo import make_demo, make_transition_demo
 
 MAX_FILE_BYTES = 200 * 1024 * 1024  # per uploaded CSV
+MAX_UPLOAD_BYTES = 400 * 1024 * 1024  # whole upload request (all files + multipart overhead)
+MAX_UPLOAD_FILES = 20               # a request carrying 50 files is not a use case
+UPLOAD_CHUNK = 1 << 20              # read uploads in 1 MiB slices
 MAX_ROWS = 2_000_000                # in-memory safety cap
 LIVE_MAX_ROWS = 200_000             # safety cap for one live ingest
+MAX_FEED_BYTES = 64 * 1024 * 1024   # safety cap on one outbound FIRMS download
+
+# The dev server proxies /api to this process, so the browser talks same-origin and needs
+# no CORS grant at all. Defaulting to `*` let any web page the operator visits drive
+# /upload and /demo against their dataset, so the default is now the local origins only.
+# Deploying the console elsewhere means setting ALLOW_ORIGINS explicitly.
+DEFAULT_ORIGINS = "http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:4173,http://localhost:4173"
 
 app = FastAPI(title="Pyro-Harmony — Burning Activity Calendar")
+# The JSON endpoints are mostly text (dates, sensor names, repeated keys) and compress
+# 3-9x, which matters a lot on the day/bbox re-fetches while exploring the map.
+# 1 KiB floor: below that gzip costs more than it saves.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+# Registered before CORS so a rejected upload still comes back inside the CORS grant.
+
+
+@app.middleware("http")
+async def cap_upload_body(request, call_next):
+    """Refuse an oversized upload before any of it is buffered.
+
+    The multipart parser spools the whole body to disk while the request is being
+    received, so checking size inside the handler is far too late -- it only sees the
+    file after everything has landed. This reads the declared Content-Length and bails
+    early. Chunked requests without a Content-Length fall through to the per-file cap.
+    """
+    if request.url.path.endswith("/upload"):
+        try:
+            declared = int(request.headers.get("content-length") or 0)
+        except ValueError:
+            declared = 0
+        if declared > MAX_UPLOAD_BYTES:
+            return JSONResponse(
+                {"detail": f"upload too large: {declared} bytes (limit {MAX_UPLOAD_BYTES})"},
+                status_code=413)
+    return await call_next(request)
+
+
 app.add_middleware(CORSMiddleware,
-                   allow_origins=[o.strip() for o in os.environ.get("ALLOW_ORIGINS", "*").split(",") if o.strip()],
+                   allow_origins=[o.strip() for o in os.environ.get("ALLOW_ORIGINS", DEFAULT_ORIGINS).split(",") if o.strip()],
                    allow_methods=["*"], allow_headers=["*"])
 CONF_MAP = {"l": 20, "low": 20, "n": 60, "nominal": 60, "h": 90, "high": 90}
 REQUIRED = {"latitude", "longitude", "acq_date", "acq_time", "confidence"}
@@ -46,6 +87,56 @@ LIVE_FEEDS = {
 LIVE_REGIONS = ["Global", "South_East_Asia", "South_America", "North_and_Central_America",
                 "Africa", "Europe", "Northern_and_Central_Australia", "South_Asia"]
 LIVE_USER_AGENT = {"User-Agent": "pyro-harmony/1.0 (NASA Space Apps 2026 prototype)"}
+
+
+# ------------------------------------------------------- derived-data caches
+# Every analytics endpoint is a pure function of the loaded dataset, so memoize its
+# response until the dataset changes.  These recomputations (DBSCAN, rolling
+# percentiles, K-means) are the difference between instant and a multi-second freeze
+# on every click on a low-end machine.
+_AGG_CACHE: dict = {}
+_CACHE_MAX = 256
+
+
+def _invalidate() -> None:
+    """Drop every derived cache. Call after DF changes."""
+    _AGG_CACHE.clear()
+
+
+def cached(func):
+    """Memoize an endpoint keyed by its own arguments; cleared by _invalidate()."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        key = (func.__name__, args, tuple(sorted(kwargs.items())))
+        hit = _AGG_CACHE.get(key)
+        if hit is not None:
+            return hit
+        value = func(*args, **kwargs)
+        if isinstance(value, Response):      # already-serialized body: don't reuse it
+            return value
+        if len(_AGG_CACHE) >= _CACHE_MAX:    # keep memory bounded on small machines
+            _AGG_CACHE.clear()
+        _AGG_CACHE[key] = value
+        return value
+    return wrapper
+
+
+def read_firms_csv(blob: bytes) -> pd.DataFrame:
+    """Decode a FIRMS-style CSV no matter which OS or editor produced it.
+
+    pandas assumes UTF-8, but Excel on Windows writes cp1252 and Excel on macOS
+    can emit UTF-16, so a perfectly good export would otherwise be rejected as
+    "not a readable CSV".  latin-1 last, because it decodes any byte.
+    """
+    if blob[:2] in (b"\xff\xfe", b"\xfe\xff"):            # UTF-16 little/big endian BOM
+        return pd.read_csv(io.BytesIO(blob), encoding="utf-16")
+    last = None
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return pd.read_csv(io.BytesIO(blob), encoding=enc)
+        except UnicodeDecodeError as e:
+            last = e
+    raise ValueError(f"could not decode the CSV as text ({last})")
 
 
 # ---------------------------------------------------------------- harmonization
@@ -107,27 +198,62 @@ EMPTY_DF = harmonize(pd.DataFrame(columns=["latitude", "longitude", "acq_date", 
 DF = EMPTY_DF.copy()
 
 
+def _safe_name(name, limit: int = 80) -> str:
+    """Make a client-supplied filename safe to echo back in an error body.
+
+    Filenames are attacker-controlled and end up in JSON detail strings and server logs,
+    so strip directories, control characters and newlines (which would otherwise let a
+    crafted name forge extra log lines) and cap the length.
+    """
+    flat = (name or "upload").replace("\\", "/").rsplit("/", 1)[-1]
+    cleaned = "".join(c for c in flat if c.isprintable())
+    return cleaned[:limit] or "upload"
+
+
+async def _read_capped(f: UploadFile, limit: int) -> bytes:
+    """Read an upload in slices and abort the moment it passes `limit`.
+
+    `await f.read()` buffers the entire body in RAM first and only then lets the caller
+    compare len(blob), so one request with a multi-gigabyte body would exhaust memory
+    before the size check ever ran.
+    """
+    buf = bytearray()
+    while True:
+        chunk = await f.read(UPLOAD_CHUNK)
+        if not chunk:
+            return bytes(buf)
+        buf += chunk
+        if len(buf) > limit:
+            raise HTTPException(400, f"{_safe_name(f.filename)}: file exceeds "
+                                     f"{limit // (1024 * 1024)} MB limit")
+
+
 @app.post("/upload")
-async def upload(files: list[UploadFile] = File(...)):
+async def upload(files: list[UploadFile] = File(...), demo_transition: bool = False):
     global DF
     if not files:
         raise HTTPException(400, "No files uploaded")
+    if len(files) > MAX_UPLOAD_FILES:
+        raise HTTPException(400, f"too many files: {len(files)} (limit {MAX_UPLOAD_FILES} per request)")
     parts = [DF] if len(DF) else []
+    # The poster's 2002-2024 illusion dataset used to load whenever a file happened to be
+    # *named* demo_transition.csv. A filename is client-controlled input and must never
+    # select server behaviour: that made the upload's real content irrelevant, and anyone
+    # with a legitimate file of that name silently got the demo instead. Now it is an
+    # explicit, documented flag.
+    if demo_transition:
+        return demo("transition")
     for f in files:
-        blob = await f.read()
-        if (f.filename or "") == "demo_transition.csv":  # poster: 2002-2024 illusion scenario
-            parts += _transition_frames()
-            continue
-        if len(blob) > MAX_FILE_BYTES:
-            raise HTTPException(400, f"{f.filename}: file exceeds {MAX_FILE_BYTES // (1024 * 1024)} MB limit")
+        name = _safe_name(f.filename)
+        blob = await _read_capped(f, MAX_FILE_BYTES)
         try:
-            raw = pd.read_csv(io.BytesIO(blob))
+            raw = read_firms_csv(blob)
         except Exception as e:
-            raise HTTPException(400, f"{f.filename}: not a readable CSV ({e})")
+            raise HTTPException(400, f"{name}: not a readable CSV ({e})")
         try:
             h = harmonize(raw)
         except ValueError as e:
-            raise HTTPException(400, f"{f.filename}: {e}")
+            raise HTTPException(400, f"{name}: {e}")
         if not h.empty:
             parts.append(h)
     if not parts:
@@ -136,15 +262,28 @@ async def upload(files: list[UploadFile] = File(...)):
     DF = pd.concat(parts).drop_duplicates(["lat", "lon", "time", "sensor"]).reset_index(drop=True)
     if len(DF) > MAX_ROWS:
         DF = DF.tail(MAX_ROWS).reset_index(drop=True)
+    _invalidate()
     return meta()
 
 
 @app.post("/demo")
 def demo(mode: str = "standard"):
     global DF
-    frames = _transition_frames() if mode == "transition" else [harmonize(x) for x in make_demo()]
+    frames = _transition_frames() if mode == "transition" else _demo_frames()
     DF = pd.concat(frames).reset_index(drop=True)
+    _invalidate()
     return meta()
+
+
+_DEMO_CACHE = None
+
+
+def _demo_frames():
+    """Generate + harmonize the 2020-2024 demo once (seconds of CPU per call)."""
+    global _DEMO_CACHE
+    if _DEMO_CACHE is None:
+        _DEMO_CACHE = [harmonize(x) for x in make_demo()]
+    return _DEMO_CACHE
 
 
 _TRANSITION_CACHE = None
@@ -160,7 +299,7 @@ def _transition_frames():
 
 @app.delete("/data")
 def clear():
-    global DF; DF = EMPTY_DF.copy(); return meta()
+    global DF; DF = EMPTY_DF.copy(); _invalidate(); return meta()
 
 
 @app.get("/meta")
@@ -213,12 +352,14 @@ def daily(d):
 
 
 @app.get("/calendar")
+@cached
 def calendar(bbox: str = None, start: str = None, end: str = None):
     s = daily(subset(bbox, start, end))
     return [{"date": str(i.date()), "count": round(r["count"], 1), "raw": int(r["raw"]), "frp": round(r["frp"], 1)} for i, r in s.iterrows()]
 
 
 @app.get("/points")
+@cached
 def points(bbox: str = None, start: str = None, end: str = None, limit: int = 6000):
     d = subset(bbox, start, end)
     limit = min(max(limit, 1), 20000)
@@ -227,6 +368,7 @@ def points(bbox: str = None, start: str = None, end: str = None, limit: int = 60
 
 
 @app.get("/clusters")
+@cached
 def clusters(bbox: str = None, start: str = None, end: str = None, eps: float = 550, min_pts: int = 3, hours: float = 12):
     eps = min(max(eps, 10), 5000); min_pts = min(max(min_pts, 1), 100); hours = min(max(hours, 0.5), 720)
     return _cluster_payload(subset(bbox, start, end), eps, min_pts, hours)
@@ -257,6 +399,7 @@ def _doy_matrix(s):
 
 
 @app.get("/climatology")
+@cached
 def climatology(bbox: str = None, window: int = 15, step: int = 5):
     """Day-of-Year climatology + percentile envelope (poster pillar 1)."""
     window = min(max(window, 3), 45); step = min(max(step, 1), 30)
@@ -287,6 +430,7 @@ def climatology(bbox: str = None, window: int = 15, step: int = 5):
 
 # --------------------------------------- 2. the "Sensor Transition Illusion"
 @app.get("/diagnostic")
+@cached
 def diagnostic(bbox: str = None):
     """Unmask the post-2012 VIIRS deployment artifact (poster pillar 2)."""
     d = subset(bbox)
@@ -353,13 +497,31 @@ def diagnostic(bbox: str = None):
 
 # --------------------------------- 3. live NASA FIRMS feeds + on-the-fly clustering
 def _fetch_feed(url, timeout=90):
-    r = requests.get(url, headers=LIVE_USER_AGENT, timeout=timeout)
-    if r.status_code != 200 or len(r.content) < 80:
+    # Streamed with a hard ceiling. r.content buffered whatever came back with no limit,
+    # so a huge or unexpected response would be pulled into memory in full.
+    with requests.get(url, headers=LIVE_USER_AGENT, timeout=timeout, stream=True) as r:
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        buf = bytearray()
+        for chunk in r.iter_content(1 << 20):
+            buf += chunk
+            if len(buf) > MAX_FEED_BYTES:
+                raise RuntimeError(f"feed exceeded {MAX_FEED_BYTES // (1024 * 1024)} MB")
+    if len(buf) < 80:
         raise RuntimeError(f"HTTP {r.status_code}")
-    df = pd.read_csv(io.BytesIO(r.content))
+    try:
+        df = read_firms_csv(bytes(buf))
+    except ValueError as e:
+        raise RuntimeError(str(e))
     if "latitude" not in df.columns:
         raise RuntimeError("unrecognized CSV layout")
     return df
+
+
+# One live ingest costs four outbound downloads plus DBSCAN/K-means. Unauthenticated and
+# uncached, so overlapping calls were free CPU and bandwidth amplification: N requests
+# meant 4N outbound fetches. Refuse to stack them instead of queueing.
+_LIVE_SLOTS = threading.BoundedSemaphore(2)
 
 
 @app.get("/live")
@@ -367,6 +529,20 @@ def live(region: str = "Global", bbox: str = None, eps: float = 550, min_pts: in
          hours: float = 12, crop: bool = False):
     """Pull 24h global FIRMS CSVs, harmonize on the fly, cluster, and return them."""
     eps = min(max(eps, 50), 10000); min_pts = min(max(min_pts, 1), 100); hours = min(max(hours, 0.5), 48)
+    # `region` is interpolated straight into the outbound FIRMS URL, so an unvalidated value
+    # let a caller drive which URL this server requests (and, with a `?`, which query string).
+    # The allowlist is the one the UI already offers.
+    if region not in LIVE_REGIONS:
+        raise HTTPException(400, f"unknown region {region!r}; expected one of: {', '.join(LIVE_REGIONS)}")
+    if not _LIVE_SLOTS.acquire(blocking=False):
+        raise HTTPException(429, "a live FIRMS ingest is already running; retry in a moment")
+    try:
+        return _live_ingest(region, bbox, eps, min_pts, hours, crop)
+    finally:
+        _LIVE_SLOTS.release()
+
+
+def _live_ingest(region, bbox, eps, min_pts, hours, crop):
     parts, feeds, errors = [], [], []
 
     def fetch_one(item):
@@ -476,6 +652,7 @@ def _biomes(d, k=4):
 
 
 @app.get("/briefing")
+@cached
 def briefing(bbox: str = None, z: float = 2.0, min_days: int = 2, format: str = "json"):
     z = min(max(z, 1.0), 5.0); min_days = min(max(min_days, 1), 14)
     d = subset(bbox)
@@ -518,7 +695,9 @@ def briefing(bbox: str = None, z: float = 2.0, min_days: int = 2, format: str = 
                  f"**Threat level:** {thr['level']} (score {thr['score']})  ",
                  f"**Record window:** {result['record']['days']} days · mean {result['record']['mean_daily']} fires/day  ",
                  f"**Last 30 days:** mean {result['recent']['mean_daily']}/day · peak {result['recent']['max_daily']}", "",
-                 f"## Critical burning periods (Z ≥ {z}σ, ≥ {min_days}d)"]
+                 # Lowercase z: the statistic symbol stays lowercase everywhere in the UI
+                 # (the cards read "z 3.1", "z=3"), so the exported markdown matches.
+                 f"## Critical burning periods (z ≥ {z}σ, ≥ {min_days}d)"]
         if streaks:
             for st in streaks:
                 lines.append(f"- **{st['start']} → {st['end']}** — {st['days']} day(s), peak z={st['max_z']}, total {st['total']} fires")
@@ -539,6 +718,7 @@ def briefing(bbox: str = None, z: float = 2.0, min_days: int = 2, format: str = 
 
 # ---------------------------------------------------------------- legacy panels
 @app.get("/anomalies")
+@cached
 def anomalies(bbox: str = None, z: float = 2.0):
     z = min(max(z, 0.5), 10)
     s = daily(subset(bbox))["count"]
@@ -552,6 +732,7 @@ def anomalies(bbox: str = None, z: float = 2.0):
 
 
 @app.get("/forecast")
+@cached
 def forecast(bbox: str = None, horizon: int = 30, epochs: int = 40):
     horizon = min(max(horizon, 1), 90); epochs = min(max(epochs, 1), 200)
     s = daily(subset(bbox))["count"]

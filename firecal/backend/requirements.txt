@@ -1,6 +1,14 @@
-fastapi
+# No hard pins: this is a hackathon prototype and the resolver should be able to pick
+# platform wheels. The floors below are security floors, not compatibility wishes -- each
+# one is the release that fixed a published advisory in a package this app actually uses:
+#   starlette        multipart form DoS (CVE-2024-47874)
+#   python-multipart DoS via malformed multipart boundary (CVE-2024-53981)
+# /upload accepts multipart bodies from anonymous callers, so both of those were directly
+# reachable here.
+fastapi>=0.115
+starlette>=0.40
 uvicorn[standard]
-python-multipart
+python-multipart>=0.0.18
 pandas
 numpy
 scikit-learn
