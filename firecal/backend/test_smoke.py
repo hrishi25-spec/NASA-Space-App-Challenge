@@ -1,10 +1,12 @@
 """API smoke test: runs every endpoint end-to-end against synthetic demo data."""
 import io
 
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
-from main import app
+import main
+from main import LIVE_REGIONS, REGIONS, app, firms_area_url, parse_env
 
 client = TestClient(app)
 
@@ -73,7 +75,41 @@ def test_diagnostic_transition_demo():
     assert d["adjusted_growth_pct"] is not None
     assert d["observed_growth_pct"] > 100          # raw record surges after 2012
     assert d["adjusted_growth_pct"] < 25           # harmonized record is stable
+    assert d["artifact_pct"] > 0                   # and the removal goes one way
+    assert d["viirs_scaling"] > 1                  # the VIIRS era inflates the raw count
     assert d["calibration"] and d["calibration"]["r2"] is not None
+    # ESFP is a per-sensor expansion ratio, so after nadir normalization the two
+    # sensors' footprint distributions have to agree.  It read 1.739 when VIIRS was
+    # being divided by the 750 m M-band cell instead of the 375 m I-band one.
+    assert 0.8 < d["calibration"]["esfp_ratio_viirs_to_modis"] < 1.25
+    client.post("/demo")  # restore the standard demo for the remaining tests
+
+
+def test_esfp_nadir_cells():
+    """One standard pixel is the floor: 1.0 at each sensor's own nadir cell.
+
+    NASA's FIRMS attribute table for the VIIRS feed: "The algorithm produces
+    approximately 375 m pixels at nadir. Scan and track reflect actual pixel size."
+    So the I-band cell (0.375 x 0.375 = 0.140625 km²) is the divisor -- not the 750 m
+    M-band cell, which understated every VIIRS footprint by exactly 4x.
+    """
+    assert main.NADIR_KM2["VIIRS"] == pytest.approx(0.140625)
+    assert main.NADIR_KM2["MODIS"] == pytest.approx(1.0)
+    assert main._esfp(pd.Series([0.375]), pd.Series([0.375]), "VIIRS")[0].iloc[0] == pytest.approx(1.0)
+    assert main._esfp(pd.Series([1.0]), pd.Series([1.0]), "MODIS")[0].iloc[0] == pytest.approx(1.0)
+    # edge of scan: ~9.7x the nadir area for either sensor, and never below 1.0
+    assert main._esfp(pd.Series([1.166]), pd.Series([1.166]), "VIIRS")[0].iloc[0] == pytest.approx(9.67, rel=0.02)
+    assert main._esfp(pd.Series([0.1]), pd.Series([0.1]), "VIIRS")[0].iloc[0] == 1.0
+
+
+def test_demo_footprints_are_product_shaped():
+    """Synthetic scan/track must sit in the real per-sensor ranges, or ESFP is fiction."""
+    assert client.post("/demo", params={"mode": "transition"}).status_code == 200
+    d = main.DF
+    v, m = d[d.sensor == "VIIRS"], d[d.sensor == "MODIS"]
+    assert 0.375 <= v.scan.min() and v.scan.max() <= 1.17     # 375 m I-band -> ~1.17 km
+    assert 1.0 <= m.scan.min() and m.scan.max() <= 4.84       # 1 km -> 4.83 km along-scan
+    assert (d.esfp >= 1).all() and (d.pixel_km2 > 0).all()
     client.post("/demo")  # restore the standard demo for the remaining tests
 
 
@@ -186,3 +222,124 @@ def test_cached_analytics_not_stale_after_data_change():
     assert client.get("/calendar").json() == []            # a stale cache would answer here
     client.post("/demo")
     assert len(client.get("/calendar").json()) > 400      # and it refills correctly
+
+
+# ---------------------------------------------------------------- region presets
+def test_regions_catalog():
+    r = client.get("/regions")
+    assert r.status_code == 200
+    regions = r.json()
+    keys = [x["key"] for x in regions]
+    assert len(regions) >= 5 and len(keys) == len(set(keys))
+    assert "california" in keys
+    for x in regions:
+        a, b, c, e = x["bbox"]                       # minlat, minlon, maxlat, maxlon
+        assert -90 <= a < c <= 90 and -180 <= b < e <= 180
+        assert x["peak_months"] and all(1 <= m <= 12 for m in x["peak_months"])
+        assert x["biome"] and x["events"]
+        # A preset's live region must stay on the allowlist, or "pull live" would 400.
+        assert x["firms_region"] in LIVE_REGIONS
+        lat, lon = x["center"]
+        assert a <= lat <= c and b <= lon <= e
+
+
+def test_demo_per_region_stays_inside_its_bbox():
+    r = client.post("/demo", params={"region": "california"})
+    assert r.status_code == 200
+    m = r.json()
+    assert m["n"] > 1000
+    a, b, c, e = REGIONS["california"]["bbox"]
+    assert a <= m["bounds"][0] and m["bounds"][2] <= c
+    assert b <= m["bounds"][1] and m["bounds"][3] <= e
+    days = client.get("/calendar", params={"bbox": f"{a},{b},{c},{e}"}).json()
+    assert len(days) > 400                            # the AOI really carries the record
+    assert client.post("/demo").json()["n"] > 1000   # restore the default demo
+
+
+def test_demo_unknown_region_400():
+    r = client.post("/demo", params={"region": "atlantis"})
+    assert r.status_code == 400 and "unknown region" in r.json()["detail"]
+
+
+def test_region_seed_is_stable_and_region_specific():
+    """The generator ignores the box for event counts, so the seed is what keeps two
+    presets from showing identical statistics; the default demo must keep its own seed."""
+    assert main._region_seed(None, 7) == 7
+    assert main._region_seed("california", 7) == main._region_seed("california", 7)
+    assert main._region_seed("california", 7) != main._region_seed("amazon", 7)
+
+
+def test_env_file_parsing():
+    parsed = parse_env("# comment\n"
+                       "FIRMS_MAP_KEY=abc123\n"
+                       "export FOO=bar\n"
+                       'QUOTED="a b"\n'
+                       "SINGLE='c d'\n"
+                       "\n"
+                       "nonsense\n")
+    assert parsed["FIRMS_MAP_KEY"] == "abc123"
+    assert parsed["FOO"] == "bar" and parsed["QUOTED"] == "a b" and parsed["SINGLE"] == "c d"
+    assert "nonsense" not in parsed
+
+
+def test_archive_validates_the_request_before_the_key():
+    """A bad request must not depend on whether a MAP_KEY happens to be configured."""
+    assert client.post("/archive", params={"source": "NOPE"}).status_code == 400
+    assert client.post("/archive", params={"region": "atlantis"}).status_code == 400
+    assert client.post("/archive").status_code == 400                  # no region, no bbox
+    assert client.post("/archive", params={"bbox": "1,2,3"}).status_code == 400
+    assert client.post("/archive", params={"region": "california", "date": "yesterday"}).status_code == 400
+
+
+def test_archive_requires_a_key(monkeypatch):
+    monkeypatch.delenv("FIRMS_MAP_KEY", raising=False)
+    r = client.post("/archive", params={"region": "california"})
+    assert r.status_code == 400 and "FIRMS_MAP_KEY" in r.json()["detail"]
+
+
+def test_archive_url_builder():
+    box = REGIONS["california"]["bbox"]               # minlat, minlon, maxlat, maxlon
+    url = firms_area_url("KEY123", "MODIS_C6.1", box, 3, "2024-08-01")
+    # ...and the area API wants west,south,east,north, i.e. minlon,minlat,maxlon,maxlat.
+    assert url == ("https://firms.modaps.eosdis.nasa.gov/api/area/csv/KEY123/MODIS_C6_1/"
+                   "-124.4,32.5,-114.1,42.0/3/2024-08-01")
+    assert firms_area_url("KEY123", "VIIRS_S-NPP", box, 1).endswith("/1")
+
+
+def test_archive_appends_rows_and_clips_to_the_aoi(monkeypatch):
+    """The network call is stubbed; the endpoint contract is what is under test."""
+    monkeypatch.setenv("FIRMS_MAP_KEY", "TESTKEY123")
+    frame = pd.DataFrame({
+        "latitude": [37.0, 37.5, 13.7],               # the last row is outside California
+        "longitude": [-120.0, -119.0, 100.5],
+        "acq_date": ["2024-08-01"] * 3, "acq_time": ["1315", "1320", "0900"],
+        "confidence": [80, 90, 70], "frp": [12.0, 8.0, 4.0],
+        "brightness": [330.0, 335.0, 325.0],
+        "satellite": ["Terra", "Aqua", "NPP"],
+    })
+    monkeypatch.setattr(main, "_fetch_feed", lambda url, timeout=90: frame)
+    before = client.get("/meta").json()["n"]
+    r = client.post("/archive", params={"region": "california", "days": 2})
+    assert r.status_code == 200, r.text
+    assert r.json()["n"] == before + 2               # out-of-AOI row dropped
+    assert r.json()["source"] == "VIIRS_S-NPP" and r.json()["days"] == 2
+    client.delete("/data")
+    client.post("/demo")
+
+
+def test_archive_can_replace_instead_of_append(monkeypatch):
+    """append=false means "this window is now the record", so the load must swap, not merge."""
+    monkeypatch.setenv("FIRMS_MAP_KEY", "TESTKEY123")
+    frame = pd.DataFrame({
+        "latitude": [37.0], "longitude": [-120.0], "acq_date": ["2024-08-02"],
+        "acq_time": ["1315"], "confidence": [80], "frp": [12.0],
+        "brightness": [330.0], "satellite": ["Terra"],
+    })
+    monkeypatch.setattr(main, "_fetch_feed", lambda url, timeout=90: frame)
+    before = client.get("/meta").json()["n"]
+    r = client.post("/archive", params={"region": "california", "append": False})
+    assert r.status_code == 200, r.text
+    assert r.json()["n"] == 1 < before                 # replaced, not merged
+    assert client.delete("/data").json()["n"] == 0     # ...and the analytics caches were dropped
+    assert client.get("/calendar").json() == []
+    client.post("/demo")

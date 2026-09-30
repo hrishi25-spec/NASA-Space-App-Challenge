@@ -32,11 +32,12 @@ export function HeroStats({ meta }) {
 const REGIONS = ["Global", "South_East_Asia", "South_America", "North_and_Central_America",
   "Africa", "Europe", "Northern_and_Central_Australia", "South_Asia"];
 
-export function LivePanel({ onLoaded, wide }) {
+export function LivePanel({ onLoaded, wide, bbox, region: aoRegion, onDatasetChanged }) {
   const [region, setRegion] = useState("Global");
   const [busy, setBusy] = useState(false);
   const [res, setRes] = useState(null);
   const [err, setErr] = useState(null);
+  const [pulled, setPulled] = useState(null);
 
   async function pull() {
     setBusy(true); setErr(null);
@@ -47,6 +48,24 @@ export function LivePanel({ onLoaded, wide }) {
       setRes(j);
       if (onLoaded) onLoaded(j);
     } catch (e) { setErr("Live feed failed: " + e.message); }
+    setBusy(false);
+  }
+
+  /* The open 24 h feeds are global: every AOI looks like a single day. The FIRMS area API
+     serves real 1-5 day windows for the AOI instead, but it needs a free MAP_KEY, so this
+     button reports that plainly rather than hiding the capability. */
+  async function pullArchive() {
+    setBusy(true); setErr(null); setPulled(null);
+    try {
+      const q = new URLSearchParams({ days: "3" });
+      if (bbox) q.set("bbox", bbox);
+      else if (aoRegion) q.set("region", aoRegion);
+      const r = await fetch("/api/archive?" + q, { method: "POST" });
+      if (!r.ok) throw new Error(await errMsg(r));
+      const m = await r.json();
+      setPulled(`Merged a real ${m.days}-day ${m.source} window — ${fmt(m.n)} rows now loaded.`);
+      onDatasetChanged?.(m);
+    } catch (e) { setErr("Real-window pull failed: " + e.message); }
     setBusy(false);
   }
 
@@ -64,10 +83,16 @@ export function LivePanel({ onLoaded, wide }) {
         <button className={"btn sm" + (busy ? "" : " primary")} onClick={pull} disabled={busy}>
           {busy ? "Fetching feeds… (up to ~2 min for Global)" : "Pull live hotspots"}
         </button>
+        <button className="btn sm" onClick={pullArchive} disabled={busy || (!bbox && !aoRegion)}
+          title={bbox || aoRegion
+            ? "Load a real 1-5 day FIRMS window for this AOI (needs FIRMS_MAP_KEY in .env)"
+            : "Select an area or a region preset first"}>Real 3-day pull</button>
       </span>
     </h3>
     {busy && <div className="hint">Downloading 24 h CSVs from FIRMS, harmonizing, clustering…</div>}
     {err && <div className="errbox">⚠ {err}</div>}
+    {pulled && <div className="hint">{pulled}</div>}
+    {!bbox && !aoRegion && <div className="hint">Real 3-day pull needs an AOI — pick a region or draw one.</div>}
     {res && <>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 8, marginBottom: 8 }}>
         <div className="stat"><div className="k">Feeds online</div>

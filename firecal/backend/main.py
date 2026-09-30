@@ -11,9 +11,13 @@ import functools
 import io
 import math
 import os
+import re
 import threading
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from pathlib import Path
+from urllib.parse import urlsplit
 
 import numpy as np
 import pandas as pd
@@ -25,7 +29,48 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from scipy.spatial import ConvexHull
 from sklearn.cluster import DBSCAN, KMeans
 
-from demo import make_demo, make_transition_demo
+from demo import BOX, make_demo, make_transition_demo
+from regions import REGIONS, region_box, region_keys
+
+
+# ------------------------------------------------------------ local configuration
+def parse_env(text: str) -> dict:
+    """Parse the `KEY=VALUE` subset of a .env file: comments, blanks, `export`, quotes."""
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key:
+            out[key] = value
+    return out
+
+
+def load_env_file():
+    """Load the first .env found next to this file, in firecal/, or at the repo root.
+
+    Real environment variables always win (`setdefault`), so exporting FIRMS_MAP_KEY in
+    the shell keeps working exactly as before.  Searching the parents means the launcher
+    -- which runs uvicorn from firecal/backend -- still finds a repo-root .env.
+    """
+    here = Path(__file__).resolve().parent
+    for candidate in (here / ".env", here.parent / ".env", here.parent.parent / ".env"):
+        if candidate.is_file():
+            for key, value in parse_env(candidate.read_text(encoding="utf-8", errors="replace")).items():
+                os.environ.setdefault(key, value)
+            return candidate
+    return None
+
+
+load_env_file()
 
 MAX_FILE_BYTES = 200 * 1024 * 1024  # per uploaded CSV
 MAX_UPLOAD_BYTES = 400 * 1024 * 1024  # whole upload request (all files + multipart overhead)
@@ -34,6 +79,8 @@ UPLOAD_CHUNK = 1 << 20              # read uploads in 1 MiB slices
 MAX_ROWS = 2_000_000                # in-memory safety cap
 LIVE_MAX_ROWS = 200_000             # safety cap for one live ingest
 MAX_FEED_BYTES = 64 * 1024 * 1024   # safety cap on one outbound FIRMS download
+CLUSTER_MAX_POINTS = 60_000         # detections fed to one DBSCAN pass (strided above this)
+CLUSTER_RETURN = 300                # clusters returned; only these get a convex hull
 
 # The dev server proxies /api to this process, so the browser talks same-origin and needs
 # no CORS grant at all. Defaulting to `*` let any web page the operator visits drive
@@ -70,9 +117,29 @@ async def cap_upload_body(request, call_next):
     return await call_next(request)
 
 
-app.add_middleware(CORSMiddleware,
-                   allow_origins=[o.strip() for o in os.environ.get("ALLOW_ORIGINS", DEFAULT_ORIGINS).split(",") if o.strip()],
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOW_ORIGINS", DEFAULT_ORIGINS).split(",") if o.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
                    allow_methods=["*"], allow_headers=["*"])
+
+
+@app.middleware("http")
+async def same_origin_writes(request, call_next):
+    """Refuse writes a foreign page drove, which CORS alone does not stop.
+
+    CORS decides whether a foreign origin may *read* a response; it never stops the
+    request itself.  A form POST, and a fetch with a simple content type, are sent
+    without a preflight, so restricting allow_origins left every write endpoint
+    (/upload, /demo, /archive, /live) drivable by any page the operator had open.  A
+    write now has to come from this host or from an explicit ALLOW_ORIGINS entry; a
+    request with no Origin at all (curl, pytest, the launcher's health checks) is
+    untouched, and GETs are never gated.
+    """
+    origin = request.headers.get("origin")
+    if origin and request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        host = request.headers.get("host", "")
+        if urlsplit(origin).netloc != host and origin not in ALLOWED_ORIGINS:
+            return JSONResponse({"detail": "cross-origin write refused"}, status_code=403)
+    return await call_next(request)
 CONF_MAP = {"l": 20, "low": 20, "n": 60, "nominal": 60, "h": 90, "high": 90}
 REQUIRED = {"latitude", "longitude", "acq_date", "acq_time", "confidence"}
 
@@ -87,6 +154,23 @@ LIVE_FEEDS = {
 LIVE_REGIONS = ["Global", "South_East_Asia", "South_America", "North_and_Central_America",
                 "Africa", "Europe", "Northern_and_Central_Australia", "South_Asia"]
 LIVE_USER_AGENT = {"User-Agent": "pyro-harmony/1.0 (NASA Space Apps 2026 prototype)"}
+
+# FIRMS area API: real per-AOI windows (1-5 days) for one chosen source. Unlike the open
+# 24h CSVs it needs a free MAP_KEY, so /archive explains how to get one instead of
+# guessing.  Its source names differ from the open-feed keys, hence the mapping.
+FIRMS_AREA_API = "https://firms.modaps.eosdis.nasa.gov/api/area/csv"
+AREA_SOURCES = {"MODIS_C6.1": "MODIS_C6_1", "VIIRS_S-NPP": "VIIRS_SNPP_C2",
+                "VIIRS_NOAA-20": "VIIRS_NOAA20_C2", "VIIRS_NOAA-21": "VIIRS_NOAA21_C2"}
+MAP_KEY_RE = re.compile(r"[A-Za-z0-9]{6,64}")
+DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def firms_area_url(key, source, box, days, date=None):
+    """Build an area-API URL. `box` is minlat,minlon,maxlat,maxlon; the API wants
+    west,south,east,north. The key comes from the operator's environment, never a request."""
+    a, b, c, e = box
+    url = f"{FIRMS_AREA_API}/{key}/{AREA_SOURCES[source]}/{b},{a},{e},{c}/{days}"
+    return f"{url}/{date}" if date else url
 
 
 # ------------------------------------------------------- derived-data caches
@@ -140,20 +224,30 @@ def read_firms_csv(blob: bytes) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------- harmonization
+# Nadir cell of the product FIRMS actually distributes.  MODIS is 1x1 km; the VIIRS
+# feed is the I-band 375 m product (VNP14IMG / VJ114IMG / VJ214IMG), *not* the 750 m
+# M-band one, so its cell is 0.375x0.375 km -- 0.140625 km², four times smaller than
+# the 0.5625 km² (0.75 km) cell this used to assume.  NASA Earthdata's FIRMS attribute
+# table is explicit: "The algorithm produces approximately 375 m pixels at nadir.
+# Scan and track reflect actual pixel size."
+NADIR_KM2 = {"MODIS": 1.0, "VIIRS": 0.140625}
+
+
 def _esfp(scan, track, sensor):
-    """Equivalent Standard Fire Pixels (nadir-normalized expansion ratio)
-    and the physical footprint area (km²) of each detection.
+    """Equivalent Standard Fire Pixels (footprint expansion ratio) and the physical
+    footprint area (km²) of each detection.
 
     FIRMS reports the instantaneous footprint extent per detection via the
-    `scan` / `track` columns (already in km).  Normalizing by each sensor's
-    nadir cell (MODIS 1x1 km, VIIRS 0.75x0.75 km) yields the expansion ratio
-    A(theta): up to ~10x for MODIS at scan edge vs ~2-3x for VIIRS — the
-    pixel-growth effect behind the Sensor Transition Illusion.
+    `scan` / `track` columns (already in km).  Dividing by the sensor's own nadir
+    cell yields A(theta), the expansion ratio: 1.0 at nadir, up to ~9.7x at the
+    edge of scan for either sensor (Giglio 2016 for MODIS; Schroeder 2014 and the
+    2026 VIIRS studies for the I-band).  One detection is therefore never worth
+    less than one standard pixel, which is what the clip below enforces.
     """
     sensor = str(sensor).upper()
+    nadir = NADIR_KM2.get(sensor, 1.0)
     area_km2 = scan.clip(0.1, 20) * track.clip(0.1, 20)
-    nadir = 0.5625 if sensor == "VIIRS" else 1.0
-    return area_km2 / nadir, area_km2
+    return area_km2.clip(lower=nadir) / nadir, area_km2
 
 
 def harmonize(raw: pd.DataFrame) -> pd.DataFrame:
@@ -267,34 +361,100 @@ async def upload(files: list[UploadFile] = File(...), demo_transition: bool = Fa
 
 
 @app.post("/demo")
-def demo(mode: str = "standard"):
+def demo(mode: str = "standard", region: str = None):
+    """Generate the synthetic demo record. `region` scopes it to a preset AOI, so the
+    demo -- and therefore every panel -- works for any region in the catalog."""
     global DF
-    frames = _transition_frames() if mode == "transition" else _demo_frames()
+    if region is not None and region not in REGIONS:
+        raise HTTPException(400, f"unknown region {region!r}; expected one of: {region_keys()}")
+    frames = _transition_frames(region) if mode == "transition" else _demo_frames(region)
     DF = pd.concat(frames).reset_index(drop=True)
     _invalidate()
     return meta()
 
 
-_DEMO_CACHE = None
+# One generated record per (mode, region). The catalog has five presets plus the default
+# Thailand-shaped box, and each entry is built at most once.
+_DEMO_CACHE, _TRANSITION_CACHE = {}, {}
 
 
-def _demo_frames():
-    """Generate + harmonize the 2020-2024 demo once (seconds of CPU per call)."""
-    global _DEMO_CACHE
-    if _DEMO_CACHE is None:
-        _DEMO_CACHE = [harmonize(x) for x in make_demo()]
-    return _DEMO_CACHE
+def _region_seed(region, base):
+    """Stable per-region seed so two presets don't present identical demo statistics.
+
+    The generator draws the same number of events whatever the box is, so without this
+    California and the Amazon would differ only in geography. crc32 (not hash()) keeps it
+    reproducible across processes and machines, and the default demo -- the one whose
+    numbers the README quotes -- keeps its original seed.
+    """
+    return base if region is None else base + zlib.crc32(region.encode()) % 997
 
 
-_TRANSITION_CACHE = None
+def _demo_frames(region=None):
+    """Generate + harmonize the 2020-2024 demo once per region (seconds of CPU)."""
+    if region not in _DEMO_CACHE:
+        box = region_box(region) or BOX
+        _DEMO_CACHE[region] = [harmonize(x) for x in make_demo(seed=_region_seed(region, 7), box=box)]
+    return _DEMO_CACHE[region]
 
 
-def _transition_frames():
-    """Generate + harmonize the 2002-2024 illusion dataset once (it is heavy)."""
-    global _TRANSITION_CACHE
-    if _TRANSITION_CACHE is None:
-        _TRANSITION_CACHE = [harmonize(x) for x in make_transition_demo()]
-    return _TRANSITION_CACHE
+def _transition_frames(region=None):
+    """Generate + harmonize the 2002-2024 illusion dataset once per region (it is heavy)."""
+    if region not in _TRANSITION_CACHE:
+        box = region_box(region) or BOX
+        _TRANSITION_CACHE[region] = [harmonize(x) for x in
+                                     make_transition_demo(seed=_region_seed(region, 11), box=box)]
+    return _TRANSITION_CACHE[region]
+
+
+@app.post("/archive")
+def archive(region: str = None, bbox: str = None, source: str = "VIIRS_S-NPP",
+            days: int = 3, date: str = None, append: bool = True):
+    """Load a real FIRMS window for an AOI through the area API -- needs FIRMS_MAP_KEY.
+
+    The 24h open feeds make every AOI look like a single day; this pulls 1-5 days for one
+    source and region (or an explicit bbox) so the console can hold real fire records.
+    Rows are appended to whatever is loaded, exactly like an upload.
+    """
+    global DF
+    if source not in AREA_SOURCES:
+        raise HTTPException(400, f"unknown source {source!r}; expected one of: {', '.join(AREA_SOURCES)}")
+    if region is not None and region not in REGIONS:
+        raise HTTPException(400, f"unknown region {region!r}; expected one of: {region_keys()}")
+    box = parse_bbox(bbox) if bbox else (region_box(region) if region else None)
+    if box is None:
+        raise HTTPException(400, "provide ?region=<preset> or ?bbox=minlat,minlon,maxlat,maxlon")
+    if date and not DATE_RE.fullmatch(date):
+        raise HTTPException(400, "date must be YYYY-MM-DD")
+    key = os.environ.get("FIRMS_MAP_KEY", "").strip()
+    if not key:
+        raise HTTPException(400, "FIRMS_MAP_KEY is not set. Get a free key at "
+                                 "https://firms.modaps.eosdis.nasa.gov/api/map_key/ then copy "
+                                 ".env.example to .env (repo root or firecal/backend), or export FIRMS_MAP_KEY.")
+    if not MAP_KEY_RE.fullmatch(key):
+        raise HTTPException(400, "FIRMS_MAP_KEY looks malformed (expected 6-64 letters/digits)")
+    days = min(max(days, 1), 5)          # the area API accepts 1-5 days per request
+    try:
+        raw = _fetch_feed(firms_area_url(key, source, box, days, date))
+    except Exception as e:
+        # `e` is sanitised by _fetch_feed: this detail reaches the client, so nothing that
+        # could contain the key (or the URL that carries it) may be echoed here.
+        raise HTTPException(502, f"FIRMS area API request failed: {e}")
+    h = harmonize(raw)
+    a, b, c, e = box
+    # Trust the API's AREA filter, then verify: an unexpected layout must not smuggle
+    # rows outside the requested AOI into every later query.
+    h = h[(h.lat >= a) & (h.lat <= c) & (h.lon >= b) & (h.lon <= e)]
+    if not len(h):
+        raise HTTPException(400, "FIRMS returned no usable rows for that window "
+                                 "(all low-confidence, outside the AOI, or an empty day range)")
+    DF = (pd.concat([DF, h]) if append and len(DF) else h) \
+        .drop_duplicates(["lat", "lon", "time", "sensor"]).reset_index(drop=True)
+    if len(DF) > MAX_ROWS:
+        DF = DF.tail(MAX_ROWS).reset_index(drop=True)
+    _invalidate()
+    m = meta()
+    m.update({"source": source, "region": region, "days": days})
+    return m
 
 
 @app.delete("/data")
@@ -311,6 +471,12 @@ def meta():
             "hfi": round(float(DF.frp.mul(DF.esfp).sum()), 1),
             "esfp": round(float(DF.esfp.sum()), 1),
             "pixels": int(len(DF))}
+
+
+@app.get("/regions")
+def list_regions():
+    """Curated AOI presets: bbox, biome, peak season and notable past fire events."""
+    return [{"key": key, **region} for key, region in REGIONS.items()]
 
 
 def parse_bbox(bbox):
@@ -376,20 +542,33 @@ def clusters(bbox: str = None, start: str = None, end: str = None, eps: float = 
 
 def _cluster_payload(d, eps, min_pts, hours):
     if len(d) < min_pts: return []
-    d = d.head(60000)
+    # ponytail: stride-sample above 60k detections (an exact pass would be a per-day
+    # clustering rewrite). head() kept the OLDEST rows, so a big upload silently showed a
+    # map biased to the past; a stride keeps the whole period covered.
+    if len(d) > CLUSTER_MAX_POINTS:
+        d = d.sort_values("time")
+        d = d.iloc[:: max(1, -(-len(d) // CLUSTER_MAX_POINTS))]
     lat0 = np.deg2rad(d.lat.mean())
     X = np.c_[(d.lon.values * 111320 * np.cos(lat0)), d.lat.values * 110540,
               (d.time.astype("int64").values / 3.6e12) / hours * eps]  # time scaled so `hours` ~ eps metres
     lab = DBSCAN(eps=eps, min_samples=min_pts).fit_predict(X)
-    d = d.assign(c=lab); d = d[d.c >= 0]; res = []
-    for cid, g in d.groupby("c"):
+    d = d.assign(c=lab); d = d[d.c >= 0]
+    if not len(d): return []
+    # Rank first, hull second. Only the 300 biggest clusters are returned, but this used to
+    # build a convex hull (or a full point dump) for every cluster and discard ~98% of them:
+    # on a 59k-row 23-year record that was ~20k hulls and a 33 s first click. DBSCAN itself
+    # is 0.8 s of that.
+    grouped = d.groupby("c")
+    res = []
+    for cid in grouped.size().nlargest(CLUSTER_RETURN).index:
+        g = grouped.get_group(cid)
         pts = g[["lat", "lon"]].values
         try: hull = pts[ConvexHull(pts).vertices].tolist()
         except Exception: hull = pts.tolist()
         res.append({"id": int(cid), "n": len(g), "frp": round(g.frp.sum(), 1), "lat": g.lat.mean(), "lon": g.lon.mean(),
                     "start": str(g.time.min()), "end": str(g.time.max()), "hull": hull,
                     "sensors": sorted(set(g.sensor)), "duration_h": round((g.time.max() - g.time.min()).total_seconds() / 3600, 1)})
-    return sorted(res, key=lambda r: -r["n"])[:300]
+    return sorted(res, key=lambda r: -r["n"])
 
 
 # ------------------------------------------- 1. multi-decadal DOY climatology
@@ -432,19 +611,22 @@ def climatology(bbox: str = None, window: int = 15, step: int = 5):
 @app.get("/diagnostic")
 @cached
 def diagnostic(bbox: str = None):
-    """Unmask the post-2012 VIIRS deployment artifact (poster pillar 2)."""
+    """Unmask the post-2012 VIIRS deployment artifact (poster pillar 2).
+
+    The artifact is a *sampling* effect: over the same fires VIIRS resolves several
+    times more detections than MODIS, so the combined count jumps the day it arrives.
+    The correction is therefore measured from counts in the collocated window.
+
+    Footprint ratios cannot do this job.  ESFP is a per-sensor expansion ratio (≈1
+    for both sensors once each is divided by its own nadir cell) and mean FRP per
+    detection is comparable between the sensors, so an earlier version that
+    multiplied the two ratios together was multiplying two numbers that carry no
+    sampling information -- its factor of 1.73 was just the 750 m/375 m unit error
+    (1/0.5625 = 1.778) echoing through the payload.
+    """
     d = subset(bbox)
     if d.empty:
         return {"series": [], "note": "No data loaded"}
-    per = daily(d)["count"]
-    raw = d.groupby([d.date.dt.year, "sensor"]).size().unstack(fill_value=0)
-    for c in ("MODIS", "VIIRS"):
-        if c not in raw: raw[c] = 0
-    adj = per.groupby(per.index.year).sum()
-    series = [{"year": int(y),
-               "modis": int(raw.MODIS.get(y, 0)), "viirs": int(raw.VIIRS.get(y, 0)),
-               "raw_total": int(raw.MODIS.get(y, 0) + raw.VIIRS.get(y, 0)),
-               "adjusted": round(float(adj.get(y, 0.0)), 1)} for y in sorted(set(raw.index) | set(adj.index))]
     pre = d[d.date.dt.year < 2012]
     post = d[(d.date.dt.year >= 2012) & (d.date.dt.year <= 2015)]
     cal = {}
@@ -468,24 +650,43 @@ def diagnostic(bbox: str = None):
                    "rmse_mw": None if rmse is None else round(rmse, 2), "daily_count_ratio": None if k is None else round(k, 3)}
         else:
             cal = {}
+    # --- the comparable record ----------------------------------------------------
+    # A fire both sensors saw must not be counted twice, so each day keeps the larger
+    # of the two counts expressed in MODIS-detection units (`k`, the collocated-period
+    # ratio -- one MODIS detection is worth 1/k VIIRS detections).  Summing them, or
+    # rescaling and summing them, is what made the record surge after 2012.
+    k = cal.get("daily_count_ratio")
+    per = daily(d)["count"]        # the app-wide calendar series, for reference/fallback
+    if k:
+        by_sensor = d.groupby([d.date, "sensor"]).size().unstack(fill_value=0)
+        zero = pd.Series(0.0, index=by_sensor.index)
+        modis = by_sensor.get("MODIS", zero)
+        viirs = by_sensor.get("VIIRS", zero) * float(k)
+        comparable = pd.concat([modis, viirs], axis=1).max(axis=1)
+    else:
+        comparable = per
+    raw = d.groupby([d.date.dt.year, "sensor"]).size().unstack(fill_value=0)
+    for c in ("MODIS", "VIIRS"):
+        if c not in raw: raw[c] = 0
+    adj = comparable.groupby(comparable.index.year).sum()
+    series = [{"year": int(y),
+               "modis": int(raw.MODIS.get(y, 0)), "viirs": int(raw.VIIRS.get(y, 0)),
+               "raw_total": int(raw.MODIS.get(y, 0) + raw.VIIRS.get(y, 0)),
+               "adjusted": round(float(adj.get(y, 0.0)), 1)} for y in sorted(set(raw.index) | set(adj.index))]
     pre_n = int((d.date.dt.year < 2012).sum()); post_n = int(((d.date.dt.year >= 2012) & (d.date.dt.year <= 2015)).sum())
-    pre_s = per[per.index.year < 2012]
-    post_s = per[(per.index.year >= 2012) & (per.index.year <= 2015)]
-    pre_c = float(pre_s.mean()) if len(pre_s) else 0.0
-    post_c = float(post_s.mean()) if len(post_s) else 0.0
+    raw_day = d.groupby("date").size()          # what an unharmonized analyst counts
+    ry, cy = raw_day.index.year, comparable.index.year
+    pre_c = float(raw_day[ry < 2012].mean()) if len(pre) else 0.0
+    post_c = float(raw_day[(ry >= 2012) & (ry <= 2015)].mean()) if len(post) else 0.0
+    pre_k = float(comparable[cy < 2012].mean()) if len(pre) else 0.0
+    post_k = float(comparable[(cy >= 2012) & (cy <= 2015)].mean()) if len(post) else 0.0
     pre_frp = float(pre.frp.mean()) if len(pre) else 0.0
     post_frp = float(post.frp.mean()) if len(post) else 0.0
     growth = round((post_c / pre_c - 1) * 100, 1) if pre_c > 0 else None
-    m_last = d[(d.sensor == "MODIS") & (d.date.dt.year < 2012)]
-    v_first = d[(d.sensor == "VIIRS") & (d.date.dt.year >= 2012) & (d.date.dt.year <= 2015)]
-    if not m_last.empty and not v_first.empty:
-        yl = m_last[m_last.date.dt.year == m_last.date.dt.year.max()]
-        scale = float(v_first.frp.mean() / max(yl.frp.mean(), 1e-9)) * float(v_first.esfp.mean() / max(m_last.esfp.mean(), 1e-9))
-        adj_growth = round((post_c / (pre_c * scale) - 1) * 100, 1) if pre_c > 0 else None
-    else:
-        scale, adj_growth = None, None
+    adj_growth = round((post_k / pre_k - 1) * 100, 1) if pre_k > 0 else None
+    scale = round(post_c / post_k, 3) if post_k > 0 else None   # era inflation of the raw count
     return {"series": series, "observed_growth_pct": growth, "adjusted_growth_pct": adj_growth,
-            "viirs_scaling": None if scale is None else round(scale, 3),
+            "viirs_scaling": scale,
             "artifact_pct": None if (growth is None or adj_growth is None) else round(growth - adj_growth, 1),
             "calibration": cal or None,
             "stats": {"hfi": round(float(d.frp.mul(d.esfp).sum()), 1),
@@ -499,14 +700,21 @@ def diagnostic(bbox: str = None):
 def _fetch_feed(url, timeout=90):
     # Streamed with a hard ceiling. r.content buffered whatever came back with no limit,
     # so a huge or unexpected response would be pulled into memory in full.
-    with requests.get(url, headers=LIVE_USER_AGENT, timeout=timeout, stream=True) as r:
-        if r.status_code != 200:
-            raise RuntimeError(f"HTTP {r.status_code}")
-        buf = bytearray()
-        for chunk in r.iter_content(1 << 20):
-            buf += chunk
-            if len(buf) > MAX_FEED_BYTES:
-                raise RuntimeError(f"feed exceeded {MAX_FEED_BYTES // (1024 * 1024)} MB")
+    #
+    # The URL can carry the operator's FIRMS_MAP_KEY (every /archive pull does) and
+    # requests' own exception text embeds the full URL, so a transport failure must not
+    # propagate that text: it used to reach the caller in the 502 detail /archive returns.
+    try:
+        with requests.get(url, headers=LIVE_USER_AGENT, timeout=timeout, stream=True) as r:
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code}")
+            buf = bytearray()
+            for chunk in r.iter_content(1 << 20):
+                buf += chunk
+                if len(buf) > MAX_FEED_BYTES:
+                    raise RuntimeError(f"feed exceeded {MAX_FEED_BYTES // (1024 * 1024)} MB")
+    except requests.RequestException as e:
+        raise RuntimeError(f"request failed: {type(e).__name__}") from None
     if len(buf) < 80:
         raise RuntimeError(f"HTTP {r.status_code}")
     try:

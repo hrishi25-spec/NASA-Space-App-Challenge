@@ -5,7 +5,7 @@ A unified fire-intelligence platform that harmonizes MODIS and VIIRS active-fire
 Beyond the base calendar, it implements the four **Pyro-Harmony** poster pillars:
 
 1. **Multi-decadal burning-activity climatology** — day-of-year heatmap matrix plus a 10th/50th/90th/95th percentile envelope that exposes seasonal onset, peak burning days, and cessation.
-2. **The "Sensor Transition Illusion" diagnostic** — quantifies and removes the artificial post-2012 surge caused by VIIRS 375 m deployment, using ESFP footprint scaling and cross-sensor calibration (R², RMSE).
+2. **The "Sensor Transition Illusion" diagnostic** — quantifies and removes the artificial post-2012 surge caused by VIIRS 375 m deployment, using the detection ratio measured on days both sensors flew, plus cross-sensor calibration (R², RMSE).
 3. **Live FIRMS ingestion + hotspot clustering** — pulls 24 h NRT CSVs (MODIS C6.1, VIIRS S-NPP/NOAA-20/NOAA-21) from NASA's open endpoints, harmonizes on the fly, and DBSCAN-clusters them.
 4. **Incident Commander wildfire briefing** — flags consecutive critical days (z ≥ 2σ), stratifies fuel biomes via K-means, assigns a threat level, and generates exportable (Markdown/clipboard) recommendations.
 
@@ -129,6 +129,12 @@ The Vite dev server proxies `/api` → `:8000` automatically (`firecal/frontend/
 2. Click **Upload FIRMS CSVs** in the app (multiple files at once are fine).
 3. For **anomalies** and the **forecast**, upload **more than one year** of data.
 
+Or let the backend pull a real window for you: with a free
+[FIRMS MAP_KEY](https://firms.modaps.eosdis.nasa.gov/api/map_key/) in `.env`, **Real 3-day
+pull** in the live panel loads 1–5 days straight from the FIRMS area API for the selected
+region (or drawn AOI) and merges them into the current record. Without a key the button
+says so instead of failing silently — the download path still works offline.
+
 You can also generate realistic fake files instead: run `python demo.py` in
 `firecal/backend/` to write `demo_modis.csv` / `demo_viirs.csv`, then upload them like
 real FIRMS files (they exercise the exact same parsing pipeline).
@@ -136,7 +142,9 @@ real FIRMS files (they exercise the exact same parsing pipeline).
 No files at hand? The UI's **Load demo** button loads a 2020–2024 synthetic set, and
 **Load 2002–2024 demo** loads a 23-year transition dataset (MODIS-only era → VIIRS
 ramp-up after 2012) that makes the Sensor Transition Illusion visible: raw detections
-surge after 2012 while the harmonized record stays flat.
+surge after 2012 while the harmonized record stays flat. Both follow the selected region
+preset, so *Load demo* with **Punjab & Haryana** selected fills that AOI instead of the
+default box; each preset gets its own seed, so no two regions show identical statistics.
 
 ## What you see
 
@@ -144,12 +152,13 @@ surge after 2012 while the harmonized record stays flat.
 |---|---|
 | **Hero stats strip** | HFII (Σ FRP·ESFP), equivalent standard pixels (ESFP), hotspots harmonized, record span. |
 | **Burning calendar** | GitHub-style heatmap: one row per year, one cell per day, color = harmonized daily detections. A **Year** selector narrows it to a single-year calendar. Click any day to inspect it. |
-| **Map** | One camera that morphs a **3D Earth globe** into a flat map as you zoom (the badge tracks `3D GLOBE → TRANSITION → 2D MAP`); scroll in past the transition for the flat view, or press **Globe view** to fly back. Detections for the selected day (±1/3/7/14 d span) — **MODIS coral, VIIRS amber, live points pale gold** — plus soft-sand DBSCAN cluster polygons, on either **Satellite** imagery or the colour **Terrain** basemap (both toggles sit with the other view controls in the top-right). The bottom-left chip is a pure readout (`day · hotspots · clusters · MW`) so it never covers the Esri attribution. Live-feed points/polygons overlay when pulled. Use **Select area** and click two corners to draw a bounding box; every panel then filters to it. |
+| **Region presets** | The *Fly to…* picker in the command bar (California, Amazon & Pantanal, Southeastern Australia, Punjab & Haryana, Mediterranean basin) sets the AOI filter, flies the camera to a regional zoom, and fills the **Selection** panel with the region's fuel type, peak season and notable fire years. Every panel then recomputes for that AOI; **Load demo** follows the selection, and when an AOI holds no detections the panel offers *Load demo for …*. |
+| **Map** | One camera that morphs a **3D Earth globe** into a flat map as you zoom (the badge tracks `3D GLOBE → TRANSITION → 2D MAP`); scroll in past the transition for the flat view, or press **Globe view** to fly back. **Fly to AOI** fits the drawn box, **Reset orbit** returns to the default global attitude, and **Auto-rotate** drifts the bearing slowly (opt-in, slower on weak GPUs, and any gesture stops it). Detections for the selected day (±1/3/7/14 d span) — **MODIS coral, VIIRS amber, live points pale gold** — plus soft-sand DBSCAN cluster polygons, on either **Satellite** imagery or the colour **Terrain** basemap (both toggles sit with the other view controls in the top-right). The bottom-left chip is a pure readout (`day · hotspots · clusters · MW`) so it never covers the Esri attribution. Live-feed points/polygons overlay when pulled. Use **Select area** and click two corners to draw a bounding box; every panel then filters to it. |
 | **Anomalies & critical periods** | A click-through list of anomalous days (z-score vs the same ±7-day window in other years) and the months running above mean + 1σ flagged as *critical*. |
 | **Incident Commander briefing** | Threat level (Low/Watch/Elevated/Critical) with its score, record mean and last-30-days readout, then the full report split across **four sub-tabs** — Situation, Critical streaks, Fuel types, Actions — each with a count badge so you can see what is inside before opening it. Streak rows jump the map to that window; **Copy MD** exports the whole briefing. The right-rail card keeps the compact headline version. |
 | **Last year + 30-day forecast** | Line chart of the trailing 365 days with the forecast appended, now with an Observed/Forecast legend and the fitted method named. |
 | **Seasonal climatology** | Day-of-year percentile envelope (10/50/90/95) with **Peak day** and **Fire season** (onset → cessation) called out above the chart. |
-| **Sensor Transition Illusion** | Per-sensor raw detections vs the harmonized line; observed vs adjusted post-2012 growth, artifact removed, calibration stats. In the 2002–2024 demo this reads +102.4 % raw → +17 % harmonized, 85.4 pp of artifact. |
+| **Sensor Transition Illusion** | Per-sensor raw detections vs the harmonized line; observed vs adjusted post-2012 growth, artifact removed, calibration stats. On the default 2002–2024 demo this reads +304.0 % raw → +11.7 % harmonized, 292.3 pp of artifact; a region preset draws its own record (Southeastern Australia measured +339.2 % → +23.6 %, 315.6 pp, era factor 3.553, 10,046 matchups, R² 0.848). |
 | **Live FIRMS 24h feed** | Region selector; pulls MODIS + 3 VIIRS NRT feeds, harmonizes, clusters, and overlays them on the map. |
 
 ## Method
@@ -159,13 +168,18 @@ surge after 2012 while the harmonized record stays flat.
   `acq_date` + `acq_time`; duplicate rows removed on `(lat, lon, time, sensor)`.
   Because VIIRS 375 m finds more fires than MODIS 1 km, per-sensor daily counts are
   **rescaled to the best-covered sensor over their overlap period** before summing.
-- **ESFP / HFII** — every detection keeps its FIRMS `scan`/`track` footprint; the
-  nadir-normalized expansion ratio (≈10× at MODIS scan edge vs ≈2–3× for VIIRS) yields
-  *equivalent standard pixels*, and HFII = Σ FRP·ESFP (standardized radiative energy).
+- **ESFP / HFII** — every detection keeps its FIRMS `scan`/`track` footprint, divided by
+  that sensor's own nadir cell (MODIS 1 km², VIIRS 0.140625 km² — the 375 m I-band
+  product FIRMS distributes, not the 750 m M-band one) to give the footprint expansion
+  ratio: 1.0 at nadir, ≈9.7× at the edge of scan for either sensor, never below 1.0.
+  Those are the *equivalent standard pixels*, and HFII = Σ FRP·ESFP.
 - **Climatology** — rolling 15-day percentiles per day-of-year across all years;
   onset/cessation = first/last DOY where the 95th percentile exceeds 50 % of its max.
-- **Illusion diagnostic** — pre/post-2012 daily means, VIIRS scaling from collocated
-  FRP + ESFP ratios, daily-count correlation (R²) and RMSE in the 2012–2015 overlap.
+- **Illusion diagnostic** — pre/post-2012 daily means; the era factor is the measured
+  detection ratio on days both sensors flew (VIIRS resolves several times more
+  detections over the same fires), and the comparable record takes the larger of the two
+  counts in a common unit per day, so a fire both sensors saw is counted once.  Also
+  reports daily-count correlation (R²), RMSE and the FRP/ESFP ratios in the overlap.
 - **Briefing** — z-scores vs the same ±7-day DOY window in other years (vectorized),
   consecutive-day streaks (z ≥ 2σ, 2-day gap tolerance), K-means (k=4) fuel-biome
   stratification on position + FRP after Zhang et al. (2020), threat score
@@ -187,16 +201,18 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
 | Method & path | Parameters | Description |
 |---|---|---|
 | `POST /upload` | multipart `files[]`, `demo_transition` (bool) | Add FIRMS CSVs (200 MB/file, 400 MB/request, ≤20 files). HTTP 400 with the sanitised filename and reason on bad files, HTTP 413 if the request declares more than 400 MB. `demo_transition=true` replaces the dataset with the 2002–2024 demo — the poster dataset is loaded by this flag, **not** by naming a file `demo_transition.csv`. |
-| `POST /demo` | `mode=standard\|transition` | Replace data with the synthetic 2020–2024 set, or the 2002–2024 transition set. |
+| `POST /demo` | `mode=standard\|transition`, `region` | Replace data with the synthetic 2020–2024 set, or the 2002–2024 transition set. `region` scopes the generated record (and its own seed) to a preset AOI, so the demo works for any region; HTTP 400 for an unknown key. |
+| `POST /archive` | `region`, `bbox`, `source`, `days` (1–5), `date`, `append` | Load a **real** FIRMS window through the area API and merge it into the record (like an upload). Needs `FIRMS_MAP_KEY`: HTTP 400 with the link and the `.env` locations when it is missing, 400 for an unknown source/region/bad date, 502 when FIRMS is unreachable. Rows outside the requested AOI are dropped, and the response is `meta` plus `{source, region, days}`. |
 | `DELETE /data` | — | Clear all loaded data. |
+| `GET /regions` | — | Curated AOI presets: `{key, name, subtitle, bbox, center, zoom, biome, peak_months, events[], firms_region}`. `firms_region` is always on the live-feed allowlist. |
 | `GET /meta` | — | `{n, start, end, sensors, bounds, hfi, esfp, pixels}` or `{"n": 0}`. |
 | `GET /climatology` | `bbox`, `window` (3–45), `step` (1–30) | Per-year DOY series, DOY percentile envelope (p10/50/90/95), peak/onset/cessation summary. |
-| `GET /diagnostic` | `bbox` | Sensor Transition Illusion: per-year raw counts per sensor, harmonized totals, observed/adjusted post-2012 growth, calibration (R², RMSE, FRP & ESFP ratios). |
+| `GET /diagnostic` | `bbox` | Sensor Transition Illusion: per-year raw counts per sensor, the comparable record, observed/adjusted post-2012 growth, the era scaling factor, calibration (R², RMSE, FRP & ESFP ratios). |
 | `GET /live` | `region`, `bbox`, `crop`, `eps`, `min_pts`, `hours` | Pull FIRMS 24h NRT feeds (region name with underscores, e.g. `South_America`), harmonize + cluster on the fly. `region` is allowlisted because it is interpolated into the outbound URL (HTTP 400 otherwise), at most two ingests run at once (HTTP 429), and HTTP 502 means no feed was reachable. |
 | `GET /briefing` | `bbox`, `z` (1–5), `min_days`, `format=json\|markdown` | Threat level, critical streaks, fuel biomes, recommendations. Markdown for incident hand-off. |
 | `GET /calendar` | `bbox`, `start`, `end` | Daily rows: `{date, count, raw, frp}`. |
-| `GET /points` | `bbox`, `start`, `end`, `limit` (1–20000) | Map points, randomly sampled if over the limit. |
-| `GET /clusters` | `bbox`, `start`, `end`, `eps` (10–5000), `min_pts` (1–100), `hours` (0.5–720) | DBSCAN clusters, top 300 by size, each with a convex `hull`. |
+| `GET /points` | `bbox`, `start`, `end`, `limit` (1–20000) | Map points (`{lat, lon, frp, sensor}`), randomly sampled if over the limit. |
+| `GET /clusters` | `bbox`, `start`, `end`, `eps` (10–5000), `min_pts` (1–100), `hours` (0.5–720) | DBSCAN clusters, top 300 by size, each with a convex `hull`. Only those 300 are hulled (hulling every cluster made one uncached call cost 33 s on a 23-year record); above 60k detections the input is stride-sampled across the whole period rather than truncated to the oldest rows. |
 | `GET /anomalies` | `bbox`, `z` (0.5–10) | `{anomalies[], critical[], monthly[]}`; needs >1 year of data. |
 | `GET /forecast` | `bbox`, `horizon` (1–90), `epochs` (1–200) | `{model, forecast[]}`; needs ≥120 days. |
 
@@ -212,12 +228,14 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
 ├── run.py                          ← the one-command launcher (any OS, stdlib only)
 ├── start.sh                        ← thin wrapper: ./start.sh (Linux/macOS)
 ├── start.bat                       ← thin wrapper: start.bat (Windows)
+├── .env.example                    ← optional FIRMS_MAP_KEY + ALLOW_ORIGINS (copy to .env)
 ├── .github/workflows/ci.yml        ← CI (pytest + frontend build)
 └── firecal/
     ├── backend/
     │   ├── main.py                 ← FastAPI app: endpoints, harmonization, analytics
+    │   ├── regions.py              ← curated AOI presets: bbox, biome, peak season, notable fires
     │   ├── demo.py                 ← synthetic FIRMS generator (2020–24 + 2002–24 transition)
-    │   ├── test_smoke.py           ← 19-test API smoke suite (encodings, gzip, cache invalidation)
+    │   ├── test_smoke.py           ← 28-test API smoke suite (encodings, gzip, cache, presets, archive)
     │   ├── test_security.py        ← 20-test hardening suite (URL allowlist, upload caps, CORS)
     │   ├── requirements.txt        ← runtime deps (with security floors)
     │   └── requirements-dev.txt    ← + pytest, httpx (for tests)
@@ -229,7 +247,8 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
         └── src/
             ├── App.jsx             ← layout: heatmap, map, drawer tabs (lazy-loads the rest)
             ├── MissionMap.jsx      ← MapLibre stage: 3D globe ⇄ flat map, clusters, picking
-            ├── charts.jsx          ← chart tabs (lazy: pulls Recharts only when opened)
+            ├── charts.jsx          ← chart tabs (lazy: fetched only when a tab opens)
+            ├── plot.jsx            ← hand-rolled SVG chart kit (axes, bands, bars, hover)
             ├── ForecastChart.jsx   ← forecast line chart (lazy)
             ├── panels.jsx          ← chart-free pillars: hero stats, live feed, briefing
             ├── lib.js              ← API client (memoized), heat ramp, formatters
@@ -242,7 +261,7 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
 | Layer | Choices |
 |---|---|
 | Backend | FastAPI, pandas, NumPy, scikit-learn (DBSCAN, K-means), SciPy (convex hull), requests (live FIRMS), optional PyTorch (LSTM) |
-| Frontend | React 18, Vite 5, MapLibre GL 6 (one camera morphing a 3D globe into a flat map), Recharts |
+| Frontend | React 18, Vite 5, MapLibre GL 6 (one camera morphing a 3D globe into a flat map), hand-rolled SVG charts |
 | Tooling | `check-lazy-exports.mjs` (zero-dep build guard, wired as `prebuild`) |
 | Data | NASA FIRMS archive CSVs (MODIS C6.1, VIIRS SNPP/NOAA-20) |
 | CI | GitHub Actions — pytest on Python 3.12, `npm ci` + build on Node 20 |
@@ -286,15 +305,20 @@ sanctioned exception is an `h3` subtitle, which reads as prose.
 The app targets machines with a weak CPU, little RAM and no discrete GPU, so it is
 built to stay responsive rather than to look impressive in a profiler.
 
-**First paint is small.** MapLibre (~280 KB gzipped) and Recharts (~109 KB gzipped) are
-code-split behind `React.lazy`, so the console shell paints after loading only the app
-chunk plus React — about **170 KB raw / 55 KB gzipped**, against 2,078 KB before the
-split. Measured cold: DOMContentLoaded **1,768 ms → 283 ms**, requests **44 → 14**. The
-map engine is fetched when the map mounts; the charting library only when a chart tab is
-opened — and hovering or focusing a drawer tab starts that download early, so the click
-lands on an already-warm module. `manualChunks` is a function over the module path rather
-than an object of package names: the object form matched only entry files, which pulled
-Recharts back into the first paint.
+**First paint is small.** MapLibre (~280 KB gzipped) is code-split behind `React.lazy`, so
+the console shell paints after loading only the app chunk plus React — about **170 KB raw /
+55 KB gzipped**, against 2,078 KB before the split. Measured cold: DOMContentLoaded
+**1,768 ms → 283 ms**, requests **44 → 14**. The map engine is fetched when the map mounts;
+charting code only when a chart tab is opened — and hovering or focusing a drawer tab
+starts that download early, so the click lands on an already-warm module.
+
+**Charts are hand-rolled SVG, not a charting library.** A chart tab used to pull a 404 KB
+(108.7 KB gzipped) vendor chunk plus ~10 transitive packages (d3, victory-vendor,
+react-smooth, …) to draw three charts. `src/plot.jsx` does axes, an envelope band, grouped
+bars, line series, a legend and a hover readout in ~130 lines — the same approach as the
+calendar heatmap that was already hand-rolled — so a chart tab now costs **9.1 KB raw /
+4.2 KB gzipped** and the app has one fewer dependency family (and `recharts`, `cobe`,
+`leaflet` and `react-leaflet` are gone from `package.json`).
 
 **Interactions are memoized twice.** The API gzips its JSON (≈4–9× smaller on the
 calendar, points and climatology payloads) and each analytics endpoint is memoized
@@ -312,7 +336,7 @@ four cores or less, MSAA is disabled and camera moves become instant (`LOW_END` 
 ## Testing & CI
 
 ```bash
-# 39 tests, ~2 min — starts the app in-process via TestClient
+# 53 tests, ~2 min — starts the app in-process via TestClient
 cd firecal/backend
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest -q
@@ -324,12 +348,17 @@ npm run check:lazy                 # …or run the guard on its own
 
 `.github/workflows/ci.yml` runs both on every push to `main` and on pull requests.
 
-**`test_smoke.py` (19)** covers every endpoint end-to-end — demo load, calendar with and
+**`test_smoke.py` (29)** covers every endpoint end-to-end — demo load, calendar with and
 without bbox, points clamping, clusters, climatology envelope, illusion diagnostic on both
 demos, briefing JSON + Markdown, live feed (skipped offline when FIRMS is unreachable),
 anomalies, forecast — plus error paths (bad bbox → 400, missing-column CSV → 400, valid CSV
 merge, clear), the three CSV encodings (UTF-8, cp1252, UTF-16 BOM), gzip on the wire, and
-cache invalidation after a dataset change.
+cache invalidation after a dataset change. The region work added its own cases: the preset
+catalog is well-formed and every `firms_region` stays on the live allowlist, a per-region
+demo really lands inside its bbox and carries the calendar, the per-region seed is stable
+and region-specific, `.env` parsing handles comments/`export`/quotes, and `/archive`
+validates the request *before* the key, explains a missing key, builds the area-API URL in
+west,south,east,north order, and merges rows while dropping anything outside the AOI.
 
 **`test_security.py` (20)** pins the input-handling guarantees described under
 [Security notes](#security-notes), so they fail loudly if they regress: unknown/traversal/
@@ -349,6 +378,8 @@ no type checker or bundler catches it, so it is checked explicitly.
 | Setting | Default | Notes |
 |---|---|---|
 | `ALLOW_ORIGINS` | local origins | Comma-separated origins; set when deploying so only your frontend can call the API. The dev server proxies `/api`, so the browser is same-origin and needs no grant. |
+| `FIRMS_MAP_KEY` | unset | Optional, read from the environment only (never from a request); enables `POST /archive`. `.env` is loaded from `firecal/backend/`, `firecal/` or the repo root, and a real environment variable always wins. |
+| Archive window | 1–5 days per pull | FIRMS area-API limit; `days` is clamped, `source` is one of four mapped products, and `date` must be `YYYY-MM-DD`. |
 | Upload size | 200 MB / file, 400 MB / request | Per-file is enforced while reading; the request-wide cap is checked from `Content-Length` before the body is buffered → HTTP 413. |
 | Upload count | 20 files / request | Public demo console, no auth: a request carrying 50 files is not a use case. |
 | Outbound feed cap | 64 MB | One live FIRMS CSV download; larger responses are abandoned mid-stream. |
@@ -376,8 +407,21 @@ data and can replace the in-memory dataset. What the API does enforce:
   newlines (which would otherwise forge log lines) before appearing in an error body.
 - **CORS defaults to the local origins**, not `*`, and is never paired with credentials — with
   no auth and no cookies, `*` only let any visited web page drive `/upload` and `/demo`.
+- **Writes are gated by `Origin`, because CORS does not stop a request.** The browser sends a
+  form POST without a preflight, so a page the operator merely had open could still drive
+  `/upload`, `/demo`, `/archive` and `/live`. `POST`/`PUT`/`PATCH`/`DELETE` now need an
+  `Origin` of either this host or an explicit `ALLOW_ORIGINS` entry (403 otherwise); a caller
+  that sends no `Origin` at all (curl, pytest, the launcher) is untouched, and reads are never
+  gated.
 - **Dependency floors** in `requirements.txt` cover the multipart advisories
   (CVE-2024-47874, CVE-2024-53981) that were reachable through `/upload`.
+- **The FIRMS MAP_KEY never comes from a request.** It is read from the process environment
+  (or the git-ignored `.env`), matched against `[A-Za-z0-9]{6,64}` before it is interpolated
+  into the outbound URL, and never echoed back — including through the one path that used to
+  leak it: `requests` puts the whole URL in its own exception text, so a transport failure is
+  now reduced to `request failed: <ExceptionType>` before it can reach a 502 body. Everything
+  else in that URL — source, AOI, day range, date — is allowlisted, range-checked or
+  regex-validated first.
 
 Known gaps, accepted for a prototype and worth closing before real deployment:
 
@@ -396,6 +440,9 @@ Known gaps, accepted for a prototype and worth closing before real deployment:
 - **Forecast says “install torch for LSTM”** — expected without PyTorch; numbers still
   show, via the climatology fallback: `pip install torch`.
 - **CORS errors after deploying** — set `ALLOW_ORIGINS` on the backend to your frontend's origin.
+- **“Real-window pull failed: FIRMS_MAP_KEY is not set”** — expected: the area API needs a
+  free key. Copy `.env.example` to `.env` and paste it in, or export `FIRMS_MAP_KEY`, or keep
+  using CSV uploads and the open 24 h feeds, which need no key.
 - **Upload rejected** — check the file has FIRMS columns
   (`latitude, longitude, acq_date, acq_time, confidence`); the error message lists what's missing.
 - **`Could not create a virtualenv` on Linux** — the venv module isn't installed:

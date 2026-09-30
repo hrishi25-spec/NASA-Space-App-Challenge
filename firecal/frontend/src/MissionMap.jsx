@@ -119,6 +119,7 @@ export default function MissionMap({
   day,
   span,
   end,
+  fly,
 }) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
@@ -137,6 +138,7 @@ export default function MissionMap({
   const selectionDataRef = useRef(null);
   const [firstCorner, setFirstCorner] = useState(null);
   const [view, setView] = useState("3D globe");
+  const [spin, setSpin] = useState(false);
   const viewRef = useRef("3D globe");
 
   onSelectBoundsRef.current = onSelectBounds;
@@ -306,6 +308,34 @@ export default function MissionMap({
     mapRef.current?.easeTo({ center: [center[1], center[0]], zoom: START_ZOOM, duration: MOTION_MS + 100 });
   }, [center[0], center[1]]);
 
+  // Preset navigation: one flight to a curated AOI. Kept separate from the dataset-bounds
+  // easing above, which always lands at the opening globe zoom; a preset wants a regional
+  // zoom instead. `fly.nonce` changes on every pick, so re-picking the same region re-flies.
+  const flyNonce = fly?.nonce;
+  useEffect(() => {
+    if (!fly || !mapRef.current) return;
+    mapRef.current.flyTo({ center: [fly.center[1], fly.center[0]], zoom: fly.zoom ?? START_ZOOM,
+                           duration: MOTION_MS + 250 });
+  }, [flyNonce]);
+
+  // Opt-in orbital drift. Slower on weak GPUs, and any gesture stops it immediately so it
+  // can never fight the operator mid-drag.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !spin) return undefined;
+    const step = LOW_END ? 0.12 : 0.22;
+    const id = setInterval(() => map.setBearing((map.getBearing() + step) % 360), LOW_END ? 140 : 70);
+    return () => clearInterval(id);
+  }, [spin]);
+  useEffect(() => {
+    const el = mapRef.current?.getCanvas();
+    if (!el || !spin) return undefined;
+    const stop = () => setSpin(false);
+    el.addEventListener("pointerdown", stop);
+    el.addEventListener("wheel", stop, { passive: true });
+    return () => { el.removeEventListener("pointerdown", stop); el.removeEventListener("wheel", stop); };
+  }, [spin]);
+
   const hotspotTotal = points.length + (live?.rows?.length || 0);
   const totalFrp = points.reduce((sum, point) => sum + (point.frp || 0), 0)
     + (live?.rows || []).reduce((sum, point) => sum + (point.frp || 0), 0);
@@ -329,6 +359,14 @@ export default function MissionMap({
         <button className={"btn sm" + (tiles === "terrain" ? " on" : "")} onClick={() => onTilesChange("terrain")}>Terrain</button>
       </span>
       <button className="btn sm" onClick={() => mapRef.current?.easeTo({ zoom: START_ZOOM, duration: MOTION_MS })} title="Return to the 3D Earth view">⤢ Globe view</button>
+      <button className="btn sm" disabled={!bbox}
+        onClick={() => bbox && mapRef.current?.fitBounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]], { padding: 56, duration: MOTION_MS + 250 })}
+        title="Zoom the camera to the selected area">⌖ Fly to AOI</button>
+      <button className="btn sm"
+        onClick={() => mapRef.current?.easeTo({ center: [0, 0], zoom: START_ZOOM, bearing: 0, pitch: 0, duration: MOTION_MS + 250 })}
+        title="Return to the default global view">↺ Reset orbit</button>
+      <button className={"btn sm" + (spin ? " on" : "")} onClick={() => setSpin(on => !on)} aria-pressed={spin}
+        title="Slowly rotate the view; any gesture stops it">⟳ Auto-rotate</button>
     </div>
     <div className="scan" />
     <div className="chip bl mapReadout">

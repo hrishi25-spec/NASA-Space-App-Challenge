@@ -9,3 +9,8 @@ dist/
 
 # Uploads / local data
 *.csv
+
+# Local configuration and secrets
+.env
+.env.local
+.env.*.local

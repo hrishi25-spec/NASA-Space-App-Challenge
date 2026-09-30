@@ -13,6 +13,7 @@ import io
 
 import pandas as pd
 import pytest
+import requests
 from fastapi.testclient import TestClient
 
 import main
@@ -166,6 +167,38 @@ def test_safe_name_strips_directories_controls_and_length():
 
 
 # ------------------------------------------------------------------- CORS default
+def test_archive_failure_never_reflects_the_map_key(monkeypatch):
+    """The area-API URL embeds FIRMS_MAP_KEY, and `requests` puts the whole URL in its
+    own exception text, so the 502 detail used to hand the operator's key to the caller.
+    """
+    sentinel = "SENTINELKEY123"
+    monkeypatch.setenv("FIRMS_MAP_KEY", sentinel)
+
+    def boom(url, **_kw):
+        raise requests.exceptions.ConnectionError(f"Max retries exceeded with url: {url}")
+
+    monkeypatch.setattr(main.requests, "get", boom)
+    r = client.post("/archive", params={"region": "california", "days": 1})
+    assert r.status_code == 502
+    assert sentinel not in r.text and "SENTINEL" not in r.text
+    assert "ConnectionError" in r.json()["detail"]          # still diagnosable
+
+
+def test_foreign_origin_cannot_drive_a_write():
+    """CORS stops a foreign page reading the response, never sending the request: a form
+    POST is not preflighted, so before this guard any open page could replace the dataset.
+    """
+    evil = {"Origin": "https://evil.example"}
+    assert client.post("/demo", headers=evil).status_code == 403
+    assert client.post("/upload", files=[_csv("ok.csv")], headers=evil).status_code == 403
+    assert client.delete("/data", headers=evil).status_code == 403
+    assert client.get("/meta", headers=evil).status_code == 200        # reads stay open
+    # same host, an allowlisted dev origin, and a no-Origin caller all still write
+    assert client.post("/demo", headers={"Origin": "http://testserver"}).status_code == 200
+    assert client.post("/demo", headers={"Origin": "http://127.0.0.1:5173"}).status_code == 200
+    assert client.post("/demo").status_code == 200
+
+
 def test_cors_default_is_local_only():
     """`*` let any visited web page drive /upload and /demo against the operator's data."""
     allowed = client.get("/meta", headers={"Origin": "http://127.0.0.1:5173"})

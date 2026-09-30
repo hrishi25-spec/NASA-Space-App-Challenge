@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState, Suspense, lazy } from "react";
+import React, { useEffect, useMemo, useRef, useState, Suspense, lazy } from "react";
 import { api, errMsg, ramp, fmt, invalidateApiCache } from "./lib";
 import { HeroStats, LivePanel, BriefingPanel } from "./panels";
 
@@ -116,9 +116,32 @@ export default function App() {
   // null and the calendar empty, so the dataset gets its own version counter.
   const [dataKey, setDataKey] = useState(0);
   const [tiles, setTiles] = useState("sat"), [tab, setTab] = useState("calendar");
+  // Curated AOI presets: the picker sets the bbox filter and flies the camera. `fly` carries
+  // a nonce so picking the same region twice still re-flies.
+  const [regions, setRegions] = useState([]), [presetKey, setPresetKey] = useState(null), [fly, setFly] = useState(null);
+  const flyNonce = useRef(0);
   const bb = bbox?.join(",");
 
   useEffect(() => { api("/meta").then(setMeta).catch(() => { /* intro card covers the down state */ }); }, []);
+  useEffect(() => { api("/regions").then(setRegions).catch(() => setRegions([])); }, []);
+
+  // The picked preset, or whichever preset the current bbox matches: a hand-picked box that
+  // happens to line up with a preset gets that region's facts too, so the panel describes
+  // the AOI rather than the click that created it.
+  const preset = useMemo(() => regions.find(r => r.key === presetKey)
+    || regions.find(r => bbox && r.bbox.join() === bbox.join()), [regions, presetKey, bb]);
+
+  function gotoRegion(key) {
+    const region = regions.find(r => r.key === key);
+    setDay(null); setPick(false);                            // the day cursor belongs to the old AOI
+    if (!region) {                                           // "Fly to…" / Clear: back to the global view
+      setPresetKey(null); setBbox(null);
+      setFly({ center: [0, 0], nonce: ++flyNonce.current });
+      return;
+    }
+    setPresetKey(region.key); setBbox(region.bbox);
+    setFly({ center: region.center, zoom: region.zoom, nonce: ++flyNonce.current });
+  }
   useEffect(() => {
     if (!meta.n) return;
     api("/calendar", { bbox: bb })
@@ -129,20 +152,29 @@ export default function App() {
     setYearSel("all");
     setDiagKey(k => k + 1);
   }, [meta.n, dataKey, bb]);
-  async function loadDemo(mode) {
-    setBusy(true); setDay(null); setBbox(null); setErr(null);
+  async function loadDemo(mode, region) {
+    // Follow the selected AOI: clicking "Load demo" while a region is active must put the
+    // demo inside that region instead of back in the default box, which would look empty.
+    const target = region ?? preset?.key ?? null;
+    setBusy(true); setDay(null); setErr(null);
+    if (!target) setBbox(null);
     try {
-      const r = await fetch("/api/demo" + (mode === "transition" ? "?mode=transition" : ""), { method: "POST" });
+      const q = new URLSearchParams();
+      if (mode === "transition") q.set("mode", "transition");
+      if (target) q.set("region", target);
+      const r = await fetch("/api/demo" + (q.toString() ? "?" + q : ""), { method: "POST" });
       if (!r.ok) {
         const msg = await errMsg(r);
         throw new Error(msg === "Method Not Allowed" ? "wrong HTTP method" : msg);
       }
-      setMeta(await r.json());
-      invalidateApiCache();          // the dataset changed: every cached query is stale
-      setDataKey(k => k + 1);
-      setDiagKey(k => k + 1);
+      datasetChanged(await r.json());
     } catch (e) { setErr("Could not load demo data — " + (e && e.message && e.message !== "Failed to fetch" ? e.message : "the API server isn't reachable on :8000. Start it with start.bat / start.sh (backend: uvicorn main:app --port 8000), then try again.")); }
     setBusy(false);
+  }
+  // Any loader that changes the dataset (upload, demo, real FIRMS window) lands here, so the
+  // memoized queries are dropped and the panels refetch against the new record.
+  function datasetChanged(m) {
+    setMeta(m); invalidateApiCache(); setDay(null); setDataKey(k => k + 1); setDiagKey(k => k + 1);
   }
   const end = day && new Date(new Date(day).getTime() + (span - 1) * 864e5).toISOString().slice(0, 10);
   useEffect(() => {
@@ -160,7 +192,7 @@ export default function App() {
     try {
       const r = await fetch("/api/upload", { method: "POST", body: fd });
       if (!r.ok) setErr("Upload failed: " + await errMsg(r));
-      else { setMeta(await r.json()); invalidateApiCache(); setDay(null); setDataKey(k => k + 1); setDiagKey(k => k + 1); }
+      else datasetChanged(await r.json());
     } catch { setErr("Upload failed — could not reach the backend."); }
     setBusy(false); e.target.value = "";
   }
@@ -186,8 +218,13 @@ export default function App() {
       </label>
       <button className="btn" onClick={() => loadDemo()} disabled={busy}>Load demo</button>
       <button className="btn" onClick={() => loadDemo("transition")} disabled={busy}>2002–2024</button>
+      {regions.length > 0 && <select value={preset?.key || ""} onChange={e => gotoRegion(e.target.value)}
+        title="Fly the map to a curated fire region">
+        <option value="">Fly to…</option>
+        {regions.map(r => <option key={r.key} value={r.key}>{r.name}</option>)}
+      </select>}
       <button className={"btn" + (pick ? " on" : "")} onClick={() => setPick(!pick)}>{pick ? "Pick 2 corners…" : "Select area"}</button>
-      {bbox && <button className="btn" onClick={() => setBbox(null)}>Clear</button>}
+      {bbox && <button className="btn" onClick={() => gotoRegion("")}>Clear</button>}
     </header>
 
     {err && <div className="banner">⚠ {err}</div>}
@@ -213,9 +250,20 @@ export default function App() {
             <h3>Selection</h3>
             <div className="kv"><span className="mut">AOI</span><b>{bbox ? `${bbox[0].toFixed(2)}, ${bbox[1].toFixed(2)} → ${bbox[2].toFixed(2)}, ${bbox[3].toFixed(2)}` : "global"}</b></div>
             <div className="kv"><span className="mut">Cursor day</span><b>{day || "—"}</b>{span > 1 && <b>→ {end}</b>}</div>
+            {preset && <>
+              <div className="kv"><span className="mut">Region</span><b>{preset.name} · {preset.subtitle}</b></div>
+              <div className="kv"><span className="mut">Fuel</span><b>{preset.biome}</b></div>
+              <div className="kv"><span className="mut">Peak season</span><b>{preset.peak_months.map(m => MONTHS[m - 1]).join(" · ")}</b></div>
+              <div className="kv"><span className="mut">Noted fires</span><b>{preset.events.map(ev => `${ev.year} ${ev.note}`).join(" · ")}</b></div>
+            </>}
             <div style={{ display: "flex", gap: 4, marginTop: 8 }}>
               {[1, 3, 7, 14].map(n => <button key={n} className={"btn sm" + (span === n ? " on" : "")} onClick={() => setSpan(n)}>{n}d</button>)}
             </div>
+            {preset && !cal.length && <div className="hint" style={{ marginTop: 9 }}>
+              No detections in this AOI yet.
+              <button className="btn sm" style={{ marginTop: 6, width: "100%" }} disabled={busy}
+                onClick={() => loadDemo("standard", preset.key)}>Load demo for {preset.name}</button>
+            </div>}
           </div>
           <div className="panel">
             <h3>Clustering <span className="mut">DBSCAN</span></h3>
@@ -241,6 +289,7 @@ export default function App() {
               day={day}
               span={span}
               end={end}
+              fly={fly}
             />
           </Suspense>
         </div>
@@ -294,7 +343,7 @@ export default function App() {
           {tab === "briefing" && <BriefingPanel bbox={bb} onPickDay={setDay} refreshKey={diagKey} detail />}
         </div>
 
-        <LivePanel onLoaded={setLive} wide />
+        <LivePanel onLoaded={setLive} wide bbox={bb} region={preset?.key} onDatasetChanged={datasetChanged} />
       </div>
     </>}
   </>;
