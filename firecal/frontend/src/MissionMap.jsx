@@ -7,26 +7,50 @@ import "maplibre-gl/dist/maplibre-gl.css";
 // points into Vite's pre-bundled deps folder where no worker exists ("Worker failed to load"),
 // leaving every source stuck unparsed. Hand it the worker URL Vite actually bundles.
 import maplibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
-import { fmt } from "./lib";
+import { fmt, SLOW_LINK } from "./lib";
+import { createQualityGovernor } from "./adaptiveQuality";
+// The basemap style documents and the globe/mercator thresholds live in their own module, so
+// the style that is drawn and the badge that reports it read the same constants.
+import { GLOBE_ZOOM, FLAT_ZOOM, START_ZOOM, rasterStyle, mergeOverlays, VECTOR_STYLE_URL } from "./basemapStyles";
 
 setWorkerUrl(maplibreWorkerUrl);
 
-// The single source of truth for the globe <-> flat-map morph. These drive BOTH the style's
-// projection expression and the view badge, so the readout can never disagree with what's drawn.
-const GLOBE_ZOOM = 3.7;   // at/below this zoom the Earth is a fully 3D globe
-const FLAT_ZOOM = 5.2;    // at/above this zoom the map is fully flat (mercator)
-const START_ZOOM = 1.65;  // the "zoomed out" opening view
-const MAX_TILE_ZOOM = 16; // past this Esri tiles are upscaled: far fewer fetches, no visible loss at fire scale
+// The vector basemap is a third-party style document fetched once per session. The promise is
+// cached so flipping away and back is instant; a failure is not cached, so a retry after the
+// network comes back can still succeed.
+let vectorStylePromise = null;
+const loadVectorStyle = () => {
+  vectorStylePromise ||= fetch(VECTOR_STYLE_URL)
+    .then(r => { if (!r.ok) throw new Error(String(r.status)); return r.json(); })
+    .catch(error => { vectorStylePromise = null; throw error; });
+  return vectorStylePromise;
+};
+
+// The badge names the basemap that is actually drawn, in one place, so a new basemap cannot be
+// added to the control row and forgotten here.
+const BASEMAP_LABEL = { sat: "Satellite", terrain: "Terrain", vector: "Vector" };
+
+// What the map wears while the vector style is in flight: our own layers, no basemap. On a slow
+// link the console opens straight onto this rather than pulling raster tiles it is about to
+// throw away, and the dark map well shows through until the real style lands.
+const PLACEHOLDER_STYLE = mergeOverlays({ version: 8, name: "Pyro-Harmony mission view (basemap loading)", sources: {}, layers: [] });
 
 // Cheap capability probe. Weak machines get fewer GPU-heavy effects, never fewer
-// features: no MSAA on the map canvas and no animated camera moves.
+// features: a 1x render ratio and no animated camera moves.
 const LOW_END = typeof navigator !== "undefined" &&
   ((navigator.hardwareConcurrency || 8) <= 4 || (navigator.deviceMemory || 8) <= 4);
 const MOTION_MS = LOW_END ? 0 : 800;
 
-const IMAGERY_ATTRIBUTION = "Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community";
-const TERRAIN_ATTRIBUTION = "Tiles © Esri — Esri, USGS, NOAA, HERE, Garmin, FAO, METI/NASA";
-const EMPTY = { type: "FeatureCollection", features: [] };
+// Rendering cost scales with canvas pixels, and a HiDPI canvas shades roughly four times the
+// fragments of a 1x one. Capping the ratio keeps the raster basemaps legible -- there are no
+// symbol layers whose text would soften -- while cutting the per-frame work of every drag and
+// zoom on the integrated GPUs this console targets. Weak machines render at a true 1x.
+const PIXEL_RATIO = Math.min((typeof window !== "undefined" && window.devicePixelRatio) || 1,
+                             LOW_END ? 1 : 1.5);
+// What a gesture that is not keeping up drops to: one canvas pixel per CSS pixel, the cheapest
+// thing the browser can shade. On a machine already capped at 1x this is the same value, and the
+// detection points below are the only lever left.
+const DEGRADED_RATIO = Math.min(PIXEL_RATIO, 1);
 
 function makePointData(points, liveRows) {
   const features = [];
@@ -122,11 +146,18 @@ export default function MissionMap({
   fly,
 }) {
   const containerRef = useRef(null);
+  const rootRef = useRef(null);
   const mapRef = useRef(null);
   const firstCornerRef = useRef(null);
   const onSelectBoundsRef = useRef(onSelectBounds);
+  const onTilesChangeRef = useRef(onTilesChange);
   const pickingRef = useRef(picking);
   const tilesRef = useRef(tiles);
+  // Which family of style is currently on the map. Switching inside a family is a visibility
+  // flip; crossing the boundary is a `setStyle`, which is why it has to be tracked. It starts at
+  // "raster" even when the console opens on vector: the map is created on the placeholder, so
+  // the vector style is precisely what the switch effect below still has to fetch and install.
+  const styleKindRef = useRef("raster");
   const initialCenterRef = useRef(center);
   const lastCenterRef = useRef(center);
   const pointData = useMemo(() => makePointData(points, live?.rows || []), [points, live]);
@@ -139,14 +170,54 @@ export default function MissionMap({
   const [firstCorner, setFirstCorner] = useState(null);
   const [view, setView] = useState("3D globe");
   const [spin, setSpin] = useState(false);
+  const [vectorErr, setVectorErr] = useState(null);
   const viewRef = useRef("3D globe");
+  // True while a gesture is being served at reduced detail, so the correction survives a
+  // basemap swap (a new style would otherwise hand the full-detail layers back mid-drag).
+  const degradedRef = useRef(false);
 
   onSelectBoundsRef.current = onSelectBounds;
+  onTilesChangeRef.current = onTilesChange;
   pickingRef.current = picking;
   tilesRef.current = tiles;
   pointDataRef.current = pointData;
   clusterDataRef.current = clusterData;
   selectionDataRef.current = makeSelectionData(bbox, firstCorner);
+
+  // Re-attaches our data and the raster visibility to whichever style is loaded now. A style
+  // swap rebuilds every source, so this runs on each `style.load` (which also fires for the
+  // first style), not once per mount.
+  const hydrateLayers = () => {
+    const map = mapRef.current;
+    if (!map) return;
+    map.getSource("fires")?.setData(pointDataRef.current);
+    map.getSource("clusters")?.setData(clusterDataRef.current);
+    map.getSource("selection")?.setData(selectionDataRef.current);
+    // The vector style has no raster layers at all, so both of these are lookups that miss.
+    if (map.getLayer("satellite-imagery")) map.setLayoutProperty("satellite-imagery", "visibility", tilesRef.current === "sat" ? "visible" : "none");
+    if (map.getLayer("terrain-basemap")) map.setLayoutProperty("terrain-basemap", "visibility", tilesRef.current === "terrain" ? "visible" : "none");
+    if (degradedRef.current && map.getLayer("fire-points")) map.setLayoutProperty("fire-points", "visibility", "none");
+  };
+
+  // Reduced detail for the duration of a gesture that is not keeping up: a 1x canvas, and the
+  // detection points out of the draw. The ratio is the lever that matters (it is the whole
+  // per-frame fragment bill); the points are what is left when the ratio is already 1x. Both
+  // come back the moment the motion stops, so a still map is always the full-detail map.
+  const applyQuality = reduced => {
+    const map = mapRef.current;
+    if (!map) return;
+    degradedRef.current = reduced;
+    const ratio = reduced ? DEGRADED_RATIO : PIXEL_RATIO;
+    // setPixelRatio resizes the backing store, so only call it when it actually changes.
+    if (map.getPixelRatio() !== ratio) map.setPixelRatio(ratio);
+    if (map.getLayer("fire-points")) {
+      map.setLayoutProperty("fire-points", "visibility", reduced ? "none" : "visible");
+    }
+    const root = rootRef.current;
+    // A DOM flag, not React state: this toggles mid-gesture, and a render is the last thing a
+    // janky drag needs. It also makes the mode visible to devtools and to any styling later.
+    if (root) { if (reduced) root.dataset.quality = "reduced"; else delete root.dataset.quality; }
+  };
 
   useEffect(() => {
     if (!containerRef.current) return undefined;
@@ -154,82 +225,82 @@ export default function MissionMap({
     const start = initialCenterRef.current;
     const map = new MapLibreMap({
       container: containerRef.current,
-      style: {
-        version: 8,
-        name: "Pyro-Harmony satellite mission view",
-        projection: {
-          // Continuous morph: a globe that keeps its curvature below GLOBE_ZOOM
-          // ("vertical-perspective") and has blended into mercator by FLAT_ZOOM —
-          // interpolating the projection type is what makes the hand-off smooth instead of a snap.
-          type: ["interpolate", ["linear"], ["zoom"], GLOBE_ZOOM, "vertical-perspective", FLAT_ZOOM, "mercator"],
-        },
-        sources: {
-          imagery: {
-            type: "raster",
-            tiles: ["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"],
-            tileSize: 256,
-            maxzoom: MAX_TILE_ZOOM,
-            attribution: IMAGERY_ATTRIBUTION,
-          },
-          terrain: {
-            type: "raster",
-            // Colourful terrain/vegetation basemap: green canopy, blue water, warm relief — a
-            // readable backdrop for fire clusters, unlike the flat greyscale canvas it replaced.
-            tiles: ["https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}"],
-            tileSize: 256,
-            maxzoom: MAX_TILE_ZOOM,
-            attribution: TERRAIN_ATTRIBUTION,
-          },
-          fires: { type: "geojson", data: EMPTY },
-          clusters: { type: "geojson", data: EMPTY },
-          selection: { type: "geojson", data: EMPTY },
-        },
-        layers: [
-          // raster-fade-duration 0: loading a tile no longer triggers a fade animation,
-          // which is a per-frame cost on weak GPUs every time you pan or zoom.
-          { id: "satellite-imagery", type: "raster", source: "imagery", layout: { visibility: tilesRef.current === "sat" ? "visible" : "none" }, paint: { "raster-opacity": 1, "raster-fade-duration": 0 } },
-          { id: "terrain-basemap", type: "raster", source: "terrain", layout: { visibility: tilesRef.current === "terrain" ? "visible" : "none" }, paint: { "raster-opacity": 1, "raster-fade-duration": 0 } },
-          { id: "cluster-fill", type: "fill", source: "clusters", filter: ["==", ["geometry-type"], "Polygon"], paint: {
-            "fill-color": ["case", ["==", ["get", "kind"], "LIVE"], "#ffe6b0", "#d8e2df"],
-            "fill-opacity": 0.16,
-          } },
-          { id: "cluster-outline", type: "line", source: "clusters", paint: {
-            "line-color": ["case", ["==", ["get", "kind"], "LIVE"], "#ffe6b0", "#d8e2df"],
-            "line-width": 1.4,
-            "line-opacity": 0.9,
-          } },
-          { id: "fire-points", type: "circle", source: "fires", paint: {
-            // Sensor colours are shared with the Illusion diagnostic bars and the basin
-            // legend below: MODIS coral, VIIRS amber, live pale gold. One sensor, one colour.
-            "circle-color": ["match", ["get", "kind"], "VIIRS", "#f7b26a", "LIVE", "#ffe6b0", "#e2635a"],
-            "circle-radius": ["interpolate", ["linear"], ["zoom"], 0, 1.4, 3, 2, 5, 2.8, 9, 4],
-            "circle-opacity": 0.9,
-            "circle-stroke-color": "#ffeed6",
-            "circle-stroke-width": 0.45,
-            "circle-stroke-opacity": 0.75,
-          } },
-          { id: "selection-fill", type: "fill", source: "selection", filter: ["==", ["geometry-type"], "Polygon"], paint: { "fill-color": "#7fd1c8", "fill-opacity": 0.08 } },
-          { id: "selection-outline", type: "line", source: "selection", filter: ["==", ["geometry-type"], "Polygon"], paint: { "line-color": "#7fd1c8", "line-width": 1.6, "line-dasharray": [2, 1] } },
-          { id: "selection-corner", type: "circle", source: "selection", filter: ["==", ["geometry-type"], "Point"], paint: { "circle-color": "#7fd1c8", "circle-radius": 5, "circle-stroke-color": "#0e1416", "circle-stroke-width": 2 } },
-        ],
-      },
+      // The raster pair is built here; the vector basemap arrives over the network, so an
+      // opening on a slow link starts on our layers alone and swaps the real style in below.
+      style: tilesRef.current === "vector" ? PLACEHOLDER_STYLE : rasterStyle(tilesRef.current),
       center: [start[1], start[0]],
       zoom: START_ZOOM,
       minZoom: 0.5,
       maxZoom: 19,
       maxPitch: 60,
       attributionControl: { compact: true },
-      canvasContextAttributes: { antialias: !LOW_END },
+      // No MSAA on the shared canvas -- MapLibre's own default, and the right one here. A
+      // multisampled buffer costs a full-resolution resolve every frame, while the only edges
+      // it would smooth are the round fire dots: both basemaps are textures, drawn either
+      // fully covered or not at all. Satellite and terrain pay the same bill.
+      canvasContextAttributes: { antialias: false },
+      // Both basemaps are raster layers that keep streaming during a zoom or a drag, and
+      // MapLibre's default 300 ms crossfade is per-frame work for every layer it draws, so
+      // it is off. The cap on the render ratio applies to the satellite and terrain views
+      // alike -- it is a property of the canvas, not of the tiles.
+      fadeDuration: 0,
+      pixelRatio: PIXEL_RATIO,
+      // Esri tiles do not change minute to minute. Re-validating an expired tile mid-gesture
+      // buys a conditional request, a decode and a texture re-upload -- a visible hitch -- for
+      // pixels that are almost always identical, so expiry checking stays off for the session.
+      refreshExpiredTiles: false,
+      // At the opening zoom the same world can be drawn up to seven times in one frame, and
+      // each copy is another tile cover to project and rasterize. A fire console never shows
+      // a repeated Earth, so the extra covers are pure cost.
+      renderWorldCopies: false,
     });
     mapRef.current = map;
     map.addControl(new NavigationControl({ showCompass: true, showZoom: true }), "bottom-right");
 
+    // The bottom-left column has to clear MapLibre's attribution notice, and that notice is a
+    // legal requirement whose height we do not control: it grows a line or two on a narrow map
+    // and for a moment when both basemaps report. Measure it rather than guess, and hand the
+    // measurement to the CSS as the height the column sits above, so the controls are never
+    // parked on the notice at any width.
+    const attribEl = map.getContainer().querySelector(".maplibregl-ctrl-attrib");
+    const syncAttribBand = () => {
+      const root = rootRef.current;
+      // An empty notice is display:none: keep the stylesheet's default band until it appears.
+      if (!root || !attribEl || !attribEl.getClientRects().length) return;
+      const gap = map.getContainer().getBoundingClientRect().bottom - attribEl.getBoundingClientRect().top;
+      if (gap > 0) root.style.setProperty("--attribBand", `${Math.min(Math.ceil(gap) + 6, 120)}px`);
+    };
+    syncAttribBand();
+    const attribObserver = attribEl && typeof ResizeObserver !== "undefined"
+      ? new ResizeObserver(syncAttribBand) : null;
+    attribObserver?.observe(attribEl);
+    map.on("styledata", syncAttribBand);
+
+    // ---- adaptive detail -------------------------------------------------
+    // The map watches its own frame times while the camera is being moved, and hands the
+    // decision to `createQualityGovernor` (pure, unit-tested). Sampling happens only inside a
+    // gesture: the loop is started by the gesture that opens the window and stops itself once
+    // the motion has been quiet for a moment, which is also when full detail comes back.
+    const governor = createQualityGovernor({ onChange: applyQuality });
+    let rafId = 0;
+    const stepFrame = now => {
+      rafId = 0;
+      governor.sample(now);
+      if (governor.settled(now)) { governor.release(); return; }
+      rafId = requestAnimationFrame(stepFrame);
+    };
+    // Every gesture event arms the window; only the first one of a run starts the sampler.
+    // MapLibre fires the matching *end* events too, but the quiet window covers those without
+    // needing to pair them up (a pinch can be a zoom, a rotate and a pitch at once).
+    const armQuality = () => {
+      governor.arm(performance.now());
+      if (!rafId) rafId = requestAnimationFrame(stepFrame);
+    };
+    for (const gesture of ["dragstart", "zoomstart", "rotatestart", "pitchstart"]) map.on(gesture, armQuality);
+
+    map.on("style.load", hydrateLayers);
     map.on("load", () => {
-      map.getSource("fires")?.setData(pointDataRef.current);
-      map.getSource("clusters")?.setData(clusterDataRef.current);
-      map.getSource("selection")?.setData(selectionDataRef.current);
-      map.setLayoutProperty("satellite-imagery", "visibility", tilesRef.current === "sat" ? "visible" : "none");
-      map.setLayoutProperty("terrain-basemap", "visibility", tilesRef.current === "terrain" ? "visible" : "none");
+      hydrateLayers();
       map.resize();
     });
     map.on("zoom", () => {
@@ -259,6 +330,9 @@ export default function MissionMap({
     });
 
     return () => {
+      if (rafId) cancelAnimationFrame(rafId);
+      governor.release();
+      attribObserver?.disconnect();
       map.remove();
       mapRef.current = null;
     };
@@ -282,11 +356,41 @@ export default function MissionMap({
     map.getSource("selection")?.setData(makeSelectionData(bbox, firstCorner));
   }, [bbox, firstCorner]);
 
+  // Basemap switching. Inside the raster pair both sources are already in the style, so this is
+  // a visibility flip and the tile caches stay warm; entering or leaving the vector basemap
+  // means a whole new style document, and the overlays are re-hydrated once it loads.
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !map.getLayer("satellite-imagery")) return;
-    map.setLayoutProperty("satellite-imagery", "visibility", tiles === "sat" ? "visible" : "none");
-    map.setLayoutProperty("terrain-basemap", "visibility", tiles === "terrain" ? "visible" : "none");
+    if (!map) return undefined;
+
+    if (tiles === "vector") {
+      if (styleKindRef.current === "vector") return undefined;
+      let cancelled = false;
+      setVectorErr(null);
+      loadVectorStyle()
+        .then(base => {
+          if (cancelled) return;
+          styleKindRef.current = "vector";
+          map.setStyle(mergeOverlays(base));
+        })
+        .catch(() => {
+          // Keep the console usable: report it on the button and land back on imagery, which
+          // needs no third party beyond the Esri tiles already in the style.
+          if (cancelled) return;
+          setVectorErr("Vector basemap unavailable — retry, or stay on the imagery");
+          onTilesChangeRef.current?.("sat");
+        });
+      return () => { cancelled = true; };
+    }
+
+    if (styleKindRef.current === "vector") {
+      styleKindRef.current = "raster";
+      map.setStyle(rasterStyle(tiles));
+      return undefined;
+    }
+    if (map.getLayer("satellite-imagery")) map.setLayoutProperty("satellite-imagery", "visibility", tiles === "sat" ? "visible" : "none");
+    if (map.getLayer("terrain-basemap")) map.setLayoutProperty("terrain-basemap", "visibility", tiles === "terrain" ? "visible" : "none");
+    return undefined;
   }, [tiles]);
 
   useEffect(() => {
@@ -340,39 +444,49 @@ export default function MissionMap({
   const totalFrp = points.reduce((sum, point) => sum + (point.frp || 0), 0)
     + (live?.rows || []).reduce((sum, point) => sum + (point.frp || 0), 0);
 
-  return <div className="missionMap">
+  return <div className="missionMap" ref={rootRef}>
     <div ref={containerRef} className="mapCanvas" aria-label="Interactive satellite map and 3D Earth globe" />
     <div className="chip tl mapLegend">
-      <span className="viewBadge"><i className="viewOrb" />{tiles === "sat" ? "Satellite" : "Terrain"} · {view}</span>
+      <span className="viewBadge"><i className="viewOrb" />{BASEMAP_LABEL[tiles] || "Satellite"} · {view}</span>
       <span className="mapLegendItem"><i className="dot" style={{ background: "#e2635a" }} />MODIS</span>
       <span className="mapLegendItem"><i className="dot" style={{ background: "#f7b26a" }} />VIIRS</span>
       <span className="mapLegendItem"><i className="dot" style={{ background: "#ffe6b0" }} />Live</span>
       <span className="mapLegendItem"><i className="dot" style={{ background: "#d8e2df" }} />Clusters</span>
       <span className="hint mapGestureHint">Scroll to zoom · drag to rotate Earth</span>
     </div>
-    {/* All view controls live together in the top-right corner. Keeping the basemap
-        toggle out of the bottom-left readout keeps that chip narrow, which is what stops
-        it from running underneath the Esri attribution that has to stay legible. */}
-    <div className="mapTopTools">
-      <span className="mapLayerTools" role="group" aria-label="Basemap style">
-        <button className={"btn sm" + (tiles === "sat" ? " on" : "")} onClick={() => onTilesChange("sat")}>Satellite</button>
-        <button className={"btn sm" + (tiles === "terrain" ? " on" : "")} onClick={() => onTilesChange("terrain")}>Terrain</button>
-      </span>
-      <button className="btn sm" onClick={() => mapRef.current?.easeTo({ zoom: START_ZOOM, duration: MOTION_MS })} title="Return to the 3D Earth view">⤢ Globe view</button>
-      <button className="btn sm" disabled={!bbox}
-        onClick={() => bbox && mapRef.current?.fitBounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]], { padding: 56, duration: MOTION_MS + 250 })}
-        title="Zoom the camera to the selected area">⌖ Fly to AOI</button>
-      <button className="btn sm"
-        onClick={() => mapRef.current?.easeTo({ center: [0, 0], zoom: START_ZOOM, bearing: 0, pitch: 0, duration: MOTION_MS + 250 })}
-        title="Return to the default global view">↺ Reset orbit</button>
-      <button className={"btn sm" + (spin ? " on" : "")} onClick={() => setSpin(on => !on)} aria-pressed={spin}
-        title="Slowly rotate the view; any gesture stops it">⟳ Auto-rotate</button>
-    </div>
     <div className="scan" />
-    <div className="chip bl mapReadout">
-      <span>{day || "—"}{span > 1 && <> → {end}</>}</span>
-      <span>· {fmt(hotspotTotal)} hotspots · {fmt(clusters.length)} clusters · {fmt(totalFrp)} MW</span>
-      {picking && <span className="mapPickHint">{firstCorner ? "Click the opposite corner" : "Click two corners to select an area"}</span>}
+    {/* Bottom-left column: the day/hotspot readout first, then every view control beneath it.
+        One bottom-anchored column means a wrapped row of buttons grows upward instead of
+        colliding with the numbers, and its right margin keeps the compact corner free for the
+        Esri attribution. The bottom offset is `--attribBand`, the notice height measured above. */}
+    <div className="mapBottom">
+      <div className="chip mapReadout">
+        <span>{day || "—"}{span > 1 && <> → {end}</>}</span>
+        <span>· {fmt(hotspotTotal)} hotspots · {fmt(clusters.length)} clusters · {fmt(totalFrp)} MW</span>
+        {picking && <span className="mapPickHint">{firstCorner ? "Click the opposite corner" : "Click two corners to select an area"}</span>}
+      </div>
+      <div className="mapTools">
+        <span className="mapLayerTools" role="group" aria-label="Basemap style">
+          <button className={"btn sm" + (tiles === "sat" ? " on" : "")} onClick={() => onTilesChange("sat")}>Satellite</button>
+          <button className={"btn sm" + (tiles === "terrain" ? " on" : "")} onClick={() => onTilesChange("terrain")}>Terrain</button>
+          {/* Vector tiles: geometry and labels rather than pixels, so a deep zoom stays crisp
+              and the planet costs a fraction of the bytes. The lightest choice on a slow link,
+              which is why it is the opening basemap there. */}
+          <button className={"btn sm" + (tiles === "vector" ? " on" : "")} onClick={() => onTilesChange("vector")}
+            title={vectorErr || "Vector tiles: crisp coastlines and place names at any zoom, and the lightest basemap on a slow connection"}>Vector</button>
+        </span>
+        {SLOW_LINK && tiles === "vector" &&
+          <span className="hint mapSlowLink" title="Chosen automatically: this connection is slow, and vector tiles are the lightest basemap">Slow link</span>}
+        <button className="btn sm" onClick={() => mapRef.current?.easeTo({ zoom: START_ZOOM, duration: MOTION_MS })} title="Return to the 3D Earth view">⤢ Globe view</button>
+        <button className="btn sm" disabled={!bbox}
+          onClick={() => bbox && mapRef.current?.fitBounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]], { padding: 56, duration: MOTION_MS + 250 })}
+          title="Zoom the camera to the selected area">⌖ Fly to AOI</button>
+        <button className="btn sm"
+          onClick={() => mapRef.current?.easeTo({ center: [0, 0], zoom: START_ZOOM, bearing: 0, pitch: 0, duration: MOTION_MS + 250 })}
+          title="Return to the default global view">↺ Reset orbit</button>
+        <button className={"btn sm" + (spin ? " on" : "")} onClick={() => setSpin(on => !on)} aria-pressed={spin}
+          title="Slowly rotate the view; any gesture stops it">⟳ Auto-rotate</button>
+      </div>
     </div>
   </div>;
 }

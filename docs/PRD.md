@@ -4,7 +4,7 @@
 **Event:** NASA Space Apps Challenge 2026 — Earth Science / Software
 **Status:** feature-complete prototype, hardened and verified — see [§12 Status](#12-status-summary)
 **Owners:** the project team
-**Related docs:** [README.md](./README.md) (install, API contract, troubleshooting) · [`Nasa Space app challenge.md`](./Nasa%20Space%20app%20challenge.md) (challenge brief + 4 reference papers)
+**Related docs:** [README.md](../README.md) (install, API contract, troubleshooting) · [`nasa-space-apps-challenge.md`](./nasa-space-apps-challenge.md) (challenge brief + 4 reference papers)
 
 ---
 
@@ -103,10 +103,11 @@ Status key: **✅ implemented** · **⚠️ partial** · **❌ not started**. "V
 | FR-3.2 | Return to the globe in one click | ✅ | "Globe view" eases back to `START_ZOOM` |
 | FR-3.3 | Render detections for the selected day and span | ✅ | 1/3/7/14-day spans |
 | FR-3.4 | Render DBSCAN clusters as extents, not points | ✅ | Convex-hull polygons, line fallback for degenerate hulls |
-| FR-3.5 | Two basemaps: satellite imagery and colour terrain | ✅ | Esri World_Imagery and World_Topo_Map; toggle grouped with the other view controls |
+| FR-3.5 | Three basemaps: satellite imagery, colour terrain, and vector tiles | ✅ | Esri World_Imagery + World_Topo_Map share one style (visibility flip, both tile caches stay warm); CARTO Dark Matter vector tiles are a fetched style that `mergeOverlays()` grafts the mission layers onto, so overzoomed coastlines and labels stay sharp instead of upscaling pixels. All three toggles are grouped with the other view controls. Verified: the merged 99-layer style validates with 0 errors against MapLibre's style spec, no duplicate layer ids, mission layers last, provider keeps its glyphs/sprite and its CARTO + OpenStreetMap credit, tiles need no key. A failure to fetch returns the operator to imagery with the reason on the button |
+| FR-3.11 | The basemap follows the connection on first paint | ✅ | `SLOW_LINK` (`saveData`, `effectiveType` 2g/3g, `downlink < 1.5 Mbps`) opens the console on vector tiles — the lightest basemap — with a `Slow link` hint beside the controls; nothing is gated, every basemap stays one click away |
 | FR-3.6 | Draw a bounding box by clicking two corners | ✅ | Crosshair cursor, double-click-zoom disabled while picking, corner marker between clicks |
 | FR-3.7 | Overlay live-feed points and clusters | ✅ | Pale-gold points, live polygons |
-| FR-3.8 | Chronological readout never covers required attribution | ✅ | Measured 0 px overlap at 820 px and 1440 px viewports after moving the basemap toggle out of the readout chip |
+| FR-3.8 | Chronological readout never covers required attribution | ✅ | Readout and view controls are one bottom-left column whose height clears the notice by measurement, not by assumption: 0 px overlap at 1440, 1200, 900, 820, 700, 640, 560 and 500 px viewports, with the notice collapsed, expanded, and wrapped to four lines |
 | FR-3.9 | Map engine must load under Vite (worker + dep pre-bundling) | ✅ | Worker URL handed to MapLibre explicitly, otherwise every source stays unparsed |
 | FR-3.10 | Camera controls beyond zooming out | ✅ | **Fly to AOI** fits the drawn box (disabled without one), **Reset orbit** restores the default global attitude (centre 0,0, bearing 0, pitch 0), **Auto-rotate** drifts the bearing at 0.22°/70 ms (0.12°/140 ms on a low-end probe). Verified live: bearing −15.72°→−17.40° while on, frozen at −38.40° and `aria-pressed=false` after a `pointerdown` on the canvas |
 
@@ -270,7 +271,11 @@ Target: a responsive console on a 4-core, 8 GB machine with integrated graphics.
 | `/calendar` warm | 0.47 s | **0.058 s** | ≤ 100 ms |
 | `POST /demo` warm | 2.56 s | **0.026 s** | ≤ 100 ms |
 
-Mechanisms: lazy `React.lazy` splits gated by a path-based `manualChunks` function (the object form only matched entry files and pulled the charting vendor chunk back into first paint), charts drawn as hand-rolled SVG in `plot.jsx` so no charting dependency exists at all, gzip with a 1 KiB floor, server-side memoization of every derived endpoint plus explicit invalidation on dataset change, a client-side in-memory response cache with in-flight request collapsing, a cached demo generator, raster tiles capped at zoom 16 with fade animation disabled, no per-frame React render on zoom, and `LOW_END` degraded effects (no MSAA, instant camera moves) on ≤4-core or ≤4 GB devices.
+Mechanisms: lazy `React.lazy` splits gated by a path-based `manualChunks` function (the object form only matched entry files and pulled the charting vendor chunk back into first paint), charts drawn as hand-rolled SVG in `plot.jsx` so no charting dependency exists at all, gzip with a 1 KiB floor, server-side memoization of every derived endpoint plus explicit invalidation on dataset change, a client-side in-memory response cache with in-flight request collapsing, a cached demo generator, raster tiles capped at zoom 16 with fade animation disabled, no per-frame React render on zoom, and `LOW_END` degraded effects (1× render ratio, instant camera moves) on ≤4-core or ≤4 GB devices.
+
+A map that cannot keep up is not left to stutter: `adaptiveQuality.js` watches frame times for the duration of a gesture and, on a sustained low frame rate, holds the canvas at a 1× ratio with the detection points out of the draw until the motion stops — then hands the detail straight back. The policy is pure (timestamps in, at most one decision out) and unit-tested as a prebuild guard: 60 fps drags are never touched, a sustained slow one degrades once, a three-frame stutter and a 1.2 s stall are not mistaken for a frame rate, and recovery never flaps mid-gesture.
+
+Gesture cost is bounded by the canvas, not by the network. There is no MSAA (a full-resolution resolve on every frame, bought for edges that only the round detection dots have), the render ratio is capped at 1.5× — a HiDPI canvas shades about four times the fragments of a 1× one, so the cap is the single largest saving during a drag or a zoom — tile fade is 0, expired tiles are not re-validated mid-session, and repeated world copies are off. Those are properties of the shared canvas, so they hold for Satellite, Terrain and Vector alike. Byte cost is bounded separately: the vector basemap is the one option whose detail does not require a new download at every zoom step, and it is what a slow connection opens on.
 
 ### NFR-2 — Security
 
@@ -294,7 +299,7 @@ Partial. Honoured: `prefers-reduced-motion`, `aria-label` on the map and basemap
 
 ### NFR-4 — Reliability & correctness
 
-53 automated tests (31 smoke + 22 security) run in CI on every push and PR, plus the frontend production build with the lazy-export guard as a prebuild step. Derived values are asserted against invariants (percentile ordering, cluster hull sizes, threat ladder membership, growth relationships) rather than hard-coded snapshots where possible.
+55 automated tests (33 smoke + 22 security) run in CI on every push and PR, plus the frontend production build, whose prebuild step runs the lazy-export guard and the adaptive-detail policy check. Derived values are asserted against invariants (percentile ordering, cluster hull sizes, threat ladder membership, growth relationships) rather than hard-coded snapshots where possible.
 
 ### NFR-5 — Portability
 
@@ -311,7 +316,8 @@ Windows, macOS and Linux from one launcher; CSV encodings from all three as they
                     │  ForecastChart.jsx (lazy) · panels.jsx (rail cards) · lib.js (API client)   │
                     │  styles.css ...... "ember dusk" tokens + letter-case contract               │
                     └───────────────┬─────────────────────────────────────────────────────────────┘
-                                    │  /api/*  →  Vite dev proxy → 127.0.0.1:8000
+                                    │  /api/*  →  dev: Vite proxy strips it → :8000
+                                    │            image: the API serves dist/ and strips it
                     ┌───────────────▼──────────── FastAPI (uvicorn, single process) ──────────────┐
                     │  upload / demo / data ....... ingest, replace, clear                        │
                     │  calendar / points / clusters  daily series, map data, DBSCAN extents       │
@@ -328,6 +334,10 @@ Windows, macOS and Linux from one launcher; CSV encodings from all three as they
 ```
 
 Data flow: **upload or live fetch → harmonize (confidence, UTC, de-dup, per-sensor rescale, ESFP/HFII) → single `DF` → derived endpoints (memoized, invalidated on change) → gzip → client cache → panels.**
+
+### Deployment shape
+
+The image ([Dockerfile](../Dockerfile), decided in [ADR 0002](decisions/0002-single-image-deployment.md)) holds **one process on one port**: a Node stage builds the console and is discarded, then uvicorn serves that build from `firecal/frontend/dist` at `/` and answers the API on the same origin. The browser's `/api/...` calls are de-prefixed by middleware before routing, which is the one piece of the dev topology — where Vite does the same job — that has to exist in the image. A smoke test asserts the prefixed and unprefixed paths return identical bodies, and that a same-origin write through the prefix still clears the cross-origin gate. The container keeps no state on disk, so there is no volume to mount.
 
 The one structural decision worth defending: the dataset is a **process-global in-memory `DataFrame`** with a memo cache keyed by endpoint arguments. That is why warm analytics are ~10–100 ms and why there is no database to run. The cost is that two workers would not share state, and one caller can replace the dataset for everyone.
 
@@ -376,7 +386,7 @@ Canonical detection record after harmonization: `lat, lon, time (UTC), sensor, c
 | Area API | 1–5 days per pull; area passed as `west,south,east,north` (the API's order, not the internal `bbox` order); sources `MODIS_C6_1`, `VIIRS_SNPP_C2`, `VIIRS_NOAA20_C2`, `VIIRS_NOAA21_C2` |
 | Camera flights | preset fly-to uses the preset `zoom` (4.6–6.6); `Fly to AOI` uses `fitBounds` with 56 px padding; all durations are 0 ms on the low-end probe |
 | Map zooms | globe ≤3.7 · flat ≥5.2 · start 1.65 · max tiles 16 (map 0.5–19, pitch ≤60°) |
-| Low-end probe | `hardwareConcurrency ≤ 4` or `deviceMemory ≤ 4` → no MSAA, 0 ms camera moves |
+| Low-end probe | `hardwareConcurrency ≤ 4` or `deviceMemory ≤ 4` → 1× canvas render ratio, 0 ms camera moves |
 
 ## 11. Verification & evidence
 
@@ -396,7 +406,9 @@ Nothing in this document is aspirational scaffolding: each pillar was exercised 
 | Live feed | Region allowlist, 429 guard and outbound cap covered by tests; real feeds are network-dependent and skipped offline |
 | Performance | Cold-load and warm-endpoint timings measured before/after (NFR-1); `/clusters` cold 32,893 → 2,841 ms after ranking clusters before hulling |
 | Charts | Hand-rolled SVG kit rendered live on all three panels (band envelope, grouped bars, forecast lines); payload 411 → 9.1 KB raw (110.6 → 4.2 KB gzipped) after removing four charting dependencies |
-| Layout integrity | Overlap between the map readout, the legend chip, the tool cluster and the Esri attribution measured at 820 px and 1440 px: 0 px |
+| Adaptive detail | Policy replayed against simulated frame times from Node: a 60 fps drag is never touched, a 20 fps drag degrades exactly once after ≥400 ms and ≥12 frames, a three-frame stutter and a 1.2 s stall leave it alone, and detail returns only when the gesture ends (22 assertions, run by `prebuild`) |
+| Basemaps | Both style documents — `rasterStyle('sat' | 'terrain')` and `mergeOverlays(fetched)` — validated with MapLibre's own style spec from Node: 0 errors, 99 layers after the merge, no duplicate ids, mission layers drawn last, world morph intact |
+| Layout integrity | Overlap between the map readout, the legend chip, the view-control row, the zoom/compass group and the Esri attribution measured at 1440, 1200, 900, 820, 700, 640, 560 and 500 px: 0 px. The readout/control column is lifted by the notice's measured height, so the 0 holds while the notice is collapsed, expanded, or wrapped to three and four lines (a real 2-line wrap happens at ≤ 1200 px, and the stylesheet's static fallback band alone would have overlapped there by 1,315 px²) |
 | Security | Before/after reproductions against the running server (NFR-2), plus 22 regression tests |
 | Key handling & cross-site writes | `/archive` with a live `FIRMS_MAP_KEY` and a refused transport: the 502 body never contains the key. Foreign-origin writes refused 403 while same-host, allowlisted-origin and no-Origin writes pass — both covered in `test_security.py`, and the foreign-origin 403 re-checked against the running server |
 | Full suite | `pytest` 49 passed · `npm run build` (incl. lazy-export guard) passed · browser console clean across all tabs |
@@ -419,7 +431,7 @@ Nothing in this document is aspirational scaffolding: each pillar was exercised 
 | Region presets & AOI navigation | ✅ Complete (five presets, per-region demo, camera flights) |
 | Real FIRMS window pull (`MAP_KEY`) | ✅ Complete; needs the operator's own free key, reported plainly when absent |
 | Chart rendering | ✅ Hand-rolled SVG kit; `recharts`, `cobe`, `leaflet`, `react-leaflet` removed |
-| Test suite | ✅ 53 tests green (31 smoke + 22 hardening); CI runs pytest + build |
+| Test suite | ✅ 55 tests green (33 smoke + 22 hardening); CI runs pytest + build |
 
 ## 13. Known gaps & risks
 
@@ -475,5 +487,5 @@ Nothing in this document is aspirational scaffolding: each pillar was exercised 
 - NASA FIRMS — <https://firms.modaps.eosdis.nasa.gov/> (archive and 24 h NRT feeds)
 - Zhang et al. (2020) — fuel-biome stratification approach behind the K-means briefing
 - GISTDA / GIS-IDEAS (2024) — DBSCAN parameters for hotspot clustering
-- Further papers and the challenge brief: [`Nasa Space app challenge.md`](./Nasa%20Space%20app%20challenge.md)
-- Implementation detail, API examples and troubleshooting: [README.md](./README.md)
+- Further papers and the challenge brief: [`nasa-space-apps-challenge.md`](./nasa-space-apps-challenge.md)
+- Implementation detail, API examples and troubleshooting: [README.md](../README.md)

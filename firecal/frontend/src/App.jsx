@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState, Suspense, lazy } from "react";
-import { api, errMsg, ramp, fmt, invalidateApiCache } from "./lib";
+import { api, errMsg, ramp, fmt, invalidateApiCache, SLOW_LINK } from "./lib";
 import { HeroStats, LivePanel, BriefingPanel } from "./panels";
 
 // Code-split the heavy optional pieces so a low-end machine can paint the console
@@ -115,7 +115,9 @@ export default function App() {
   // would not re-run when you load a demo with the same hotspot count, leaving the cursor day
   // null and the calendar empty, so the dataset gets its own version counter.
   const [dataKey, setDataKey] = useState(0);
-  const [tiles, setTiles] = useState("sat"), [tab, setTab] = useState("calendar");
+  // The basemap the console opens on. A slow connection starts on vector tiles -- the lightest
+  // choice -- and every visitor can switch freely afterwards (`SLOW_LINK` explains the probe).
+  const [tiles, setTiles] = useState(SLOW_LINK ? "vector" : "sat"), [tab, setTab] = useState("calendar");
   // Curated AOI presets: the picker sets the bbox filter and flies the camera. `fly` carries
   // a nonce so picking the same region twice still re-flies.
   const [regions, setRegions] = useState([]), [presetKey, setPresetKey] = useState(null), [fly, setFly] = useState(null);

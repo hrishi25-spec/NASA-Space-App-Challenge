@@ -11,7 +11,7 @@ Beyond the base calendar, it implements the four **Pyro-Harmony** poster pillars
 
 Headline metrics shown in the UI strip: **HFII** (harmonized fire intensity, Σ FRP·ESFP), **ESFP** (equivalent standard pixels, nadir-normalized footprints), hotspot count, and record span.
 
-Built for the [2026 NASA Space Apps Challenge](https://spaceappschallenge.org/) (Earth Science / Software). The full challenge brief and the four reference research papers are in [`Nasa Space app challenge.md`](./Nasa%20Space%20app%20challenge.md).
+Built for the [2026 NASA Space Apps Challenge](https://spaceappschallenge.org/) (Earth Science / Software). The full challenge brief and the four reference research papers are in [`docs/nasa-space-apps-challenge.md`](docs/nasa-space-apps-challenge.md).
 
 ## Table of contents
 
@@ -30,7 +30,7 @@ Built for the [2026 NASA Space Apps Challenge](https://spaceappschallenge.org/) 
 - [Security notes](#security-notes)
 - [Troubleshooting](#troubleshooting)
 
-Planning and feature-level detail lives in [PRD.md](./PRD.md).
+Planning and feature-level detail lives in [docs/PRD.md](docs/PRD.md).
 
 ## Why
 
@@ -63,6 +63,22 @@ including the node/esbuild children. Add `--no-open` to skip the browser.
 
 Click **Load demo** — 5 years of synthetic MODIS + VIIRS data appears in ~1 second.
 The launcher needs no shell beyond that: no bash on Windows, no `.bat` on Linux.
+
+<details>
+<summary>Docker (one image, one port, no toolchain to install)</summary>
+
+```bash
+docker build -t pyro-harmony .
+docker run --rm -p 8000:8000 --env-file .env pyro-harmony
+# then open http://127.0.0.1:8000
+```
+
+The image builds the console (`npm run build`, guards included) and serves it from the same
+uvicorn that answers the API — one process, one port, no proxy. `--env-file .env` is optional
+and is how you pass `FIRMS_MAP_KEY`. The container keeps no state on disk, so there is nothing
+to mount or back up.
+
+</details>
 
 <details>
 <summary>Manual run (two terminals, Linux/macOS)</summary>
@@ -153,7 +169,7 @@ default box; each preset gets its own seed, so no two regions show identical sta
 | **Hero stats strip** | HFII (Σ FRP·ESFP), equivalent standard pixels (ESFP), hotspots harmonized, record span. |
 | **Burning calendar** | GitHub-style heatmap: one row per year, one cell per day, color = harmonized daily detections. A **Year** selector narrows it to a single-year calendar. Click any day to inspect it. |
 | **Region presets** | The *Fly to…* picker in the command bar (California, Amazon & Pantanal, Southeastern Australia, Punjab & Haryana, Mediterranean basin) sets the AOI filter, flies the camera to a regional zoom, and fills the **Selection** panel with the region's fuel type, peak season and notable fire years. Every panel then recomputes for that AOI; **Load demo** follows the selection, and when an AOI holds no detections the panel offers *Load demo for …*. |
-| **Map** | One camera that morphs a **3D Earth globe** into a flat map as you zoom (the badge tracks `3D GLOBE → TRANSITION → 2D MAP`); scroll in past the transition for the flat view, or press **Globe view** to fly back. **Fly to AOI** fits the drawn box, **Reset orbit** returns to the default global attitude, and **Auto-rotate** drifts the bearing slowly (opt-in, slower on weak GPUs, and any gesture stops it). Detections for the selected day (±1/3/7/14 d span) — **MODIS coral, VIIRS amber, live points pale gold** — plus soft-sand DBSCAN cluster polygons, on either **Satellite** imagery or the colour **Terrain** basemap (both toggles sit with the other view controls in the top-right). The bottom-left chip is a pure readout (`day · hotspots · clusters · MW`) so it never covers the Esri attribution. Live-feed points/polygons overlay when pulled. Use **Select area** and click two corners to draw a bounding box; every panel then filters to it. |
+| **Map** | One camera that morphs a **3D Earth globe** into a flat map as you zoom (the badge tracks `3D GLOBE → TRANSITION → 2D MAP`); scroll in past the transition for the flat view, or press **Globe view** to fly back. **Fly to AOI** fits the drawn box, **Reset orbit** returns to the default global attitude, and **Auto-rotate** drifts the bearing slowly (opt-in, slower on weak GPUs, and any gesture stops it). Detections for the selected day (±1/3/7/14 d span) — **MODIS coral, VIIRS amber, live points pale gold** — plus soft-sand DBSCAN cluster polygons, on one of three basemaps: **Satellite** imagery, the colour **Terrain** map, or **Vector** tiles (CARTO Dark Matter) whose coastlines and place names stay crisp however far you zoom, since vector geometry is redrawn rather than upscaled. All three toggles sit with the other view controls, in the bottom-left row under the readout, and a slow connection opens on **Vector** because it is the lightest of the three. The bottom-left column is readout first (`day · hotspots · clusters · MW`), controls beneath it, and its height tracks the measured attribution notice, so no control ever covers it. Dragging, rotating and zooming stay light on every basemap: the canvas render ratio is capped, MSAA and tile fade are off, and expired tiles are not re-fetched mid-gesture. Live-feed points/polygons overlay when pulled. Use **Select area** and click two corners to draw a bounding box; every panel then filters to it. |
 | **Anomalies & critical periods** | A click-through list of anomalous days (z-score vs the same ±7-day window in other years) and the months running above mean + 1σ flagged as *critical*. |
 | **Incident Commander briefing** | Threat level (Low/Watch/Elevated/Critical) with its score, record mean and last-30-days readout, then the full report split across **four sub-tabs** — Situation, Critical streaks, Fuel types, Actions — each with a count badge so you can see what is inside before opening it. Streak rows jump the map to that window; **Copy MD** exports the whole briefing. The right-rail card keeps the compact headline version. |
 | **Last year + 30-day forecast** | Line chart of the trailing 365 days with the forecast appended, now with an Observed/Forecast legend and the fitted method named. |
@@ -223,20 +239,32 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
 ```
 .
 ├── README.md                       ← you are here
-├── PRD.md                          ← product requirements: features, acceptance criteria, status
-├── Nasa Space app challenge.md      ← challenge brief + 4 reference papers
-├── run.py                          ← the one-command launcher (any OS, stdlib only)
-├── start.sh                        ← thin wrapper: ./start.sh (Linux/macOS)
-├── start.bat                       ← thin wrapper: start.bat (Windows)
+├── CONTRIBUTING.md                 ← how to propose work and run the checks
+├── SECURITY.md                     ← how to report a vulnerability
+├── CHANGELOG.md                    ← user-facing changes, newest first
+├── .editorconfig                   ← cross-editor basics: charset, indentation, newlines
 ├── .env.example                    ← optional FIRMS_MAP_KEY + ALLOW_ORIGINS (copy to .env)
+├── run.py                          ← the one-command launcher (any OS, stdlib only)
+├── start.sh / start.bat            ← thin wrappers around run.py
+├── Dockerfile                      ← console build + API in one image (see decisions/0002)
+├── .dockerignore                   ← keeps host node_modules/.venv/dist out of the build
+├── scripts/
+│   └── check.sh / check.bat        ← the same checks CI runs (backend tests + frontend build)
+├── docs/
+│   ├── README.md                   ← docs index
+│   ├── PRD.md                      ← product requirements: features, acceptance criteria, status
+│   ├── AGENTS.md                   ← house rules for coding agents
+│   ├── nasa-space-apps-challenge.md ← challenge brief + 4 reference papers
+│   ├── modis-viirs-integrated-review.md ← MODIS/VIIRS sensor comparison notes
+│   └── decisions/                  ← ADRs; 0001 records this layout
 ├── .github/workflows/ci.yml        ← CI (pytest + frontend build)
 └── firecal/
     ├── backend/
     │   ├── main.py                 ← FastAPI app: endpoints, harmonization, analytics
     │   ├── regions.py              ← curated AOI presets: bbox, biome, peak season, notable fires
     │   ├── demo.py                 ← synthetic FIRMS generator (2020–24 + 2002–24 transition)
-    │   ├── test_smoke.py           ← 28-test API smoke suite (encodings, gzip, cache, presets, archive)
-    │   ├── test_security.py        ← 20-test hardening suite (URL allowlist, upload caps, CORS)
+    │   ├── test_smoke.py           ← 33-test API smoke suite (encodings, gzip, cache, presets, archive, /api prefix)
+    │   ├── test_security.py        ← 22-test hardening suite (URL allowlist, upload caps, CORS)
     │   ├── requirements.txt        ← runtime deps (with security floors)
     │   └── requirements-dev.txt    ← + pytest, httpx (for tests)
     └── frontend/
@@ -330,25 +358,42 @@ The demo generator is cached too, so **Load demo** is instant after the first ru
 **Rendering avoids GPU traps.** Raster tiles stop at zoom 16 (deeper zooms upscale) and
 fade animation is off, so panning and zooming stop paying per-tile animation costs; the
 zoom listener no longer schedules a React render per frame; the scroll background and the
-map vignette were rewritten so they don't repaint on every scroll tick. On a machine with
-four cores or less, MSAA is disabled and camera moves become instant (`LOW_END` in`MissionMap.jsx`). Redundant UI effects respect `prefers-reduced-motion`.
+map vignette were rewritten so they don't repaint on every scroll tick. The canvas renders
+at most 1.5× and never with MSAA, expired tiles are not re-validated mid-gesture, and the
+same Earth is never drawn several times per frame. On a machine with four cores or less
+(`LOW_END` in `MissionMap.jsx`) the cap drops to 1× and camera moves become instant.
+
+**A slow drag reports itself.** The map measures its own frame times while the camera is
+moving: if a gesture holds a sustained low frame rate it drops to a 1× canvas and takes the
+detection points out of the draw until the motion stops, then hands the detail straight
+back. A drag that keeps up is never touched, and neither a three-frame stutter nor a stalled
+tab counts as a frame rate — the policy is pure, and unit-tested as a prebuild guard.
+Redundant UI effects respect `prefers-reduced-motion`.
 
 ## Testing & CI
 
+The one command that must pass before a review runs both checks:
+
 ```bash
-# 53 tests, ~2 min — starts the app in-process via TestClient
+scripts/check.sh          # POSIX — or scripts\check.bat on Windows
+```
+
+Both are thin wrappers around the commands below, which is also what CI runs:
+
+```bash
+# 55 tests, ~2 min — starts the app in-process via TestClient
 cd firecal/backend
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest -q
 
-# Frontend production build (the prebuild step runs the lazy-export guard first)
+# Frontend production build (prebuild runs the lazy-export guard and the policy check)
 cd firecal/frontend && npm run build
 npm run check:lazy                 # …or run the guard on its own
 ```
 
 `.github/workflows/ci.yml` runs both on every push to `main` and on pull requests.
 
-**`test_smoke.py` (29)** covers every endpoint end-to-end — demo load, calendar with and
+**`test_smoke.py` (31)** covers every endpoint end-to-end — demo load, calendar with and
 without bbox, points clamping, clusters, climatology envelope, illusion diagnostic on both
 demos, briefing JSON + Markdown, live feed (skipped offline when FIRMS is unreachable),
 anomalies, forecast — plus error paths (bad bbox → 400, missing-column CSV → 400, valid CSV
@@ -360,7 +405,7 @@ and region-specific, `.env` parsing handles comments/`export`/quotes, and `/arch
 validates the request *before* the key, explains a missing key, builds the area-API URL in
 west,south,east,north order, and merges rows while dropping anything outside the AOI.
 
-**`test_security.py` (20)** pins the input-handling guarantees described under
+**`test_security.py` (22)** pins the input-handling guarantees described under
 [Security notes](#security-notes), so they fail loudly if they regress: unknown/traversal/
 host-injection `region` values are rejected *without* an outbound fetch, the concurrency
 guard returns 429, the request and per-file upload caps and the file-count cap each fire,
@@ -457,6 +502,15 @@ Known gaps, accepted for a prototype and worth closing before real deployment:
   detected automatically (UTF-8, cp1252/Excel-Windows, UTF-16/Excel-macOS).
 - **Nothing at `http://localhost:5173` but the launcher says ready** — your system may
   resolve `localhost` to `::1`; open the `127.0.0.1` URL the launcher prints instead.
+
+## Contributing
+
+Bug reports and pull requests are welcome — start with [CONTRIBUTING.md](CONTRIBUTING.md).
+The docs index is [docs/README.md](docs/README.md) and layout decisions are recorded in
+[docs/decisions/](docs/decisions/). Security issues: see [SECURITY.md](SECURITY.md).
+
+No licence has been chosen yet, so no licence is granted for reuse — treat the code as
+all-rights-reserved until one is added.
 
 ---
 

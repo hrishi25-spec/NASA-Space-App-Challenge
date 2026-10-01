@@ -151,13 +151,21 @@ select{
   position:relative;height:calc(100vh - 300px);min-height:430px;
   border-radius:var(--r);overflow:hidden;z-index:1;
   background:#0f1518;box-shadow:var(--inset),0 0 0 1px #ffffff08;
+  /* Height of the strip at the bottom of the map that belongs to MapLibre's attribution
+     notice. It is a legal notice, so the console chrome never enters it: the readout and the
+     view controls stop above. MissionMap measures the real notice and overwrites this on the
+     same element — the value here is the band for the common one-line notice, used until the
+     style has loaded and the notice exists. */
+  --attribBand:40px;
 }
 .mapCanvas{width:100%;height:100%}
-/* soft vignette instead of the old scanline overlay: a gradient rasterizes once,
-   while a big blurred inset shadow is re-painted over the animating canvas */
+/* Soft vignette instead of the old scanline overlay, on its own composited layer: the map
+   canvas re-uploads its texture on every frame of a drag, and an overlay sharing that layer
+   would be rasterised again with it instead of once. */
 .stage .scan{
   position:absolute;inset:0;border-radius:var(--r);pointer-events:none;z-index:2;
   background:radial-gradient(120% 120% at 50% 50%,transparent 58%,#060a0cb3 100%);
+  transform:translateZ(0);
 }
 /* placeholder while the lazy map chunk downloads -- same box, so nothing shifts */
 .mapFallback{
@@ -174,13 +182,21 @@ select{
   font-size:11px;color:var(--mut);
   box-shadow:7px 7px 16px #05080ad9,-4px -4px 12px #ffffff10,inset 0 1px 0 #ffffff12;
 }
-/* Reserve room for the top-right tool cluster so the legend chip can never slide under
-   it; the chip already wraps, so the gesture hint just drops to a second line. */
-.stage .chip.tl{top:12px;left:12px;max-width:calc(100% - 310px)}
-/* Lifted clear of the bottom row: at narrow widths the Esri attribution needs the whole
-   bottom edge, and it must stay readable rather than sliding under the readout. */
-.stage .chip.bl{bottom:52px;left:12px}
-.stage .chip.br{bottom:12px;right:12px}
+/* The legend chip owns the top edge now that the view controls live at the bottom. */
+.stage .chip.tl{top:12px;left:12px;max-width:calc(100% - 24px);transform:translateZ(0)}
+/* The bottom-left telemetry column: the day/hotspot readout, then the view controls under it.
+   One bottom-anchored flex column means a wrapped row of buttons grows upward instead of
+   colliding with the numbers. The right-hand margin keeps the corner clear for the Esri
+   attribution at narrow widths, and the column is its own composited layer so its shadows
+   are rasterised once rather than on every frame of a drag over the live canvas. */
+.missionMap .mapBottom{
+  position:absolute;z-index:4;left:12px;bottom:calc(12px + var(--attribBand));
+  display:flex;flex-direction:column;align-items:flex-start;gap:8px;
+  max-width:calc(100% - 116px);
+  transform:translateZ(0);
+}
+/* Inside the column the readout is a normal block, not another free-floating chip. */
+.mapBottom .chip{position:static;max-width:100%}
 .stage .chip b{color:var(--fg)}
 .stage .chip .dot{width:8px;height:8px;border-radius:50%;box-shadow:0 0 8px currentColor,1px 1px 2px var(--sh-dark)}
 .stage .chip .viewBadge{display:inline-flex;align-items:center;gap:7px;color:var(--fg);font-weight:600;letter-spacing:1px;text-transform:uppercase}
@@ -190,15 +206,16 @@ select{
 .missionMap .viewOrb{width:9px;height:9px;border-radius:50%;background:var(--acc2);box-shadow:0 0 10px var(--acc2),2px 2px 5px var(--sh-dark)}
 .missionMap .mapLegendItem{display:inline-flex;align-items:center;gap:6px;text-transform:uppercase;letter-spacing:.8px}
 .missionMap .mapGestureHint{opacity:.85}
+/* Explains, without a dialog, why the console opened on the vector basemap. */
+.missionMap .mapSlowLink{opacity:.85;letter-spacing:.3px}
 .missionMap .mapLayerTools{display:flex;gap:8px;align-items:center}
-.missionMap .mapTopTools .btn.sm{background:linear-gradient(145deg,#232d33f2,#1a2226f2)}
+.missionMap .mapTools .btn.sm{background:linear-gradient(145deg,#232d33f2,#1a2226f2)}
 .missionMap .mapPickHint{color:var(--acc2)}
-.missionMap .mapTopTools{position:absolute;z-index:4;top:12px;right:12px;display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
-/* On a narrow map, stack the tools vertically: a tall thin rail clashes far less with the
-   legend chip than a wide row does. */
+.missionMap .mapTools{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+/* On a narrow map the controls shrink a little rather than wrapping into a tall stack, which
+   keeps the bottom-left column from climbing into the middle of the view. */
 @media(max-width:900px){
-  .stage .chip.tl{max-width:calc(100% - 196px)}
-  .missionMap .mapTopTools{flex-direction:column;align-items:flex-end}
+  .missionMap .mapTools .btn.sm{padding:5px 8px;font-size:10.5px}
 }
 
 /* ---------- drawer tabs ---------- */
@@ -262,6 +279,12 @@ select{
   background:#1a2226d9!important;color:var(--mut)!important;
   border-radius:var(--r-pill)!important;box-shadow:var(--raise-sm)!important;
 }
+/* MapLibre parks its corner controls at z-index 2, below the console chips. The attribution
+   is the one overlay that has to win that contest: the operator can open the notice, and a
+   notice hidden behind a button is a notice that was never shown. */
+.maplibregl-ctrl-bottom-right{z-index:6}
+/* Same reason as the chips: its own layer, so the icon filter is not re-run every frame. */
+.maplibregl-ctrl-group{transform:translateZ(0)}
 .maplibregl-ctrl-attrib a{color:#a7b6b9!important}
 
 /* ---------- SVG charts (plot.jsx) ---------- */

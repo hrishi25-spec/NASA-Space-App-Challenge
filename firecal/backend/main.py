@@ -26,8 +26,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
-from scipy.spatial import ConvexHull
-from sklearn.cluster import DBSCAN, KMeans
+from fastapi.staticfiles import StaticFiles
 
 from demo import BOX, make_demo, make_transition_demo
 from regions import REGIONS, region_box, region_keys
@@ -541,6 +540,13 @@ def clusters(bbox: str = None, start: str = None, end: str = None, eps: float = 
 
 
 def _cluster_payload(d, eps, min_pts, hours):
+    # scipy + scikit-learn are the two heaviest imports in the app (~2.5-3.5 s of cold
+    # start and a chunk of the baseline RSS), and only this function and the briefing's
+    # fuel stratification need them. Imported on first use so the API answers /meta -- and
+    # the launcher can open the browser -- that much sooner; later calls hit the module
+    # cache, so the cost is paid once, off the start-up path.
+    from scipy.spatial import ConvexHull
+    from sklearn.cluster import DBSCAN
     if len(d) < min_pts: return []
     # ponytail: stride-sample above 60k detections (an exact pass would be a per-day
     # clustering rewrite). head() kept the OLDEST rows, so a big upload silently showed a
@@ -843,6 +849,7 @@ def _threat(streaks, recent_mean):
 
 
 def _biomes(d, k=4):
+    from sklearn.cluster import KMeans    # same start-up reason as _cluster_payload
     if len(d) < k * 3: return []
     X = np.c_[d.lon.values * 111.32 * math.cos(math.radians(d.lat.mean())), d.lat.values * 110.57, d.frp.values]
     km = KMeans(n_clusters=k, n_init=10, random_state=0).fit(X)
@@ -967,3 +974,35 @@ def forecast(bbox: str = None, horizon: int = 30, epochs: int = 40):
         scale = (s[-30:].mean() + 1) / (clim.reindex(s[-30:].index.dayofyear).mean() + 1)
         vals = clim.reindex(idx.dayofyear).values * scale; model = "Seasonal climatology (install torch for LSTM)"
     return {"model": model, "forecast": [{"date": str(i.date()), "count": round(float(v), 1)} for i, v in zip(idx, vals)]}
+
+
+# ----------------------------------------------------------- single-origin serving (image)
+# In development the console is served by Vite, which proxies /api to this process and strips
+# the prefix on the way through (see firecal/frontend/vite.config.js). A container has no proxy
+# in front of it: one uvicorn serves the built console *and* the API, so the browser's /api/...
+# calls arrive with the prefix still attached and have to be peeled off before routing. No
+# endpoint starts with /api, so the rewrite cannot shadow one -- and the unprefixed paths keep
+# working, which is what curl, the tests and the launcher's readiness probe use.
+#
+# Registered last, which makes it the outermost middleware: gzip, CORS and the upload cap then
+# all see the same un-prefixed path they were written against.
+API_PREFIX = "/api"
+
+
+@app.middleware("http")
+async def strip_api_prefix(request, call_next):
+    path = request.url.path
+    if path == API_PREFIX or path.startswith(API_PREFIX + "/"):
+        scope = request.scope
+        scope["path"] = path[len(API_PREFIX):] or "/"
+        if scope.get("raw_path"):
+            scope["raw_path"] = scope["raw_path"][len(API_PREFIX):] or b"/"
+    return await call_next(request)
+
+
+# The built console, when there is one. Development has no build -- Vite serves the console
+# there -- so the mount is conditional rather than a 404 waiting to happen. `docker build`
+# always produces one, and that is what makes `docker run` the whole deployment story.
+CONSOLE_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+if (CONSOLE_DIST / "index.html").is_file():
+    app.mount("/", StaticFiles(directory=CONSOLE_DIST, html=True), name="console")

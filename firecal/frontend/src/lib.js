@@ -22,6 +22,20 @@ export const api = (p, q = {}) => {
 
 export const errMsg = async r => { try { const j = await r.json(); return j.detail || r.statusText; } catch { return r.statusText; } };
 
+// The only signal a browser gives us about the link itself (Network Information API; Firefox
+// exposes none of it, which is why every read is optional). Both basemaps keep every feature,
+// so this never changes what the console can do -- it only picks the basemap the console *opens*
+// on. Raster tiles are a new download at every zoom step; vector tiles carry geometry that
+// stays sharp when overzoomed, so the same pan costs a fraction of the bytes.
+export const SLOW_LINK = (() => {
+  if (typeof navigator === "undefined") return false;
+  const c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  if (!c) return false;
+  if (c.saveData) return true;                                        // "reduce data usage" is a hard yes
+  if (/^(slow-)?2g$|^3g$/.test(c.effectiveType || "")) return true;
+  return typeof c.downlink === "number" && c.downlink > 0 && c.downlink < 1.5;   // Mbps
+})();
+
 // Burning-intensity ramp, level 0 -> 5. Level 0 is the material itself so an idle
 // day recedes into the panel; the rest climb through warm browns into the ember
 // amber and finish on a pale sand, which keeps the scale soothing but ordered.

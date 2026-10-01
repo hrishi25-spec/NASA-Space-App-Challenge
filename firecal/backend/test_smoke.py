@@ -1,5 +1,6 @@
 """API smoke test: runs every endpoint end-to-end against synthetic demo data."""
 import io
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -343,3 +344,25 @@ def test_archive_can_replace_instead_of_append(monkeypatch):
     assert client.delete("/data").json()["n"] == 0     # ...and the analytics caches were dropped
     assert client.get("/calendar").json() == []
     client.post("/demo")
+
+
+def test_api_prefix_is_transparent():
+    """The image has no proxy in front of it: the browser calls /api/... while curl, these
+    tests and the launcher use the bare paths. Both spellings have to reach the same endpoint,
+    and a same-origin write through the prefix has to clear the cross-origin gate."""
+    assert client.get("/api/meta").json() == client.get("/meta").json()
+    assert (client.get("/api/points", params={"limit": 3}).json()
+            == client.get("/points", params={"limit": 3}).json())
+    # 422 (no files on the request), never 403: the write was refused by the endpoint, not by
+    # the same-origin middleware, which is the half of this that the prefix could break.
+    assert client.post("/api/upload", headers={"origin": "http://testserver"},
+                       content=b"").status_code == 422
+
+
+def test_console_mount_follows_the_build():
+    """Dockerfile builds the console into firecal/frontend/dist and copies it next to the API,
+    which is what turns a single uvicorn into the whole deployment. The mount is conditional so
+    a development checkout -- where Vite serves the console -- does not 404 on /."""
+    built = (Path(main.__file__).resolve().parent.parent / "frontend" / "dist" / "index.html").is_file()
+    mounted = any(getattr(route, "name", "") == "console" for route in app.routes)
+    assert mounted == built

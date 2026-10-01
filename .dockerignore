@@ -1,0 +1,27 @@
+# What the build context must not carry. Two kinds of thing live here: directories that are
+# regenerated inside the image, and host-local state that would actively corrupt it -- a Linux
+# node_modules built for another libc, or a stale dist/ the console stage would rather build
+# itself.
+
+# Version control and tooling
+.git
+.github
+.gitignore
+.editorconfig
+.skills
+
+# Local-only scaffold (gitignored, kept on disk -- see docs/decisions/0001-repository-layout.md)
+github setup
+
+# Regenerated in the image
+**/node_modules
+**/dist
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/*.pyc
+
+# Secrets and datasets: the image reads its configuration from the environment at run time
+**/.env
+.env
+*.csv

@@ -14,3 +14,11 @@ dist/
 .env
 .env.local
 .env.*.local
+
+# Local workspace scaffold (reference only — not part of the product)
+github setup/
+
+# Editor and OS cruft
+.DS_Store
+Thumbs.db
+*.swp
