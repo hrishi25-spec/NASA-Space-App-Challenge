@@ -3,9 +3,10 @@ import { api, errMsg, ramp, fmt, invalidateApiCache, SLOW_LINK } from "./lib";
 import { HeroStats, LivePanel, BriefingPanel } from "./panels";
 
 // Code-split the heavy optional pieces so a low-end machine can paint the console
-// before it downloads a map engine or a charting library. MissionMap drags in
-// MapLibre (~450 KB gzipped), charts/ForecastChart drag in Recharts — none of them
-// are needed to show the shell, and Recharts is not needed until a chart tab opens.
+// before it downloads a map engine or the chart kit. MissionMap drags in MapLibre
+// (~450 KB gzipped); charts/ForecastChart bring the hand-rolled SVG kit (~5 KB) —
+// neither is needed to show the shell, and no chart code is needed until a chart tab
+// opens.
 const MissionMap = lazy(() => import("./MissionMap"));
 // charts.jsx exposes NAMED exports only, and React.lazy resolves `module.default`.
 // Wrapping a multi-export module directly yields `undefined` as a component type,
@@ -34,7 +35,12 @@ class PanelBoundary extends React.Component {
 
 function Heatmap({ data, onPick, focus, year }) {
   const years = useMemo(() => {
-    const max = Math.max(1, ...data.map(d => d.count)), by = {};
+    // A loop, not `Math.max(1, ...data.map(...))`: spreading one argument per day overflows the
+    // call stack on a long enough record -- an upload spanning a couple of centuries is ~73,000
+    // days, and the failure is a blank panel rather than a slow one.
+    let max = 1;
+    for (const d of data) if (d.count > max) max = d.count;
+    const by = {};
     data.forEach(d => { const y = d.date.slice(0, 4); (by[y] ||= []).push({ ...d, lvl: d.count <= 0 ? 0 : Math.min(5, 1 + Math.floor(Math.sqrt(d.count / max) * 4.99)) }); });
     return by;
   }, [data]);
@@ -53,7 +59,7 @@ const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "
 
 function YearView({ year, days, onPick, focus }) {
   const size = 15, pitch = 17, labelW = 24, top = 16;
-  const max = Math.max(1, ...days.map(d => d.count));
+  const max = days.reduce((m, d) => (d.count > m ? d.count : m), 1);
   const off = new Date(Date.UTC(+year, 0, 1)).getUTCDay();
   const cells = days.map(d => {
     const doy = Math.round((Date.parse(d.date + "T00:00:00Z") - Date.UTC(+year, 0, 1)) / 864e5);
@@ -95,9 +101,9 @@ function YearView({ year, days, onPick, focus }) {
 }
 
 // Tab id + source-case label in one place, so the casing pass can never miss one of them
-// (styles.css uppercases .tab). The expensive chart chunks are also warmed on hover/focus:
-// opening a cold tab otherwise means downloading Recharts (~108 kB gzipped) before anything
-// appears, and the module registry makes a repeated prefetch free.
+// (styles.css uppercases .tab). The chart chunks are also warmed on hover/focus: opening a
+// cold tab otherwise waits for the module to download before anything appears, and the module
+// registry makes a repeated prefetch free.
 const DRAWER_TABS = [
   { id: "calendar", label: "Burning calendar" },
   { id: "forecast", label: "Forecast", prefetch: () => import("./ForecastChart") },
@@ -345,7 +351,8 @@ export default function App() {
           {tab === "briefing" && <BriefingPanel bbox={bb} onPickDay={setDay} refreshKey={diagKey} detail />}
         </div>
 
-        <LivePanel onLoaded={setLive} wide bbox={bb} region={preset?.key} onDatasetChanged={datasetChanged} />
+        <LivePanel onLoaded={setLive} wide bbox={bb} region={preset?.key} onDatasetChanged={datasetChanged}
+          liveRegions={meta.live_regions} />
       </div>
     </>}
   </>;

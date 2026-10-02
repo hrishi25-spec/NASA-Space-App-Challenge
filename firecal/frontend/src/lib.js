@@ -20,7 +20,17 @@ export const api = (p, q = {}) => {
   return promise;
 };
 
-export const errMsg = async r => { try { const j = await r.json(); return j.detail || r.statusText; } catch { return r.statusText; } };
+// FastAPI's `detail` is a string for the errors this API raises deliberately, but a *list of
+// objects* for a validation failure -- and `"…" + d` renders that as "[object Object]", which
+// is exactly the case where the operator needs to read what was wrong with the request.
+export const errMsg = async r => {
+  try {
+    const d = (await r.json())?.detail;
+    if (typeof d === "string") return d;
+    if (d != null) return JSON.stringify(d);
+    return r.statusText;
+  } catch { return r.statusText; }
+};
 
 // The only signal a browser gives us about the link itself (Network Information API; Firefox
 // exposes none of it, which is why every read is optional). Both basemaps keep every feature,

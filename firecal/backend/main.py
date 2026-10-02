@@ -7,13 +7,18 @@ Harmonizes FIRMS MODIS + VIIRS CSVs and serves the four poster pillars:
   4. Incident Commander wildfire briefing       -> /briefing
 plus the original calendar / map / anomaly / forecast endpoints.
 """
+import contextvars
 import functools
+import gzip
 import io
+import json
 import math
 import os
 import re
 import threading
+import time
 import zlib
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
@@ -28,6 +33,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+import forecast_model
 from demo import BOX, make_demo, make_transition_demo
 from regions import REGIONS, region_box, region_keys
 
@@ -177,30 +183,110 @@ def firms_area_url(key, source, box, days, date=None):
 # response until the dataset changes.  These recomputations (DBSCAN, rolling
 # percentiles, K-means) are the difference between instant and a multi-second freeze
 # on every click on a low-end machine.
-_AGG_CACHE: dict = {}
-_CACHE_MAX = 256
+# Bounded twice over: by entry count (many small responses) and by bytes held (a few large
+# ones). The byte budget is the one that matters -- `/points` answers 20,000 records at
+# once, and the entry count alone let an unauthenticated caller hold ~1.4 GB of them: 60
+# requests with distinct bboxes measured +342 MB of resident memory that never came back.
+_AGG_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()   # key -> (body, gzipped-or-b"")
+_CACHE_MAX = 256                     # entries
+_CACHE_BYTES = 48 * 1024 * 1024      # total held, both representations counted
+_CACHE_ENTRY_BYTES = 4 * 1024 * 1024  # a single answer this large is not worth holding
+_CACHE_GZIP_MIN = 1024               # below this, compressing costs more than it saves
+_CACHE_HELD = 0
+
+# Whether the request that is being served accepts gzip. Set by the outermost middleware and
+# read when a cached body is handed back: a `cached` wrapper is called with the endpoint's own
+# arguments and never sees the request, so the flag travels here rather than through the call.
+_ACCEPTS_GZIP: contextvars.ContextVar = contextvars.ContextVar("accepts_gzip", default=False)
 
 
 def _invalidate() -> None:
     """Drop every derived cache. Call after DF changes."""
+    global _CACHE_HELD
     _AGG_CACHE.clear()
+    _CACHE_HELD = 0
+
+
+# Starlette's own encoder settings, so a cache hit is byte-identical to a cache miss --
+# including the ASCII/UTF-8 handling and the refusal of NaN, which would otherwise become
+# invalid JSON on the wire.
+_JSON_KW = {"ensure_ascii": False, "allow_nan": False, "separators": (",", ":")}
+
+
+def _json_body(value):
+    """Serialize a payload the way the response layer would, or None if we cannot."""
+    try:
+        return json.dumps(value, **_JSON_KW).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+
+
+def _pack(body: bytes):
+    """A body plus its compressed form (empty when compressing is not worth the bytes).
+
+    Compressed once, at maximum level, instead of once per request at the middleware's level.
+    The same bytes always gzip to the same bytes, so a cache hit then costs nothing to send:
+    re-compressing the 1.2 MB `/points` answer measured 505 ms of a 515 ms response.
+    """
+    return (body, gzip.compress(body, 9) if len(body) >= _CACHE_GZIP_MIN else b"")
+
+
+def _remember(key, body: bytes) -> None:
+    """Store a body (and its compressed form) under the two ceilings."""
+    global _CACHE_HELD
+    if len(body) > _CACHE_ENTRY_BYTES:
+        return
+    old = _AGG_CACHE.pop(key, None)
+    packed = _pack(body)[1]
+    if old is not None:
+        _CACHE_HELD -= len(old[0]) + len(old[1])
+    _AGG_CACHE[key] = (body, packed)          # re-inserting also moves it to the newest end
+    _CACHE_HELD += len(body) + len(packed)
+    while _AGG_CACHE and (len(_AGG_CACHE) > _CACHE_MAX or _CACHE_HELD > _CACHE_BYTES):
+        gone = _AGG_CACHE.popitem(last=False)[1]
+        _CACHE_HELD -= len(gone[0]) + len(gone[1])
+
+
+def _serve(entry):
+    """Return a cached body, pre-compressed when the caller can take it.
+
+    `Content-Encoding` is the signal the gzip middleware already honours -- a response that
+    declares one is passed through untouched -- so the compression it would have done is
+    skipped rather than repeated. `Vary` is set by hand for the same reason: the middleware
+    adds it only when it does the compressing itself.
+    """
+    body, packed = entry
+    if packed and _ACCEPTS_GZIP.get():
+        return Response(content=packed, media_type="application/json",
+                        headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"})
+    return Response(content=body, media_type="application/json")
 
 
 def cached(func):
-    """Memoize an endpoint keyed by its own arguments; cleared by _invalidate()."""
+    """Memoize an endpoint keyed by its own arguments; cleared by _invalidate().
+
+    The body is stored *serialized*. That is what makes the memory ceiling honest -- the
+    cache counts exact bytes instead of guessing at a Python object's size -- and it removes
+    the response encoder from the hot path: re-encoding a 20,000-record `/points` answer cost
+    2.0 s on every request, hit or miss, which was most of that endpoint's latency. A payload
+    that cannot be pre-encoded is returned untouched and left uncached, so the endpoint keeps
+    whatever behaviour FastAPI gave it.
+    """
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         key = (func.__name__, args, tuple(sorted(kwargs.items())))
         hit = _AGG_CACHE.get(key)
         if hit is not None:
-            return hit
+            _AGG_CACHE.move_to_end(key)
+            return _serve(hit)
         value = func(*args, **kwargs)
         if isinstance(value, Response):      # already-serialized body: don't reuse it
             return value
-        if len(_AGG_CACHE) >= _CACHE_MAX:    # keep memory bounded on small machines
-            _AGG_CACHE.clear()
-        _AGG_CACHE[key] = value
-        return value
+        body = _json_body(value)
+        if body is None:
+            return value
+        _remember(key, body)
+        return _serve(_AGG_CACHE.get(key, (body, b"")))
     return wrapper
 
 
@@ -249,7 +335,17 @@ def _esfp(scan, track, sensor):
     return area_km2.clip(lower=nadir) / nadir, area_km2
 
 
-def harmonize(raw: pd.DataFrame) -> pd.DataFrame:
+def harmonize(raw: pd.DataFrame, geometry: bool = True) -> pd.DataFrame:
+    """Normalize a FIRMS frame to this API's columns and drop what it will not count.
+
+    `geometry=False` skips the footprint columns (`scan`, `track`, `esfp`, `pixel_km2`).
+    They are what makes `/meta` and `/diagnostic` physical rather than pure counts, but
+    they cost two clip+divide passes over every row, and `train.py` reads ~80M rows of
+    archive that it only ever reduces to per-day counts. Both callers then apply the
+    same confidence floor, the same date parsing and the same sensor naming, because the
+    trained series and the served series have to be the same quantity or the checkpoint
+    is training on something else than the endpoint predicts.
+    """
     d = raw.copy(); d.columns = [c.strip().lower() for c in d.columns]
     missing = REQUIRED - set(d.columns)
     if missing:
@@ -265,21 +361,27 @@ def harmonize(raw: pd.DataFrame) -> pd.DataFrame:
         conf = conf.fillna(d["confidence"].astype(str).str.strip().str.lower().map(CONF_MAP))
     at = pd.to_numeric(d["acq_time"], errors="coerce")  # "HHMM", 1345.0, or missing -> NaT below
     t = pd.to_datetime(d["acq_date"], errors="coerce") + pd.to_timedelta(at // 100, unit="h") + pd.to_timedelta(at % 100, unit="m")
-    scan_raw = d["scan"] if "scan" in d.columns else pd.Series(np.nan, index=d.index)
-    track_raw = d["track"] if "track" in d.columns else pd.Series(np.nan, index=d.index)
-    scan = pd.to_numeric(scan_raw, errors="coerce").fillna(1.0)
-    track = pd.to_numeric(track_raw, errors="coerce").fillna(1.0)
-    esfp, area = _esfp(scan, track, sensor)
+    scan = track = None
+    if geometry:
+        scan_raw = d["scan"] if "scan" in d.columns else pd.Series(np.nan, index=d.index)
+        track_raw = d["track"] if "track" in d.columns else pd.Series(np.nan, index=d.index)
+        scan = pd.to_numeric(scan_raw, errors="coerce").fillna(1.0)
+        track = pd.to_numeric(track_raw, errors="coerce").fillna(1.0)
+        esfp, area = _esfp(scan, track, sensor)
     out = pd.DataFrame({
         "lat": pd.to_numeric(d["latitude"], errors="coerce"),
         "lon": pd.to_numeric(d["longitude"], errors="coerce"),
         "time": t, "date": t.dt.normalize(),
         "sensor": sensor, "sat": d.get("satellite", pd.Series(sensor, index=d.index)).astype(str),
         "conf": conf, "frp": pd.to_numeric(d.get("frp", 0), errors="coerce").fillna(0),
-        "bt": d[bt_col] if bt_col in d.columns else pd.Series(np.nan, index=d.index),
-        "scan": scan.clip(0.1, 20), "track": track.clip(0.1, 20),
-        "daynight": d.get("daynight", pd.Series(0, index=d.index)),
-        "esfp": esfp, "pixel_km2": area})
+        "bt": d[bt_col] if bt_col in d.columns else pd.Series(np.nan, index=d.index)})
+    if geometry:                       # order matches the full frame: scan, track, daynight, esfp, pixel_km2
+        out["scan"] = scan.clip(0.1, 20)
+        out["track"] = track.clip(0.1, 20)
+    out["daynight"] = d.get("daynight", pd.Series(0, index=d.index))
+    if geometry:
+        out["esfp"] = esfp
+        out["pixel_km2"] = area
     out = out.dropna(subset=["lat", "lon", "time", "conf", "bt"])
     out = out[out.lat.between(-90, 90) & out.lon.between(-180, 180)]
     return out[out.conf >= 30]  # drop low-confidence detections for all sensors
@@ -329,6 +431,7 @@ async def upload(files: list[UploadFile] = File(...), demo_transition: bool = Fa
     if len(files) > MAX_UPLOAD_FILES:
         raise HTTPException(400, f"too many files: {len(files)} (limit {MAX_UPLOAD_FILES} per request)")
     parts = [DF] if len(DF) else []
+    rows_in = 0
     # The poster's 2002-2024 illusion dataset used to load whenever a file happened to be
     # *named* demo_transition.csv. A filename is client-controlled input and must never
     # select server behaviour: that made the upload's real content irrelevant, and anyone
@@ -348,6 +451,14 @@ async def upload(files: list[UploadFile] = File(...), demo_transition: bool = Fa
         except ValueError as e:
             raise HTTPException(400, f"{name}: {e}")
         if not h.empty:
+            # Capped here, not after the concat below. `MAX_UPLOAD_BYTES` bounds the bytes on
+            # the wire, but one FIRMS row expands into ~14 typed columns, so a request sitting
+            # exactly at that limit holds several hundred MB of frames -- and the old cap only
+            # ran once `pd.concat` had already copied every one of them.
+            rows_in += len(h)
+            if rows_in > MAX_ROWS:
+                raise HTTPException(413, f"too many rows in one upload: over {MAX_ROWS:,} "
+                                         f"after low-confidence filtering -- split it across requests")
             parts.append(h)
     if not parts:
         raise HTTPException(400, "No usable rows found: need FIRMS-style CSVs with "
@@ -432,12 +543,17 @@ def archive(region: str = None, bbox: str = None, source: str = "VIIRS_S-NPP",
     if not MAP_KEY_RE.fullmatch(key):
         raise HTTPException(400, "FIRMS_MAP_KEY looks malformed (expected 6-64 letters/digits)")
     days = min(max(days, 1), 5)          # the area API accepts 1-5 days per request
+    if not _ARCHIVE_SLOTS.acquire(blocking=False):
+        raise HTTPException(429, "another FIRMS area pull is already running; retry in a moment")
     try:
-        raw = _fetch_feed(firms_area_url(key, source, box, days, date))
-    except Exception as e:
-        # `e` is sanitised by _fetch_feed: this detail reaches the client, so nothing that
-        # could contain the key (or the URL that carries it) may be echoed here.
-        raise HTTPException(502, f"FIRMS area API request failed: {e}")
+        try:
+            raw = _fetch_feed(firms_area_url(key, source, box, days, date))
+        except Exception as e:
+            # `e` is sanitised by _fetch_feed: this detail reaches the client, so nothing that
+            # could contain the key (or the URL that carries it) may be echoed here.
+            raise HTTPException(502, f"FIRMS area API request failed: {e}")
+    finally:
+        _ARCHIVE_SLOTS.release()
     h = harmonize(raw)
     a, b, c, e = box
     # Trust the API's AREA filter, then verify: an unexpected layout must not smuggle
@@ -463,8 +579,12 @@ def clear():
 
 @app.get("/meta")
 def meta():
-    if DF.empty: return {"n": 0}
-    return {"n": len(DF), "start": str(DF.date.min().date()), "end": str(DF.date.max().date()),
+    # `live_regions` rides along so the console's live panel offers exactly the allowlist
+    # this server enforces. The two were separate hand-kept lists, which is a 400 waiting
+    # for whoever edits one of them.
+    if DF.empty: return {"n": 0, "live_regions": LIVE_REGIONS}
+    return {"n": len(DF), "live_regions": LIVE_REGIONS,
+            "start": str(DF.date.min().date()), "end": str(DF.date.max().date()),
             "sensors": DF.groupby("sensor").size().to_dict(),
             "bounds": [DF.lat.min(), DF.lon.min(), DF.lat.max(), DF.lon.max()],
             "hfi": round(float(DF.frp.mul(DF.esfp).sum()), 1),
@@ -501,19 +621,33 @@ def subset(bbox, start=None, end=None):
     return d
 
 
+def harmonized_daily(piv, frp):
+    """Sum a (date x sensor) count table into one series, sensors rescaled to the
+    best-covered sensor over their overlap period.
+
+    Split out of `daily()` so `train.py` can hand it the same table assembled from the
+    archive in chunks. The sensor ratio is the whole point of the harmonization -- VIIRS
+    sees several times as many detections as MODIS at 375 m -- so a trained series built
+    by some second implementation would quietly be a different quantity from the one the
+    API serves and predicts.
+    """
+    ref = (piv > 0).sum().idxmax(); adj = piv.astype(float)
+    for s in piv.columns:
+        if s == ref: continue
+        ov = (piv[ref] > 0) & (piv[s] > 0)
+        if ov.sum() >= 5: adj[s] = piv[s] * piv.loc[ov, ref].sum() / piv.loc[ov, s].sum()
+    out = pd.DataFrame({"count": adj.sum(axis=1), "raw": piv.sum(axis=1),
+                        "frp": frp.reindex(piv.index).fillna(0)})
+    return out.reindex(pd.date_range(out.index.min(), out.index.max()), fill_value=0)
+
+
 def daily(d):
     """Daily counts; sensors rescaled to the best-covered sensor over their overlap period."""
     if d.empty:
         return pd.DataFrame({"count": pd.Series(dtype=float), "raw": pd.Series(dtype=float),
                              "frp": pd.Series(dtype=float)}, index=pd.DatetimeIndex([]))
     piv = d.groupby(["date", "sensor"]).size().unstack(fill_value=0)
-    ref = (piv > 0).sum().idxmax(); adj = piv.astype(float)
-    for s in piv.columns:
-        if s == ref: continue
-        ov = (piv[ref] > 0) & (piv[s] > 0)
-        if ov.sum() >= 5: adj[s] = piv[s] * piv.loc[ov, ref].sum() / piv.loc[ov, s].sum()
-    out = pd.DataFrame({"count": adj.sum(axis=1), "raw": piv.sum(axis=1), "frp": d.groupby("date").frp.sum()})
-    return out.reindex(pd.date_range(out.index.min(), out.index.max()), fill_value=0)
+    return harmonized_daily(piv, d.groupby("date").frp.sum())
 
 
 @app.get("/calendar")
@@ -529,7 +663,12 @@ def points(bbox: str = None, start: str = None, end: str = None, limit: int = 60
     d = subset(bbox, start, end)
     limit = min(max(limit, 1), 20000)
     if len(d) > limit: d = d.sample(limit, random_state=0)
-    return d[["lat", "lon", "frp", "sensor"]].round(4).to_dict("records")
+    # Assembled column by column. `to_dict("records")` routes every value through pandas'
+    # object machinery and measured 140 ms for the 20,000-row case; four NumPy arrays zipped
+    # into the same records measure 29 ms. The records are identical, `round(4)` included.
+    lat = d.lat.to_numpy().round(4).tolist(); lon = d.lon.to_numpy().round(4).tolist()
+    frp = d.frp.to_numpy().round(4).tolist(); sensor = d.sensor.tolist()
+    return [{"lat": a, "lon": b, "frp": c, "sensor": s} for a, b, c, s in zip(lat, lon, frp, sensor)]
 
 
 @app.get("/clusters")
@@ -539,14 +678,43 @@ def clusters(bbox: str = None, start: str = None, end: str = None, eps: float = 
     return _cluster_payload(subset(bbox, start, end), eps, min_pts, hours)
 
 
+# scipy and scikit-learn are the two heaviest imports in the app (~2.5-3.5 s of cold start
+# and a chunk of the baseline RSS), so they load on first use rather than at start-up. They
+# must load *once*, under a lock. One screen asks for them from two threadpool threads at the
+# same time -- the map wants /clusters while the rail wants /briefing, and the briefing's fuel
+# stratification is the other scipy/sklearn caller -- and two concurrent cold imports of the
+# same C-extension package collide on CPython's per-module import lock. Observed for real,
+# loading the console against a freshly started server:
+#
+#   _frozen_importlib._DeadlockError: deadlock detected by _ModuleLock(
+#       'scipy.linalg.cython_lapack')   -> GET /clusters 500
+#
+# The lock makes the second caller wait for the first instead of racing it, and the cost is
+# still paid once, still off the start-up path.
+_HEAVY_LOCK = threading.Lock()
+_HEAVY: dict = {}
+
+
+def heavy(what):
+    """Import one of the heavy optional modules once, safely, and return the symbol."""
+    with _HEAVY_LOCK:
+        if what not in _HEAVY:
+            if what == "hull":
+                from scipy.spatial import ConvexHull
+                _HEAVY[what] = ConvexHull
+            elif what == "dbscan":
+                from sklearn.cluster import DBSCAN
+                _HEAVY[what] = DBSCAN
+            elif what == "kmeans":
+                from sklearn.cluster import KMeans
+                _HEAVY[what] = KMeans
+            else:
+                raise KeyError(what)
+        return _HEAVY[what]
+
+
 def _cluster_payload(d, eps, min_pts, hours):
-    # scipy + scikit-learn are the two heaviest imports in the app (~2.5-3.5 s of cold
-    # start and a chunk of the baseline RSS), and only this function and the briefing's
-    # fuel stratification need them. Imported on first use so the API answers /meta -- and
-    # the launcher can open the browser -- that much sooner; later calls hit the module
-    # cache, so the cost is paid once, off the start-up path.
-    from scipy.spatial import ConvexHull
-    from sklearn.cluster import DBSCAN
+    ConvexHull, DBSCAN = heavy("hull"), heavy("dbscan")
     if len(d) < min_pts: return []
     # ponytail: stride-sample above 60k detections (an exact pass would be a per-day
     # clustering rewrite). head() kept the OLDEST rows, so a big upload silently showed a
@@ -703,6 +871,39 @@ def diagnostic(bbox: str = None):
 
 
 # --------------------------------- 3. live NASA FIRMS feeds + on-the-fly clustering
+# One FIRMS area pull is an outbound request carrying the operator's key. Refuse to stack
+# them, so the key cannot be turned into an unbounded fetching service by a loop.
+_ARCHIVE_SLOTS = threading.BoundedSemaphore(4)
+
+
+# The open 24 h feeds refresh once a day, and one live ingest is four outbound downloads plus
+# DBSCAN. Uncached, every panel refresh was four more downloads: an unauthenticated caller
+# could drive unlimited traffic at NASA (and unlimited CPU here) by looping one URL. A short
+# TTL collapses the repeats, keeps the panel honest, and makes switching back to it instant.
+# Time-bounded rather than data-bounded on purpose -- live rows are overlaid on the map and
+# never merged into DF, so a dataset change must not drop them.
+_LIVE_TTL = 60.0
+_LIVE_CACHE: dict = {}
+_LIVE_CACHE_MAX = 8
+
+
+def _live_recall(key):
+    hit = _LIVE_CACHE.get(key)
+    if hit is None:
+        return None
+    stamp, entry = hit
+    if time.monotonic() - stamp > _LIVE_TTL:
+        _LIVE_CACHE.pop(key, None)
+        return None
+    return entry
+
+
+def _live_remember(key, entry):
+    _LIVE_CACHE[key] = (time.monotonic(), entry)
+    while len(_LIVE_CACHE) > _LIVE_CACHE_MAX:
+        _LIVE_CACHE.pop(min(_LIVE_CACHE, key=lambda k: _LIVE_CACHE[k][0]), None)
+
+
 def _fetch_feed(url, timeout=90):
     # Streamed with a hard ceiling. r.content buffered whatever came back with no limit,
     # so a huge or unexpected response would be pulled into memory in full.
@@ -719,10 +920,10 @@ def _fetch_feed(url, timeout=90):
                 buf += chunk
                 if len(buf) > MAX_FEED_BYTES:
                     raise RuntimeError(f"feed exceeded {MAX_FEED_BYTES // (1024 * 1024)} MB")
+            if len(buf) < 80:       # read inside the `with`: an empty body is not a feed
+                raise RuntimeError("HTTP 200 with an empty body")
     except requests.RequestException as e:
         raise RuntimeError(f"request failed: {type(e).__name__}") from None
-    if len(buf) < 80:
-        raise RuntimeError(f"HTTP {r.status_code}")
     try:
         df = read_firms_csv(bytes(buf))
     except ValueError as e:
@@ -748,12 +949,22 @@ def live(region: str = "Global", bbox: str = None, eps: float = 550, min_pts: in
     # The allowlist is the one the UI already offers.
     if region not in LIVE_REGIONS:
         raise HTTPException(400, f"unknown region {region!r}; expected one of: {', '.join(LIVE_REGIONS)}")
+    key = (region, bbox, eps, min_pts, hours, bool(crop))
+    entry = _live_recall(key)
+    if entry is not None:
+        return _serve(entry)
     if not _LIVE_SLOTS.acquire(blocking=False):
         raise HTTPException(429, "a live FIRMS ingest is already running; retry in a moment")
     try:
-        return _live_ingest(region, bbox, eps, min_pts, hours, crop)
+        payload = _live_ingest(region, bbox, eps, min_pts, hours, crop)
     finally:
         _LIVE_SLOTS.release()
+    body = _json_body(payload)
+    if body is None:
+        return payload
+    entry = _pack(body)
+    _live_remember(key, entry)
+    return _serve(entry)
 
 
 def _live_ingest(region, bbox, eps, min_pts, hours, crop):
@@ -849,7 +1060,7 @@ def _threat(streaks, recent_mean):
 
 
 def _biomes(d, k=4):
-    from sklearn.cluster import KMeans    # same start-up reason as _cluster_payload
+    KMeans = heavy("kmeans")              # same start-up reason as _cluster_payload
     if len(d) < k * 3: return []
     X = np.c_[d.lon.values * 111.32 * math.cos(math.radians(d.lat.mean())), d.lat.values * 110.57, d.frp.values]
     km = KMeans(n_clusters=k, n_init=10, random_state=0).fit(X)
@@ -946,6 +1157,56 @@ def anomalies(bbox: str = None, z: float = 2.0):
             "monthly": [{"month": int(m), "avg": round(v, 1)} for m, v in mo.items()]}
 
 
+def _warm_start(model):
+    """Load the archive's LSTM weights into a freshly built model, when they fit it.
+
+    Everything about this is optional and locally produced, so every failure mode means
+    "no warm start" rather than a failed forecast: no checkpoint file, a checkpoint
+    written by a different architecture, a torch build that refuses the pickle, or a
+    directory somebody half-copied. The endpoint trains either way.
+    """
+    path = forecast_model.LSTM_WEIGHTS
+    if not path.is_file():
+        return False
+    try:
+        import torch
+        state = torch.load(path, map_location="cpu")
+        mine = model.state_dict()
+        if set(state) != set(mine) or any(tuple(state[k].shape) != tuple(mine[k].shape) for k in mine):
+            return False
+        model.load_state_dict(state)
+        return True
+    except Exception:
+        return False
+
+
+def _seasonal_climatology(s, bbox):
+    """Day-of-year curve for a frame, blended with the prior the archive trained.
+
+    A prior is exactly what a short frame lacks. A fresh upload -- and the demo -- spans
+    one or two fire seasons, so its day-of-year curve is a single sample per day, while
+    the checkpoint was fitted on every FIRMS export in the training directory. The blend
+    happens in log space because detections are positive and heavily skewed: a straight
+    average of two levels would let one big fire day outvote the rest of the season.
+
+    Returns (curve, prior). `prior` is None when the archive had nothing for this AOI, so
+    the caller can say which one produced the forecast instead of implying it always did.
+    """
+    dfp = pd.DataFrame({"v": s.values, "doy": s.index.dayofyear}, index=s.index)
+    own = dfp.groupby("doy").v.mean()
+    prior = forecast_model.profile_for_bbox(bbox)
+    if prior is None:
+        return own, None
+    grid = np.arange(1, forecast_model.DOY_BINS + 1)
+    archive = forecast_model.doy_series(prior["doy"])
+    # Three years of the frame's own record is the archive's own evidence, so the prior
+    # has said what it can by then and fades out; below that it is most of the signal.
+    alpha = min(1.0, s.index.year.nunique() / 3.0)
+    mine = own.reindex(grid).astype(float)
+    mixed = alpha * np.log1p(mine.fillna(archive)) + (1.0 - alpha) * np.log1p(archive)
+    return pd.Series(np.expm1(mixed), index=grid), prior
+
+
 @app.get("/forecast")
 @cached
 def forecast(bbox: str = None, horizon: int = 30, epochs: int = 40):
@@ -953,27 +1214,42 @@ def forecast(bbox: str = None, horizon: int = 30, epochs: int = 40):
     s = daily(subset(bbox))["count"]
     if len(s) < 120: return {"model": None, "forecast": []}
     idx = pd.date_range(s.index[-1] + pd.Timedelta(days=1), periods=horizon)
+    # No bbox means the whole frame, so "everywhere" is the box the prior should come from.
+    box = parse_bbox(bbox) or (-90.0, -180.0, 90.0, 180.0)
+    prior = None
     try:
         import torch, torch.nn as nn
         y = np.log1p(s.values).astype("float32"); mu, sd = y.mean(), y.std() + 1e-6; y = (y - mu) / sd
-        W = 30; doy = lambda ix: np.c_[np.sin(2*np.pi*ix.dayofyear/365.25), np.cos(2*np.pi*ix.dayofyear/365.25)].astype("float32")
+        W = forecast_model.WINDOW
+        doy = lambda ix: np.c_[np.sin(2*np.pi*ix.dayofyear/365.25), np.cos(2*np.pi*ix.dayofyear/365.25)].astype("float32")
         feat = np.c_[y, doy(s.index)]
         Xs = np.stack([feat[i:i+W] for i in range(len(y)-W)]); Ys = y[W:]
         class M(nn.Module):
             def __init__(s): super().__init__(); s.l = nn.LSTM(3, 32, batch_first=True); s.o = nn.Linear(32, 1)
             def forward(s, x): return s.o(s.l(x)[0][:, -1]).squeeze(-1)
-        m = M(); opt = torch.optim.Adam(m.parameters(), 1e-2); Xt, Yt = torch.tensor(Xs), torch.tensor(Ys)
+        m = M(); warm = _warm_start(m)
+        opt = torch.optim.Adam(m.parameters(), 1e-2); Xt, Yt = torch.tensor(Xs), torch.tensor(Ys)
         for _ in range(epochs): opt.zero_grad(); nn.functional.mse_loss(m(Xt), Yt).backward(); opt.step()
         win, dz, out = feat[-W:].copy(), doy(idx), []
         for k in range(horizon):
             p = m(torch.tensor(win[None])).item(); out.append(p); win = np.vstack([win[1:], [p, *dz[k]]])
-        vals = np.expm1(np.array(out) * sd + mu).clip(0); model = "LSTM (PyTorch)"
+        vals = np.expm1(np.array(out) * sd + mu).clip(0)
+        model = "LSTM (PyTorch) + archive seed" if warm else "LSTM (PyTorch)"
     except ImportError:  # seasonal fallback: same-day climatology scaled to recent level
-        dfp = pd.DataFrame({"v": s.values, "doy": s.index.dayofyear}, index=s.index)
-        clim = dfp.groupby("doy").v.mean().rolling(15, center=True, min_periods=1).mean()
+        clim, prior = _seasonal_climatology(s, box)
+        clim = clim.rolling(15, center=True, min_periods=1).mean()
         scale = (s[-30:].mean() + 1) / (clim.reindex(s[-30:].index.dayofyear).mean() + 1)
-        vals = clim.reindex(idx.dayofyear).values * scale; model = "Seasonal climatology (install torch for LSTM)"
-    return {"model": model, "forecast": [{"date": str(i.date()), "count": round(float(v), 1)} for i, v in zip(idx, vals)]}
+        vals = clim.reindex(idx.dayofyear).values * scale
+        model = ("Seasonal climatology + archive prior (torch for LSTM)" if prior
+                 else "Seasonal climatology (install torch for LSTM)")
+    # `out` above is the torch branch's list of predictions; the response is its own name.
+    payload = {"model": model,
+               "forecast": [{"date": str(i.date()), "count": round(float(v), 1)} for i, v in zip(idx, vals)]}
+    if prior:   # provenance, so the panel can be checked against the checkpoint on disk
+        payload["prior"] = {"cells": prior["cells"], "trained": prior["generated"],
+                            "days": prior["source_days"],
+                            "level": None if prior["level"] is None else round(prior["level"], 2)}
+    return payload
 
 
 # ----------------------------------------------------------- single-origin serving (image)
@@ -998,6 +1274,61 @@ async def strip_api_prefix(request, call_next):
         if scope.get("raw_path"):
             scope["raw_path"] = scope["raw_path"][len(API_PREFIX):] or b"/"
     return await call_next(request)
+
+
+# ---------------------------------------------------------------- response hardening
+# One policy, written for what the built console actually loads: its own bundle, MapLibre's
+# worker, Esri raster tiles and the CARTO vector style document. Notes on the two directives
+# that look loose and are not:
+#
+#   * `style-src 'unsafe-inline'` is load-bearing. index.html paints the first frame from an
+#     inline <style> block so a slow machine sees the console's own colours instead of a white
+#     flash, and React sets an inline style attribute on most elements.
+#   * `worker-src ... blob:` is for MapLibre, which spawns its geometry worker; the bundled
+#     worker is same-origin, and the blob form is what it falls back to.
+#
+# This header only ever constrains documents *this* process serves, so it changes nothing in
+# development: there the page is served by Vite on :5173 and only its /api calls come here.
+SECURITY_HEADERS = {
+    "Content-Security-Policy": "; ".join([
+        "default-src 'self'",
+        "script-src 'self'",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data: blob: https://server.arcgisonline.com https://*.basemaps.cartocdn.com",
+        "connect-src 'self' https://*.basemaps.cartocdn.com",
+        "worker-src 'self' blob:",
+        "font-src 'self' data:",
+        "object-src 'none'",
+        "base-uri 'none'",
+        "form-action 'none'",
+        "frame-ancestors 'none'",
+    ]),
+    # An upload or a FIRMS feed is attacker-influenced text. `nosniff` stops a browser from
+    # deciding for itself that a JSON body is really HTML.
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",           # with frame-ancestors, for older browsers
+    "Referrer-Policy": "no-referrer",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Permissions-Policy": "geolocation=(), camera=(), microphone=(), payment=(), usb=()",
+}
+
+
+@app.middleware("http")
+async def harden_response(request, call_next):
+    """Stamp the security headers on every response, refusals included.
+
+    Registered last, which makes it the outermost middleware, so a 403 from the origin guard
+    or a 413 from the upload cap is hardened exactly like a 200. Being outermost is also what
+    lets it publish the request's `Accept-Encoding` before any endpoint runs.
+    """
+    token = _ACCEPTS_GZIP.set("gzip" in (request.headers.get("accept-encoding") or ""))
+    try:
+        response = await call_next(request)
+    finally:
+        _ACCEPTS_GZIP.reset(token)
+    for name, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(name, value)
+    return response
 
 
 # The built console, when there is one. Development has no build -- Vite serves the console

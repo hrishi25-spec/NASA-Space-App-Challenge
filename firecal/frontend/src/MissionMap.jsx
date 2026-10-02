@@ -9,6 +9,7 @@ import "maplibre-gl/dist/maplibre-gl.css";
 import maplibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
 import { fmt, SLOW_LINK } from "./lib";
 import { createQualityGovernor } from "./adaptiveQuality";
+import { spinHolds, spinRate, spinStep } from "./autoRotate";
 // The basemap style documents and the globe/mercator thresholds live in their own module, so
 // the style that is drawn and the badge that reports it read the same constants.
 import { GLOBE_ZOOM, FLAT_ZOOM, START_ZOOM, rasterStyle, mergeOverlays, VECTOR_STYLE_URL } from "./basemapStyles";
@@ -175,6 +176,9 @@ export default function MissionMap({
   // True while a gesture is being served at reduced detail, so the correction survives a
   // basemap swap (a new style would otherwise hand the full-detail layers back mid-drag).
   const degradedRef = useRef(false);
+  // True only for the instant the drift sets the bearing. `setBearing` fires its rotate events
+  // synchronously, so this is an exact "this move is ours" flag for the frame-rate sampler.
+  const spinningRef = useRef(false);
 
   onSelectBoundsRef.current = onSelectBounds;
   onTilesChangeRef.current = onTilesChange;
@@ -293,6 +297,10 @@ export default function MissionMap({
     // MapLibre fires the matching *end* events too, but the quiet window covers those without
     // needing to pair them up (a pinch can be a zoom, a rotate and a pitch at once).
     const armQuality = () => {
+      // A programmatic camera move is not a gesture. The drift ticks every frame and each tick
+      // fires a rotate event, which would hold the measurement window open forever and leave a
+      // slow machine pinned at reduced detail for as long as Auto-rotate was on.
+      if (spinningRef.current) return;
       governor.arm(performance.now());
       if (!rafId) rafId = requestAnimationFrame(stepFrame);
     };
@@ -422,14 +430,39 @@ export default function MissionMap({
                            duration: MOTION_MS + 250 });
   }, [flyNonce]);
 
-  // Opt-in orbital drift. Slower on weak GPUs, and any gesture stops it immediately so it
-  // can never fight the operator mid-drag.
+  // Opt-in orbital drift, one animation frame at a time. Slower on weak GPUs, and any gesture
+  // stops it immediately so it can never fight the operator mid-drag. See autoRotate.js for why
+  // the angle is accumulated from frame times instead of being stepped by a timer.
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !spin) return undefined;
-    const step = LOW_END ? 0.12 : 0.22;
-    const id = setInterval(() => map.setBearing((map.getBearing() + step) % 360), LOW_END ? 140 : 70);
-    return () => clearInterval(id);
+    const rate = spinRate(LOW_END);
+    // Our own unwrapped bearing. MapLibre wraps whatever it is handed into (-180, 180] and
+    // picks the nearest equivalent angle, so letting this grow keeps the globe turning the same
+    // way across the ±180 seam.
+    let frame = 0, angle = null, last = 0;
+    const tick = now => {
+      frame = requestAnimationFrame(tick);
+      if (angle === null) {                       // first frame, or resuming after a hold
+        angle = map.getBearing();
+        last = now;
+        return;
+      }
+      const elapsed = now - last;
+      last = now;
+      // Someone else owns the camera for the moment (a gesture, or Fly to AOI / Globe view /
+      // Reset orbit / a dataset fly-to): hold, and pick the drift up from wherever their move
+      // leaves it rather than dragging the bearing back to ours.
+      if (spinHolds(map.isMoving())) { angle = null; return; }
+      angle += spinStep(elapsed, rate);
+      // The rotate events `setBearing` fires are synchronous, so this flag is exact: it keeps
+      // the drift's own rotation from arming the adaptive-detail sampler every frame.
+      spinningRef.current = true;
+      map.setBearing(angle);
+      spinningRef.current = false;
+    };
+    frame = requestAnimationFrame(tick);
+    return () => { cancelAnimationFrame(frame); spinningRef.current = false; };
   }, [spin]);
   useEffect(() => {
     const el = mapRef.current?.getCanvas();

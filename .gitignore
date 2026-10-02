@@ -10,6 +10,13 @@ dist/
 # Uploads / local data
 *.csv
 
+# The FIRMS training archive (~10 GB of NASA area exports) and the forecast checkpoint
+# trained from it.  Both are local: `python firecal/backend/train.py` rebuilds the
+# checkpoint from whatever is in the directory, and the API works without either.
+Data Training/
+data_training/
+firecal/backend/model/
+
 # Local configuration and secrets
 .env
 .env.local

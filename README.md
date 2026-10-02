@@ -18,6 +18,7 @@ Built for the [2026 NASA Space Apps Challenge](https://spaceappschallenge.org/) 
 - [Why](#why)
 - [Quick start](#quick-start)
 - [Getting FIRMS data](#getting-firms-data)
+- [Training the model](#training-the-model)
 - [What you see](#what-you-see)
 - [Method](#method)
 - [API reference](#api-reference)
@@ -162,6 +163,35 @@ surge after 2012 while the harmonized record stays flat. Both follow the selecte
 preset, so *Load demo* with **Punjab & Haryana** selected fills that AOI instead of the
 default box; each preset gets its own seed, so no two regions show identical statistics.
 
+## Training the model
+
+`/forecast` always works: with no checkpoint it fits a climatology to your own record. The
+checkpoint is what lets it start from the real NASA archive instead.
+
+```bash
+cd firecal/backend
+python train.py                # every CSV in the training directory
+python train.py --inventory    # list what would be read, and stop
+python train.py --limit 200000 # head of each file, for a quick run
+```
+
+It streams every `*.csv` under `Data Training/` (`data_training/` works too), harmonizes
+each chunk with the server's own rules, and reduces the whole record to a day-of-year
+seasonal shape per 2° cell plus the harmonized daily series — 1.8 MB out of 10 GB in the
+reference run, written to `firecal/backend/model/`. Nothing is read into memory whole and
+nothing is committed: the archive is 10 GB of local NASA area exports, the checkpoint is
+derived from it, and both are in `.gitignore`. Delete `model/` and the API behaves exactly
+as it did before. Add `torch` to `requirements.txt` and the same run also fits the LSTM
+that `/forecast` warm-starts from.
+
+The forecast panel names which one answered. With a checkpoint (`Seasonal climatology +
+archive prior`) the archive's shape is blended into the frame's own season — in log space,
+fading out as the frame covers more years itself — because a record of a single fire season
+is one sample per day and cannot know its own shape. The reference run read 126 million
+detections across 1,089 days and learned what a 2° cell looks like through the year: the
+Thai dry-season peak in late March, Amazon burning in September, California's summer in
+July.
+
 ## What you see
 
 | Panel | What it does |
@@ -169,12 +199,12 @@ default box; each preset gets its own seed, so no two regions show identical sta
 | **Hero stats strip** | HFII (Σ FRP·ESFP), equivalent standard pixels (ESFP), hotspots harmonized, record span. |
 | **Burning calendar** | GitHub-style heatmap: one row per year, one cell per day, color = harmonized daily detections. A **Year** selector narrows it to a single-year calendar. Click any day to inspect it. |
 | **Region presets** | The *Fly to…* picker in the command bar (California, Amazon & Pantanal, Southeastern Australia, Punjab & Haryana, Mediterranean basin) sets the AOI filter, flies the camera to a regional zoom, and fills the **Selection** panel with the region's fuel type, peak season and notable fire years. Every panel then recomputes for that AOI; **Load demo** follows the selection, and when an AOI holds no detections the panel offers *Load demo for …*. |
-| **Map** | One camera that morphs a **3D Earth globe** into a flat map as you zoom (the badge tracks `3D GLOBE → TRANSITION → 2D MAP`); scroll in past the transition for the flat view, or press **Globe view** to fly back. **Fly to AOI** fits the drawn box, **Reset orbit** returns to the default global attitude, and **Auto-rotate** drifts the bearing slowly (opt-in, slower on weak GPUs, and any gesture stops it). Detections for the selected day (±1/3/7/14 d span) — **MODIS coral, VIIRS amber, live points pale gold** — plus soft-sand DBSCAN cluster polygons, on one of three basemaps: **Satellite** imagery, the colour **Terrain** map, or **Vector** tiles (CARTO Dark Matter) whose coastlines and place names stay crisp however far you zoom, since vector geometry is redrawn rather than upscaled. All three toggles sit with the other view controls, in the bottom-left row under the readout, and a slow connection opens on **Vector** because it is the lightest of the three. The bottom-left column is readout first (`day · hotspots · clusters · MW`), controls beneath it, and its height tracks the measured attribution notice, so no control ever covers it. Dragging, rotating and zooming stay light on every basemap: the canvas render ratio is capped, MSAA and tile fade are off, and expired tiles are not re-fetched mid-gesture. Live-feed points/polygons overlay when pulled. Use **Select area** and click two corners to draw a bounding box; every panel then filters to it. |
+| **Map** | One camera that morphs a **3D Earth globe** into a flat map as you zoom (the badge tracks `3D GLOBE → TRANSITION → 2D MAP`); scroll in past the transition for the flat view, or press **Globe view** to fly back. **Fly to AOI** fits the drawn box, **Reset orbit** returns to the default global attitude, and **Auto-rotate** turns the globe at a real rate — 6°/s, or 3°/s on a weak machine, the same speed whatever the frame rate and never teleporting when a frame runs long (opt-in, and any gesture stops it). Detections for the selected day (±1/3/7/14 d span) — **MODIS coral, VIIRS amber, live points pale gold** — plus soft-sand DBSCAN cluster polygons, on one of three basemaps: **Satellite** imagery, the colour **Terrain** map, or **Vector** tiles (CARTO Dark Matter) whose coastlines and place names stay crisp however far you zoom, since vector geometry is redrawn rather than upscaled. All three toggles sit with the other view controls, in the bottom-left row under the readout, and a slow connection opens on **Vector** because it is the lightest of the three. The bottom-left column is readout first (`day · hotspots · clusters · MW`), controls beneath it, and its height tracks the measured attribution notice, so no control ever covers it. Dragging, rotating and zooming stay light on every basemap: the canvas render ratio is capped, MSAA and tile fade are off, and expired tiles are not re-fetched mid-gesture. Live-feed points/polygons overlay when pulled. Use **Select area** and click two corners to draw a bounding box; every panel then filters to it. |
 | **Anomalies & critical periods** | A click-through list of anomalous days (z-score vs the same ±7-day window in other years) and the months running above mean + 1σ flagged as *critical*. |
 | **Incident Commander briefing** | Threat level (Low/Watch/Elevated/Critical) with its score, record mean and last-30-days readout, then the full report split across **four sub-tabs** — Situation, Critical streaks, Fuel types, Actions — each with a count badge so you can see what is inside before opening it. Streak rows jump the map to that window; **Copy MD** exports the whole briefing. The right-rail card keeps the compact headline version. |
-| **Last year + 30-day forecast** | Line chart of the trailing 365 days with the forecast appended, now with an Observed/Forecast legend and the fitted method named. |
-| **Seasonal climatology** | Day-of-year percentile envelope (10/50/90/95) with **Peak day** and **Fire season** (onset → cessation) called out above the chart. |
-| **Sensor Transition Illusion** | Per-sensor raw detections vs the harmonized line; observed vs adjusted post-2012 growth, artifact removed, calibration stats. On the default 2002–2024 demo this reads +304.0 % raw → +11.7 % harmonized, 292.3 pp of artifact; a region preset draws its own record (Southeastern Australia measured +339.2 % → +23.6 %, 315.6 pp, era factor 3.553, 10,046 matchups, R² 0.848). |
+| **Last year + 30-day forecast** | Full-width line chart of the trailing 365 days with the forecast appended, its method named (`Seasonal climatology + archive prior` once the model has been trained — see below), an Observed/Forecast legend — and zoom: drag across the plot to select a window, or take the last 90/180/365 days from the **Window** selector and **Reset zoom**. |
+| **Seasonal climatology** | Full-width day-of-year percentile envelope (10/50/90/95) with **Peak day**, **Fire season** (onset → cessation), the record span and the median day as cards beneath it. |
+| **Sensor Transition Illusion** | Full-width per-sensor raw detections vs the harmonized line; observed vs adjusted post-2012 growth, artifact removed, calibration stats. On the default 2002–2024 demo this reads +304.0 % raw → +11.7 % harmonized, 292.3 pp of artifact; a region preset draws its own record (Southeastern Australia measured +339.2 % → +23.6 %, 315.6 pp, era factor 3.553, 10,046 matchups, R² 0.848). |
 | **Live FIRMS 24h feed** | Region selector; pulls MODIS + 3 VIIRS NRT feeds, harmonizes, clusters, and overlays them on the map. |
 
 ## Method
@@ -263,20 +293,28 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
     │   ├── main.py                 ← FastAPI app: endpoints, harmonization, analytics
     │   ├── regions.py              ← curated AOI presets: bbox, biome, peak season, notable fires
     │   ├── demo.py                 ← synthetic FIRMS generator (2020–24 + 2002–24 transition)
-    │   ├── test_smoke.py           ← 33-test API smoke suite (encodings, gzip, cache, presets, archive, /api prefix)
+    │   ├── train.py                ← trains the model from the FIRMS archive (writes model/)
+    │   ├── forecast_model.py       ← the trained prior: 2° cell × day-of-year, checkpoint IO
+    │   ├── model/                  ← trained checkpoint (gitignored; rebuilt by train.py)
+    │   ├── test_smoke.py           ← 37-test API smoke suite (encodings, gzip, cache, presets, archive, training, /api prefix)
     │   ├── test_security.py        ← 22-test hardening suite (URL allowlist, upload caps, CORS)
     │   ├── requirements.txt        ← runtime deps (with security floors)
     │   └── requirements-dev.txt    ← + pytest, httpx (for tests)
     └── frontend/
-        ├── package.json            ← `prebuild` runs the lazy-export guard below
+        ├── package.json            ← `prebuild` runs the four guards below
         ├── vite.config.js          ← dev proxy /api → :8000
         ├── scripts/
-        │   └── check-lazy-exports.mjs ← fails the build if a React.lazy import cannot resolve
+        │   ├── check-lazy-exports.mjs ← fails the build if a React.lazy import cannot resolve
+        │   ├── check-quality-policy.mjs ← replays frame times through the adaptive-detail policy
+        │   ├── check-chart-fill.mjs   ← asserts the chart layout arithmetic (fill, axes, hover)
+        │   └── check-spin-policy.mjs  ← asserts the globe drift's rate and frame-step policy
         └── src/
             ├── App.jsx             ← layout: heatmap, map, drawer tabs (lazy-loads the rest)
             ├── MissionMap.jsx      ← MapLibre stage: 3D globe ⇄ flat map, clusters, picking
             ├── charts.jsx          ← chart tabs (lazy: fetched only when a tab opens)
-            ├── plot.jsx            ← hand-rolled SVG chart kit (axes, bands, bars, hover)
+            ├── plot.jsx            ← hand-rolled SVG chart kit (axes, bands, bars, hover card)
+            ├── chartGeometry.js    ← the kit's pure layout maths (guarded at build time)
+            ├── autoRotate.js       ← the globe drift's rate and frame-step policy
             ├── ForecastChart.jsx   ← forecast line chart (lazy)
             ├── panels.jsx          ← chart-free pillars: hero stats, live feed, briefing
             ├── lib.js              ← API client (memoized), heat ramp, formatters
@@ -288,9 +326,9 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
 
 | Layer | Choices |
 |---|---|
-| Backend | FastAPI, pandas, NumPy, scikit-learn (DBSCAN, K-means), SciPy (convex hull), requests (live FIRMS), optional PyTorch (LSTM) |
+| Backend | FastAPI, pandas, NumPy, scikit-learn (DBSCAN, K-means), SciPy (convex hull), requests (live FIRMS), optional PyTorch (LSTM warm-started from the trained checkpoint) |
 | Frontend | React 18, Vite 5, MapLibre GL 6 (one camera morphing a 3D globe into a flat map), hand-rolled SVG charts |
-| Tooling | `check-lazy-exports.mjs` (zero-dep build guard, wired as `prebuild`) |
+| Tooling | Four zero-dep `prebuild` guards: `check-lazy-exports.mjs`, `check-quality-policy.mjs`, `check-chart-fill.mjs`, `check-spin-policy.mjs` |
 | Data | NASA FIRMS archive CSVs (MODIS C6.1, VIIRS SNPP/NOAA-20) |
 | CI | GitHub Actions — pytest on Python 3.12, `npm ci` + build on Node 20 |
 
@@ -343,10 +381,21 @@ starts that download early, so the click lands on an already-warm module.
 **Charts are hand-rolled SVG, not a charting library.** A chart tab used to pull a 404 KB
 (108.7 KB gzipped) vendor chunk plus ~10 transitive packages (d3, victory-vendor,
 react-smooth, …) to draw three charts. `src/plot.jsx` does axes, an envelope band, grouped
-bars, line series, a legend and a hover readout in ~130 lines — the same approach as the
-calendar heatmap that was already hand-rolled — so a chart tab now costs **9.1 KB raw /
-4.2 KB gzipped** and the app has one fewer dependency family (and `recharts`, `cobe`,
+bars, line series, a legend and a hover readout in ~220 lines — the same approach as the
+calendar heatmap that was already hand-rolled — so a chart tab costs about **11 KB raw /
+5 KB gzipped** and the app has one fewer dependency family (and `recharts`, `cobe`,
 `leaflet` and `react-leaflet` are gone from `package.json`).
+
+**The charts fill the tab and answer the pointer.** Each chart lays itself out in its
+container's own pixels — measured with a `ResizeObserver` and written back into the SVG
+`viewBox`, so one unit is one CSS pixel — which is what lets a wide window get a wide plot
+with 9px labels that stay 9px rather than a fixed box scaled down. Hovering draws a
+crosshair and a readout card listing every series' value (exact counts where the axis is in
+thousands), `←`/`→` walk it from the keyboard, and the forecast chart zooms by dragging
+across the plot. All of that arithmetic lives in `chartGeometry.js` as pure functions, so
+`check-chart-fill.mjs` can assert the parts you would otherwise only notice by looking: the
+plot fills its container, an axis can never clip a percentile band, labels never crowd each
+other, the readout card stays inside the frame, and a gap in a series breaks the line.
 
 **Interactions are memoized twice.** The API gzips its JSON (≈4–9× smaller on the
 calendar, points and climatology payloads) and each analytics endpoint is memoized
@@ -381,19 +430,20 @@ scripts/check.sh          # POSIX — or scripts\check.bat on Windows
 Both are thin wrappers around the commands below, which is also what CI runs:
 
 ```bash
-# 55 tests, ~2 min — starts the app in-process via TestClient
+# 59 tests, ~1 min — starts the app in-process via TestClient
 cd firecal/backend
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest -q
 
-# Frontend production build (prebuild runs the lazy-export guard and the policy check)
+# Frontend production build (prebuild runs all four guards: lazy, detail, chart, drift)
 cd firecal/frontend && npm run build
-npm run check:lazy                 # …or run the guard on its own
+npm run check:lazy                 # …or run one guard on its own
+npm run check:charts
 ```
 
 `.github/workflows/ci.yml` runs both on every push to `main` and on pull requests.
 
-**`test_smoke.py` (31)** covers every endpoint end-to-end — demo load, calendar with and
+**`test_smoke.py` (37)** covers every endpoint end-to-end — demo load, calendar with and
 without bbox, points clamping, clusters, climatology envelope, illusion diagnostic on both
 demos, briefing JSON + Markdown, live feed (skipped offline when FIRMS is unreachable),
 anomalies, forecast — plus error paths (bad bbox → 400, missing-column CSV → 400, valid CSV
@@ -411,6 +461,23 @@ host-injection `region` values are rejected *without* an outbound fetch, the con
 guard returns 429, the request and per-file upload caps and the file-count cap each fire,
 a filename cannot summon the demo dataset, reflected filenames come back sanitised, and
 CORS grants the local origin but not a hostile one.
+
+**`check-chart-fill.mjs`** drives `chartGeometry.js` — the chart kit's pure layout maths —
+from Node, with no browser and no rendering: a 1,400px tab plots its full width less the
+axis gutters, the first and last rows land on the frame, an axis top is always a readable
+step that covers both edges of every band, x labels never crowd the one after them, bar
+columns stay inside the frame, hover snaps to the nearest row and its card is flipped
+rather than clipped at the right edge, and a series with a gap is split into runs instead of
+being drawn through zero. It also fails the build if the chart ever returns to a scaled,
+letterboxing viewBox, or if the card's CSS width and the clamp in code drift apart.
+
+**`check-spin-policy.mjs`** simulates frame cadences through `autoRotate.js`, the globe drift's
+policy: a second of drift is the same number of degrees at 100 fps, 50, 20 and 10 fps (the old
+fixed 0.12° per timer tick was 0.86°/s on a weak machine — a full turn every seven minutes — and
+its speed was whatever the timer happened to be), a five-second frame advances one clamped
+250 ms slice instead of 30°, and the globe never turns backwards across the ±180 seam. It also
+pins the wiring: animation frames rather than a timer, and `map.isMoving()` rather than an API
+the public `Map` does not have.
 
 **`check-lazy-exports.mjs`** resolves every `React.lazy(() => import(...))` in `src/` and
 fails the build when the target has no default export (or a mapped named export does not
@@ -484,6 +551,9 @@ Known gaps, accepted for a prototype and worth closing before real deployment:
 - **Anomalies say “Need >1 year of data”** — upload at least ~400 days of CSVs (demo data qualifies).
 - **Forecast says “install torch for LSTM”** — expected without PyTorch; numbers still
   show, via the climatology fallback: `pip install torch`.
+- **Forecast says just “Seasonal climatology”** — there is no trained checkpoint yet. Run
+  `python firecal/backend/train.py` over a FIRMS archive to add the `archive prior`; the
+  endpoint needs no restart to pick it up on its next computation.
 - **CORS errors after deploying** — set `ALLOW_ORIGINS` on the backend to your frontend's origin.
 - **“Real-window pull failed: FIRMS_MAP_KEY is not set”** — expected: the area API needs a
   free key. Copy `.env.example` to `.env` and paste it in, or export `FIRMS_MAP_KEY`, or keep

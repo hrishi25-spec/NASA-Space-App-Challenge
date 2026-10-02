@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The one command that must pass before a review — the same checks CI runs:
-# the backend test suite, then the frontend production build (which runs the
-# lazy-export guard first).  Dependency setup is the launcher's job: run.py.
+# the backend test suite, then the frontend production build (whose prebuild step
+# runs the lazy-export, adaptive-detail and chart-layout guards).  Dependency setup
+# is the launcher's job: run.py.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

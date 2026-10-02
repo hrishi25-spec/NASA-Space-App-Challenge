@@ -288,23 +288,52 @@ select{
 .maplibregl-ctrl-attrib a{color:#a7b6b9!important}
 
 /* ---------- SVG charts (plot.jsx) ---------- */
-.plot svg{display:block}
+/* The plot is laid out in the container's own pixels — plot.jsx measures it and sets the viewBox
+   to match — so a chart spans the whole tab instead of sitting letterboxed inside a fixed
+   720-unit viewBox with a 220px sidebar beside it. */
+.plot{position:relative;width:100%;min-width:0}
+.plot svg{display:block;width:100%}
+.plot svg:focus-visible{outline:1px solid #7fd1c866;outline-offset:3px;border-radius:10px}
+.plotAxisTitle{fill:var(--mut);font-size:9px;letter-spacing:1.5px;text-transform:uppercase}
+
+/* The hover card sits beside the crosshair. It is never a mouse target, so it cannot swallow
+   the mousemove that placed it, and its width matches TIP_W in chartGeometry.js — the prebuild
+   guard fails the build if the two drift apart. */
+.plotTip{
+  position:absolute;top:14px;z-index:2;width:210px;pointer-events:none;
+  background:linear-gradient(145deg,#1f282df7,#161d21f7);border-radius:12px;padding:8px 10px;
+  box-shadow:7px 7px 16px #05080ad9,-4px -4px 12px #ffffff10,inset 0 1px 0 #ffffff12;
+  font-size:11px;color:var(--mut);
+}
+.plotTipHead{
+  color:var(--fg);font-weight:600;letter-spacing:.8px;text-transform:uppercase;
+  padding-bottom:5px;margin-bottom:4px;border-bottom:1px solid #ffffff10;
+}
+.plotTipRow{display:flex;align-items:center;gap:7px;padding:1px 0}
+.plotTipRow i{width:9px;height:9px;border-radius:3px;flex:none}
+.plotTipRow b{margin-left:auto;color:var(--fg);white-space:nowrap}
+
+/* The key sits under the plot, where a wide chart has room for it: caption left, series right. */
 .plotLegend{
-  display:flex;gap:12px;flex-wrap:wrap;align-items:center;font-size:10.5px;
-  color:var(--mut);margin-bottom:2px;min-height:18px;
+  display:flex;gap:8px 16px;flex-wrap:wrap;align-items:center;justify-content:center;
+  font-size:10.5px;color:var(--mut);margin-top:8px;
 }
-.plotKey{display:inline-flex;align-items:center;gap:6px;text-transform:uppercase;letter-spacing:.8px}
+.plotDesc{margin-right:auto;max-width:min(100%,620px);letter-spacing:.3px}
+.plotKeys{display:flex;gap:14px;flex-wrap:wrap;align-items:center;justify-content:flex-end}
+.plotKey{display:inline-flex;align-items:center;gap:6px;text-transform:uppercase;letter-spacing:.8px;white-space:nowrap}
 .plotKey i{width:14px;height:3px;border-radius:2px;box-sizing:border-box}
-/* The hover readout takes the legend's right-hand end so it never covers the plot. */
-.plotReadout{
-  margin-left:auto;display:flex;gap:10px;align-items:center;color:var(--fg);
-  background:var(--surface);border-radius:var(--r-pill);padding:2px 10px;box-shadow:var(--inset-sm);
-}
-.plotReadout b{color:var(--acc2)}
-/* Chart beside its key facts when there is room, stacked when there is not. */
-.chartCol{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap}
-.chartBody{flex:1 1 420px;min-width:260px}
-.chartSide{flex:0 1 220px;min-width:190px;display:flex;flex-direction:column;gap:6px}
+.plotHint{margin-left:auto;opacity:.8}
+
+/* Chart on top of its facts. The plot takes the full width and the cards fill the row beneath,
+   the way the map keeps its readout under the canvas instead of beside it. */
+.chartStack{display:flex;flex-direction:column;gap:12px;min-width:0}
+.chartStats{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(168px,1fr))}
+.chartStats .stat{padding:10px 12px}
+.chartStats .stat .v{font-size:16px;margin:2px 0}
+.stat .v.bad{color:var(--bad);text-shadow:none}
+.chartControls{display:flex;gap:10px 16px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.chartControls.end{justify-content:flex-end;margin:10px 0 0}
+.chartControls .kv{width:auto}
 
 /* Respect users who ask for less motion (and save the work on weak devices). */
 @media (prefers-reduced-motion:reduce){

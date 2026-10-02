@@ -109,7 +109,7 @@ Status key: **✅ implemented** · **⚠️ partial** · **❌ not started**. "V
 | FR-3.7 | Overlay live-feed points and clusters | ✅ | Pale-gold points, live polygons |
 | FR-3.8 | Chronological readout never covers required attribution | ✅ | Readout and view controls are one bottom-left column whose height clears the notice by measurement, not by assumption: 0 px overlap at 1440, 1200, 900, 820, 700, 640, 560 and 500 px viewports, with the notice collapsed, expanded, and wrapped to four lines |
 | FR-3.9 | Map engine must load under Vite (worker + dep pre-bundling) | ✅ | Worker URL handed to MapLibre explicitly, otherwise every source stays unparsed |
-| FR-3.10 | Camera controls beyond zooming out | ✅ | **Fly to AOI** fits the drawn box (disabled without one), **Reset orbit** restores the default global attitude (centre 0,0, bearing 0, pitch 0), **Auto-rotate** drifts the bearing at 0.22°/70 ms (0.12°/140 ms on a low-end probe). Verified live: bearing −15.72°→−17.40° while on, frozen at −38.40° and `aria-pressed=false` after a `pointerdown` on the canvas |
+| FR-3.10 | Camera controls beyond zooming out | ✅ | **Fly to AOI** fits the drawn box (disabled without one), **Reset orbit** restores the default global attitude (centre 0,0, bearing 0, pitch 0), **Auto-rotate** drifts the bearing at a rate of **6°/s** (3°/s on a low-end probe) accumulated from frame times, so the same second of drift is the same number of degrees at 60 fps or at 10 fps, and a frame that took longer than 250 ms advances one clamped slice instead of teleporting the globe. It holds whenever another move owns the camera (a gesture, or Fly to AOI / Globe view / Reset orbit), and its own rotation never arms the adaptive-detail sampler. Verified live in a real browser: the bearing advanced monotonically in the clamped step this probe's rate predicts, **Reset orbit completed back to 0.000°** while the drift was on, the drift then resumed from there, toggling it off froze the bearing, and `data-quality` was never set |
 
 ### FR-4 — Multi-decadal climatology (pillar 1)
 
@@ -179,9 +179,10 @@ Status key: **✅ implemented** · **⚠️ partial** · **❌ not started**. "V
 |---|---|---|---|
 | FR-10.1 | 30-day forecast appended to the trailing year | ✅ | Demo fits on 365 observed days |
 | FR-10.2 | Label the series | ✅ | Observed / Forecast legend + the fitted method named |
-| FR-10.3 | LSTM model when PyTorch is present | ⚠️ | Sin/cos day-of-year features; without `torch` it falls back to scaled seasonal climatology and names the fallback in the UI |
+| FR-10.3 | LSTM model when PyTorch is present | ⚠️ | Sin/cos day-of-year features, warm-started from the trained checkpoint when there is one; without `torch` it falls back to scaled seasonal climatology and names the fallback in the UI |
 | FR-10.4 | Empty state instead of a blank chart | ✅ | Explicit hint when there is no calendar data or no forecast window |
 | FR-10.5 | Needs ≥ 120 days of data | ✅ | Otherwise the panel says what is missing |
+| FR-10.6 | Train on the FIRMS archive, not only the loaded frame | ✅ | `train.py` streams every CSV in the training directory (126M detections / 1,089 days / 10.3 GB in the reference run) into a per-2°-cell day-of-year shape plus the harmonized daily series, written to a gitignored `firecal/backend/model/`; `/forecast` blends the shape in log space and fades it out as the frame covers more years, and names the model. Absent, malformed or foreign checkpoints degrade to the pre-training behaviour instead of failing |
 
 ### FR-11 — Console shell & navigation
 
@@ -191,7 +192,8 @@ Status key: **✅ implemented** · **⚠️ partial** · **❌ not started**. "V
 | FR-11.2 | One-click demo loading | ✅ | Demo cached server-side, so repeat loads are ~26 ms |
 | FR-11.3 | Area selection and clearing | ✅ | |
 | FR-11.4 | Live status indicators | ✅ | Link pulse, hotspot count, record window, per-sensor totals |
-| FR-11.5 | Prefetch chart chunks on hover/focus | ✅ | The chart bundle (≈4 KB gzipped, hand-rolled SVG) is warm before the click |
+| FR-11.5 | Prefetch chart chunks on hover/focus | ✅ | The chart bundle (≈5 KB gzipped, hand-rolled SVG) is warm before the click |
+| FR-11.6 | Charts use the whole drawer tab and answer the pointer | ✅ | Laid out in the container's measured pixels (one viewBox unit = one CSS pixel) rather than a fixed viewBox scaled to fit, chart on top of a reflowing stat row; hover draws a crosshair and a readout card with every series' value, `←`/`→` walk it, and the forecast zooms by drag-select or the Window selector. Guarded by `check-chart-fill.mjs` (fill ratio, axis coverage, label spacing, bar inset, card clamping, line gaps) |
 
 ### FR-12 — Design system
 
@@ -299,7 +301,7 @@ Partial. Honoured: `prefers-reduced-motion`, `aria-label` on the map and basemap
 
 ### NFR-4 — Reliability & correctness
 
-55 automated tests (33 smoke + 22 security) run in CI on every push and PR, plus the frontend production build, whose prebuild step runs the lazy-export guard and the adaptive-detail policy check. Derived values are asserted against invariants (percentile ordering, cluster hull sizes, threat ladder membership, growth relationships) rather than hard-coded snapshots where possible.
+59 automated tests (37 smoke + 22 security) run in CI on every push and PR, plus the frontend production build, whose prebuild step runs the lazy-export guard and the adaptive-detail, chart-layout and orbital-drift policy checks. The tests need no archive: the training path is exercised on a few dozen synthetic rows pushed through the same scan/save/load code `train.py` runs. Derived values are asserted against invariants (percentile ordering, cluster hull sizes, threat ladder membership, growth relationships) rather than hard-coded snapshots where possible.
 
 ### NFR-5 — Portability
 
@@ -313,6 +315,8 @@ Windows, macOS and Linux from one launcher; CSV encodings from all three as they
                     │  MissionMap.jsx .. MapLibre GL 6 — one camera, globe ⇄ mercator morph       │
                     │  charts.jsx ...... SVG panels (lazy: climatology, illusion diagnostic)      │
                     │  plot.jsx ........ hand-rolled SVG chart kit (line / band / bar, no dep)   │
+                    │  chartGeometry.js  its pure layout maths (fill, axes, hover, zoom brush)   │
+                    │  autoRotate.js ... the globe drift's rate and frame-step policy           │
                     │  ForecastChart.jsx (lazy) · panels.jsx (rail cards) · lib.js (API client)   │
                     │  styles.css ...... "ember dusk" tokens + letter-case contract               │
                     └───────────────┬─────────────────────────────────────────────────────────────┘
@@ -324,11 +328,13 @@ Windows, macOS and Linux from one launcher; CSV encodings from all three as they
                     │  climatology ................. DOY percentile envelope + onset/cessation    │
                     │  diagnostic .................. raw vs harmonized + calibration              │
                     │  anomalies / forecast ........ z-score days, 30-day forecast                │
+                    │  forecast_model ............. reads model/: 2° cell x DOY prior, bbox lookup  │
                     │  briefing .................... threat, streaks, biomes, recommendations     │
                     │  live ........................ 4 NASA FIRMS NRT feeds → harmonize → cluster │
-                    │  cores: harmonize() · daily() · _zstats() · _streaks() · _threat() ·        │
-                    │         _biomes() · _cluster_payload() · _esfp() · cached()                 │
+                    │  cores: harmonize() · harmonized_daily() · _zstats() · _streaks() ·         │
+                    │         _threat() · _biomes() · _cluster_payload() · _esfp() · cached()     │
                     └──────────────────────────────┬──────────────────────────────────────────────┘
+                                                   │  off-line: train.py → model/ (gitignored)
                                                    │
                     pandas/NumPy/SciPy/scikit-learn  ·  64 MB-capped outbound HTTP  ·  process-global DF + memo cache
 ```
@@ -359,7 +365,7 @@ Canonical detection record after harmonization: `lat, lon, time (UTC), sensor, c
 | `GET /climatology` | `bbox`, `window`, `step` | per-year DOY series, percentile envelope, summary (peak/onset/cessation) |
 | `GET /diagnostic` | `bbox` | per-year per-sensor series, growth %, artifact pp, scaling factor, calibration |
 | `GET /anomalies` | `bbox`, `z` | `{anomalies[], critical[], monthly[]}` (needs >400 days) |
-| `GET /forecast` | `bbox`, `horizon`, `epochs` | `{model, forecast[]}` (needs ≥120 days) |
+| `GET /forecast` | `bbox`, `horizon`, `epochs` | `{model, forecast[], prior?}` (needs ≥120 days) |
 | `GET /briefing` | `bbox`, `z`, `min_days`, `format=json\|markdown` | threat, streaks, biomes, recent/record, recommendations |
 | `GET /live` | `region`, `bbox`, `crop`, `eps`, `min_pts`, `hours` | feeds, sensors, HFII, capped rows, top 150 clusters |
 
@@ -382,6 +388,7 @@ Canonical detection record after harmonization: `lat, lon, time (UTC), sensor, c
 | Clustering | DBSCAN eps 550 m, minPts 3, 12 h window |
 | Biomes | K-means k=4, n_init=10, seed 0, on projected position + FRP |
 | Data thresholds | climatology/briefing ≥60 days · anomalies >400 days · forecast ≥120 days |
+| Trained prior | 2° × 2° cells (90×180), day-of-year shape stored mean-normalized so only seasonality transfers; a cell needs ≥25 days with detections; blend `alpha = min(1, frame years / 3)` in log1p space, then the usual rescale to the frame's recent 30-day level |
 | Region presets | 5 AOIs; `firms_region` must be a `LIVE_REGIONS` member; per-region demo seed = base + `crc32(key) % 997` (default keeps 7 / 11, so the documented demo numbers stay valid) |
 | Area API | 1–5 days per pull; area passed as `west,south,east,north` (the API's order, not the internal `bbox` order); sources `MODIS_C6_1`, `VIIRS_SNPP_C2`, `VIIRS_NOAA20_C2`, `VIIRS_NOAA21_C2` |
 | Camera flights | preset fly-to uses the preset `zoom` (4.6–6.6); `Fly to AOI` uses `fitBounds` with 56 px padding; all durations are 0 ms on the low-end probe |
@@ -405,13 +412,15 @@ Nothing in this document is aspirational scaffolding: each pillar was exercised 
 | Briefing | All four sub-tabs exercised; thin-AOI payload reproduced from the API and confirmed to render the note instead of crashing |
 | Live feed | Region allowlist, 429 guard and outbound cap covered by tests; real feeds are network-dependent and skipped offline |
 | Performance | Cold-load and warm-endpoint timings measured before/after (NFR-1); `/clusters` cold 32,893 → 2,841 ms after ranking clusters before hulling |
-| Charts | Hand-rolled SVG kit rendered live on all three panels (band envelope, grouped bars, forecast lines); payload 411 → 9.1 KB raw (110.6 → 4.2 KB gzipped) after removing four charting dependencies |
+| Charts | Hand-rolled SVG kit rendered live on all three panels (band envelope, grouped bars, forecast lines); payload 411 → ~11 KB raw (~5 KB gzipped) after removing four charting dependencies. Layout verified in a headless browser against the real components: each of the three charts filled its container exactly (868/868 px, viewBox units = CSS px), hover placed the readout card inside the frame with a crosshair and one marker per series, `←` walked the readout, a drag reported the zoom range, the bar chart's outer columns stayed inside the frame, and a series with a gap drew as two paths instead of one through zero |
+| Orbital drift | Rate and behaviour driven from Node: 6°/s (3°/s on a low-end probe) whatever the frame cadence — 100 fps, 50, 20 and 10 fps all travel the same degrees in the same second — a 5 s frame advances one clamped 250 ms slice (1.5°) rather than 30°, and the globe never turns backwards across the ±180 seam at any starting bearing (23 assertions, run by `prebuild`). Live: bearing 0 → 0.75° → 1.915° → 2.715° with each step the clamped slice for this probe's 3°/s |
 | Adaptive detail | Policy replayed against simulated frame times from Node: a 60 fps drag is never touched, a 20 fps drag degrades exactly once after ≥400 ms and ≥12 frames, a three-frame stutter and a 1.2 s stall leave it alone, and detail returns only when the gesture ends (22 assertions, run by `prebuild`) |
 | Basemaps | Both style documents — `rasterStyle('sat' | 'terrain')` and `mergeOverlays(fetched)` — validated with MapLibre's own style spec from Node: 0 errors, 99 layers after the merge, no duplicate ids, mission layers drawn last, world morph intact |
 | Layout integrity | Overlap between the map readout, the legend chip, the view-control row, the zoom/compass group and the Esri attribution measured at 1440, 1200, 900, 820, 700, 640, 560 and 500 px: 0 px. The readout/control column is lifted by the notice's measured height, so the 0 holds while the notice is collapsed, expanded, or wrapped to three and four lines (a real 2-line wrap happens at ≤ 1200 px, and the stylesheet's static fallback band alone would have overlapped there by 1,315 px²) |
 | Security | Before/after reproductions against the running server (NFR-2), plus 22 regression tests |
 | Key handling & cross-site writes | `/archive` with a live `FIRMS_MAP_KEY` and a refused transport: the 502 body never contains the key. Foreign-origin writes refused 403 while same-host, allowlisted-origin and no-Origin writes pass — both covered in `test_security.py`, and the foreign-origin 403 re-checked against the running server |
-| Full suite | `pytest` 49 passed · `npm run build` (incl. lazy-export guard) passed · browser console clean across all tabs |
+| Model training | Full archive run in this environment: 15 CSVs / 10.30 GB / 126,178,412 rows read in 876 s, 112,174,057 detections kept over 1,089 days (2023-09-30 → 2026-09-22), 3,390 cells stored in 1.8 MB. The learned shape is checked against the known seasons rather than a fixture: Thailand peaks 29 Mar (the app's own climatology puts the peak at 19 Mar), the Amazon 13 Sep, California 10 Jul, and the global mean July-to-December ratio is 1.49 : 0.55. `harmonize(geometry=False)` is asserted frame-identical to `harmonize()` and to the same `daily()` series; a truncated, foreign-schema or missing checkpoint is asserted to fall back to the pre-training answer |
+| Full suite | `pytest` 59 passed · `npm run build` (incl. the lazy-export, adaptive-detail, chart-layout and orbital-drift guards) passed · browser console clean across all tabs |
 
 ## 12. Status summary
 
@@ -423,7 +432,7 @@ Nothing in this document is aspirational scaffolding: each pillar was exercised 
 | Pillar 3b — Live FIRMS ingestion | ✅ Complete |
 | Pillar 4 — IC briefing (now tabbed) | ✅ Complete |
 | Anomalies | ⚠️ List + critical months complete; monthly chart missing |
-| Forecast | ⚠️ Seasonal fallback complete; LSTM path needs optional `torch` |
+| Forecast | ⚠️ Seasonal fallback complete and now archive-trained; the LSTM path itself still needs optional `torch` |
 | Console UX / design system | ✅ Complete, single documented contract |
 | Performance budget | ✅ Met on every measured axis |
 | Security posture | ✅ Hardened, tested; auth/rate limiting intentionally out of scope |

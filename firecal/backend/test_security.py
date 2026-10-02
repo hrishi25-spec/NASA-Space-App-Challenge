@@ -84,6 +84,7 @@ def test_live_accepts_allowlisted_region(monkeypatch):
 
 def test_live_refuses_to_stack_concurrent_ingests():
     """Each call is four downloads plus clustering; overlapping calls must not pile up."""
+    main._LIVE_CACHE.clear()          # a recent answer would be served without fetching at all
     assert main._LIVE_SLOTS.acquire(blocking=False)
     assert main._LIVE_SLOTS.acquire(blocking=False)
     try:
@@ -93,7 +94,165 @@ def test_live_refuses_to_stack_concurrent_ingests():
     finally:
         main._LIVE_SLOTS.release()
         main._LIVE_SLOTS.release()
+        main._LIVE_CACHE.clear()
 
+
+def _fake_feed(url, timeout=90):
+    return pd.DataFrame({
+        "latitude": [5.0], "longitude": [6.0], "acq_date": ["2022-03-03"],
+        "acq_time": [1015], "confidence": [70], "frp": [9.5],
+        "brightness": [320], "satellite": ["NOAA-20"],
+    })
+
+
+def test_live_repeats_are_served_from_a_short_cache(monkeypatch):
+    """One ingest is four outbound downloads, and the feeds change once a day.
+
+    Uncached, an unauthenticated caller could drive four NASA downloads per request by
+    looping one URL -- free bandwidth amplification against a third party as well as this
+    process. The second call must not leave the machine at all."""
+    calls = []
+
+    def counting_feed(url, timeout=90):
+        calls.append(url)
+        return _fake_feed(url)
+
+    monkeypatch.setattr(main, "_fetch_feed", counting_feed)
+    main._LIVE_CACHE.clear()
+    first = client.get("/live", params={"region": "Europe"})
+    second = client.get("/live", params={"region": "Europe"})
+    assert first.status_code == second.status_code == 200
+    assert second.json() == first.json()
+    assert len(calls) == len(main.LIVE_FEEDS)      # four feeds, fetched once
+
+    # ...and it does expire, so the panel is never permanently stale
+    monkeypatch.setattr(main, "_LIVE_TTL", 0.0)
+    assert client.get("/live", params={"region": "Europe"}).status_code == 200
+    assert len(calls) == 2 * len(main.LIVE_FEEDS)
+    main._LIVE_CACHE.clear()
+
+
+def test_archive_pulls_do_not_stack(monkeypatch):
+    """`/archive` spends the operator's FIRMS_MAP_KEY on an outbound request."""
+    monkeypatch.setenv("FIRMS_MAP_KEY", "ABCDEF123456")
+    monkeypatch.setattr(main, "_fetch_feed", _fake_feed)
+    assert main._ARCHIVE_SLOTS.acquire(blocking=False)
+    assert all(main._ARCHIVE_SLOTS.acquire(blocking=False) for _ in range(3))
+    try:
+        r = client.post("/archive", params={"region": "california", "days": 1})
+        assert r.status_code == 429
+        assert "already running" in r.json()["detail"]
+    finally:
+        for _ in range(4):
+            main._ARCHIVE_SLOTS.release()
+
+
+def test_upload_cannot_accumulate_rows_before_the_cap(monkeypatch):
+    """MAX_UPLOAD_BYTES bounds the bytes on the wire, not the frames they become.
+
+    A FIRMS row expands into ~14 typed columns, so a request sitting exactly at the byte
+    limit used to hold several hundred MB of frames -- and the row cap only ran *after*
+    `pd.concat` had copied all of them.
+    """
+    monkeypatch.setattr(main, "MAX_ROWS", 10)
+    r = client.post("/upload", files=[_csv("many.csv", "5.0,6.0,2022-03-03,1015,70,9.5,320,NOAA-20\n" * 12)])
+    assert r.status_code == 413
+    assert "too many rows" in r.json()["detail"]
+
+
+# --------------------------------------------------- derived-cache memory ceiling
+def test_derived_cache_is_bounded_by_bytes_not_just_entries(monkeypatch):
+    """The cache is reachable by any caller, so its ceiling has to be real.
+
+    Keyed by endpoint arguments, `/points?limit=20000` answers 1.2 MB, and 60 distinct
+    bboxes measured +342 MB of resident memory that never came back -- the old cap counted
+    entries and nothing else.
+    """
+    main._invalidate()
+    client.get("/points", params={"limit": 2000, "bbox": "10.0,98.0,19.5,100.5"})
+    body, packed = next(iter(main._AGG_CACHE.values()))
+    budget = (len(body) + len(packed)) * 3 + 1               # room for three entries
+    monkeypatch.setattr(main, "_CACHE_BYTES", budget)
+    monkeypatch.setattr(main, "_CACHE_MAX", 100_000)      # make the byte budget the only limit
+    main._invalidate()
+    try:
+        for i in range(8):
+            r = client.get("/points", params={"limit": 2000, "bbox": f"1{i}.0,98.0,19.5,100.5"})
+            assert r.status_code == 200
+        assert main._CACHE_HELD <= budget
+        assert 0 < len(main._AGG_CACHE) <= 3               # it still caches, it just evicts
+    finally:
+        main._invalidate()
+
+
+def test_a_single_huge_payload_is_not_retained(monkeypatch):
+    monkeypatch.setattr(main, "_CACHE_ENTRY_BYTES", 512)
+    main._invalidate()
+    assert client.get("/clusters").status_code == 200
+    assert len(main._AGG_CACHE) == 0
+    main._invalidate()
+
+
+def test_cache_hits_are_byte_identical_to_misses():
+    """The cache stores a serialized body, so a hit must not change what the client sees."""
+    main._invalidate()
+    first = client.get("/climatology")
+    second = client.get("/climatology")
+    assert first.content == second.content
+    assert first.headers["content-type"] == second.headers["content-type"] == "application/json"
+    assert first.json() == second.json()
+
+
+def test_a_cache_hit_is_served_pre_compressed():
+    """Re-compressing the same bytes per request was 505 ms of a 515 ms response.
+
+    The compressed form is cached with the plain one and declared through `Content-Encoding`,
+    which is the header the gzip middleware already treats as "someone else did this".
+    """
+    main._invalidate()
+    gz = client.get("/climatology", headers={"Accept-Encoding": "gzip"})
+    assert gz.status_code == 200
+    assert gz.headers["content-encoding"] == "gzip"
+    assert "accept-encoding" in gz.headers["vary"].lower()
+    gz.json()                                   # still valid JSON after decoding
+
+    # A caller that cannot take gzip must get the plain body, not a gzip stream
+    plain = client.get("/climatology", headers={"Accept-Encoding": "identity"})
+    assert "content-encoding" not in {k.lower() for k in plain.headers}
+    assert plain.json() == gz.json()
+
+
+def test_only_bodies_worth_compressing_are_packed(monkeypatch):
+    """Below the threshold the cache holds the body alone and the middleware still decides."""
+    main._invalidate()
+    monkeypatch.setattr(main, "_CACHE_GZIP_MIN", 1 << 30)      # nothing qualifies
+    assert client.get("/briefing").status_code == 200
+    body, packed = next(iter(main._AGG_CACHE.values()))
+    assert body and packed == b""
+
+    main._invalidate()
+    monkeypatch.setattr(main, "_CACHE_GZIP_MIN", 1)             # everything does
+    assert client.get("/briefing").status_code == 200
+    assert next(iter(main._AGG_CACHE.values()))[1][:2] == b"\x1f\x8b"   # gzip magic
+    main._invalidate()
+
+
+# ------------------------------------------------------------- response hardening
+def test_security_headers_are_on_every_response():
+    """Including the refusals: the middleware is outermost on purpose."""
+    ok = client.get("/meta")
+    refused = client.post("/demo", headers={"Origin": "https://evil.example"})
+    assert refused.status_code == 403
+    for r in (ok, refused):
+        assert r.headers["x-content-type-options"] == "nosniff"
+        assert r.headers["x-frame-options"] == "DENY"
+        assert r.headers["referrer-policy"] == "no-referrer"
+        assert r.headers["permissions-policy"].startswith("geolocation=()")
+        csp = r.headers["content-security-policy"]
+        assert "frame-ancestors 'none'" in csp and "object-src 'none'" in csp
+        assert "base-uri 'none'" in csp and "form-action 'none'" in csp
+        assert "unsafe-eval" not in csp            # nothing here needs eval
+        assert "*" not in csp.replace("https://*.basemaps.cartocdn.com", "")
 
 # ----------------------------------------------------------------- upload bounds
 def test_oversize_request_is_refused_before_it_is_read(monkeypatch):

@@ -10,8 +10,8 @@ Satellites have tracked active fires for 20+ years, but the record is fragmented
 
 | Thing | State |
 |---|---|
-| Tests | 55 passing — 33 API smoke + 22 security, run in-process via `TestClient` |
-| Frontend build | Clean, including the prebuild lazy-export guard |
+| Tests | 59 passing — 37 API smoke + 22 security, run in-process via `TestClient` |
+| Frontend build | Clean, including the prebuild lazy-export, adaptive-detail and chart-layout guards |
 | Startup weight | Import ≈ 2.2 s, baseline RSS ≈ 104 MB (measured on the dev machine after the lazy scipy/sklearn change) |
 | Layout | Arranged per the repo standard; see [decisions/0001](decisions/0001-repository-layout.md) |
 
@@ -37,11 +37,14 @@ Two structural decisions do most of the work:
 
 | Path | What lives there |
 |---|---|
-| `firecal/backend/main.py` | Every endpoint plus the cores: `harmonize`, `daily`, `_zstats`, `_streaks`, `_threat`, `_biomes`, `_cluster_payload`, `_esfp`, `cached` |
+| `firecal/backend/main.py` | Every endpoint plus the cores: `harmonize`, `harmonized_daily`, `_zstats`, `_streaks`, `_threat`, `_biomes`, `_cluster_payload`, `_esfp`, `cached` |
+| `firecal/backend/train.py` | Trains the model from the FIRMS archive in chunks and writes `model/` |
+| `firecal/backend/forecast_model.py` | The trained prior — 2° cell × day-of-year shape, bbox lookup, checkpoint IO |
+| `firecal/backend/model/` | The trained checkpoint. Gitignored, rebuilt by `train.py`, optional to the API |
 | `firecal/backend/demo.py` | Synthetic FIRMS generator (2020–24 standard + 2002–24 transition) |
 | `firecal/backend/regions.py` | Five curated AOI presets |
 | `firecal/backend/test_*.py` | Smoke and security suites, colocated with the app |
-| `firecal/frontend/src/` | Console: `App.jsx`, `MissionMap.jsx`, `panels.jsx`, `charts.jsx`, `plot.jsx`, `lib.js`, `styles.css` |
+| `firecal/frontend/src/` | Console: `App.jsx`, `MissionMap.jsx`, `panels.jsx`, `charts.jsx`, `plot.jsx`, `chartGeometry.js`, `lib.js`, `styles.css` |
 | `docs/` | This page, PRD, sensor review, challenge brief, ADRs |
 | `scripts/check.sh` / `.bat` | The same checks CI runs |
 | `Dockerfile` | Console build + API in one image, one port ([decisions/0002](decisions/0002-single-image-deployment.md)) |
@@ -81,7 +84,9 @@ FIRMS_MAP_KEY=… in .env            # enables POST /archive (real 1–5 day win
 - **scipy and scikit-learn import lazily** inside clustering/briefing. Do not move them back to module scope — it costs ~2.5 s of startup.
 - **Never import chart code in the shell.** `charts.jsx` and `ForecastChart.jsx` are lazy for a reason; a new lazy target must resolve to a default export or the build guard fails.
 - **Derived values must degrade honestly.** Thin selections answer `200` with a `note`; every panel is required to show that note instead of spinning.
-- **`torch` is optional.** Without it the forecast falls back to scaled seasonal climatology and names the fallback in the UI.
+- **`torch` is optional.** Without it the forecast falls back to scaled seasonal climatology — archive-trained when a checkpoint exists — and names the fallback in the UI.
+- **The training archive is never committed.** `Data Training/` is ~10 GB of local NASA exports and `firecal/backend/model/` is derived from it; both are gitignored, and a missing or malformed checkpoint is not an error.
+- **Training and serving must harmonize identically.** `train.py` reads the archive through the server's own `harmonize(geometry=False)` and `harmonized_daily()`. A second implementation of the sensor rescale would train the model on a different quantity than the endpoint predicts.
 - **CSS uppercases labels.** Write labels in sentence case and let the contract do the casing; acronyms are the only all-caps strings in source.
 
 ## Where to look next

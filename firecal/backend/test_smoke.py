@@ -2,6 +2,7 @@
 import io
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
@@ -45,6 +46,45 @@ def test_clusters():
     assert cl and all(len(c["hull"]) >= 1 and c["n"] >= 3 for c in cl)
     assert len(cl) <= 300
     assert all("sensors" in c and "duration_h" in c for c in cl)
+
+
+def test_scipy_and_sklearn_are_imported_only_inside_the_guard():
+    """Every heavy import goes through `heavy()`, or two threads can race a cold one.
+
+    One screen pulls both in at once -- the map asks /clusters while the rail asks /briefing
+    -- and two concurrent cold imports of the same C-extension package collide on CPython's
+    per-module import lock. That is not a theoretical race: loading the console against a
+    freshly started server answered
+
+        500 /clusters  _DeadlockError: deadlock detected by
+                       _ModuleLock('scipy.linalg.cython_lapack')
+    """
+    import ast
+
+    tree = ast.parse(Path(main.__file__).read_text(encoding="utf-8"))
+    sites = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.ImportFrom) and (inner.module or "").split(".")[0] in ("scipy", "sklearn"):
+                sites.add(node.name)
+    assert sites, "no guarded scipy/sklearn import found — did it move back to module scope?"
+    assert sites == {"heavy"}, f"unguarded heavy import inside {sorted(sites)}"
+
+
+def test_heavy_imports_resolve_to_the_real_classes():
+    """The guard caches the symbol, not the module, and hands the same one to every caller."""
+    import concurrent.futures as cf
+
+    with main._HEAVY_LOCK:
+        main._HEAVY.clear()
+    wanted = ["hull", "dbscan", "kmeans"] * 3
+    with cf.ThreadPoolExecutor(max_workers=len(wanted)) as pool:
+        got = list(pool.map(main.heavy, wanted))
+    assert [c.__name__ for c in got] == ["ConvexHull", "DBSCAN", "KMeans"] * 3
+    assert main.heavy("hull") is got[0]
+    assert main.heavy("dbscan") is main._HEAVY["dbscan"]
 
 
 def test_climatology():
@@ -146,6 +186,129 @@ def test_forecast():
     fc = client.get("/forecast").json()
     assert fc["model"] and len(fc["forecast"]) == 30
     assert all(f["count"] >= 0 for f in fc["forecast"])
+
+
+# ------------------------------------------------------------------- training the model
+# `train.py` reduces ~10 GB of FIRMS exports to the seasonal prior `/forecast` blends in.
+# The archive is not in the repository and never will be, so these build a few dozen
+# synthetic rows and push them through the *real* scan/build/save/load path.
+RAW = pd.DataFrame({
+    "latitude": [37.0, 39.5, 39.5, 40.0, 999.0],
+    "longitude": [-121.0, -122.0, -122.0, -123.0, 0.0],
+    "acq_date": ["2025-09-30", "2025-09-30", "2025-10-01", "2025-10-01", "2025-10-01"],
+    "acq_time": [1740, 1809, 1019, 1200, 1200],
+    # numeric MODIS confidence, VIIRS l/n/h letters, and one below the floor
+    "confidence": ["69", "n", "h", "l", "80"],
+    "brightness": [315.9, 300.74, 297.41, 296.0, 310.0],
+    "instrument": ["MODIS", "VIIRS", "VIIRS", "VIIRS", "MODIS"],
+    "frp": [9.2, 0.44, 0.47, 1.0, 2.0],
+    "scan": [1.0, 0.49, 0.45, 0.4, 1.0],
+    "track": [1.0, 0.4, 0.47, 0.4, 1.0],
+})
+
+
+def test_harmonize_without_geometry_counts_the_same():
+    """The training pass skips the footprint columns to avoid ~80M wasted clip passes.
+
+    Everything that decides *whether and when* a detection counts has to stay identical,
+    or `train.py` fits one series and `/forecast` predicts another.
+    """
+    full = main.harmonize(RAW)
+    lean = main.harmonize(RAW, geometry=False)
+    assert list(lean.columns) == [c for c in full.columns if c not in ("scan", "track", "esfp", "pixel_km2")]
+    pd.testing.assert_frame_equal(lean, full[list(lean.columns)])
+    # the below-floor and out-of-range rows were dropped by both, and by the same rule:
+    # confidence 69 kept, "n"/"h" mapped to 60/90, "l" (20) and the 999-degree latitude gone
+    assert list(lean.conf) == [69.0, 60.0, 90.0]
+    pd.testing.assert_series_equal(main.daily(lean)["count"], main.daily(full)["count"])
+
+
+@pytest.fixture
+def trained(tmp_path, monkeypatch):
+    """A checkpoint built by the real pipeline from a tiny archive inside the demo box."""
+    import forecast_model as fm
+    import train
+
+    archive = tmp_path / "Data Training"
+    archive.mkdir()
+    days, rows = [], []
+    for year in (2024, 2025):                       # a season, twice, so the cell is storable
+        for i in range(40):
+            day = f"{year}-03-{i + 1:02d}" if i < 31 else f"{year}-04-{i - 30:02d}"
+            days.append(day)
+            rows.append(f"18.5,99.5,{day},1000,69,300.1,4.0,MODIS")
+            rows.append(f"18.6,99.4,{day},1000,n,301.2,0.4,VIIRS")
+    head = "latitude,longitude,acq_date,acq_time,confidence,brightness,frp,instrument\n"
+    (archive / "fire_archive_M-C61_1.csv").write_text(head + "\n".join(rows[::2]) + "\n", encoding="utf-8")
+    (archive / "fire_nrt_J1V-C2_2.csv").write_text(head + "\n".join(rows[1::2]) + "\n", encoding="utf-8")
+
+    out = tmp_path / "model"
+    manifest = train.run(data_dir=archive, out=out, use_lstm=False, log=lambda *a: None)
+    monkeypatch.setattr(fm, "CHECKPOINT", out / fm.CHECKPOINT.name)
+    monkeypatch.setattr(fm, "CELL_GRID", out / fm.CELL_GRID.name)
+    fm.clear_cache()
+    yield manifest
+    fm.clear_cache()
+    main._invalidate()
+
+
+def test_train_writes_a_usable_checkpoint(trained):
+    import forecast_model as fm
+
+    assert trained["source"]["files"] == 2 and trained["source"]["kept"] == 160
+    assert trained["series"]["days"] == len(trained["series"]["dates"]) > 300
+    ck = fm.load()
+    assert ck and ck["schema"] == fm.SCHEMA
+    assert ck["cells"]["count"] >= 1 and ck["grid_deg"] == 2.0
+    box = (17.0, 98.0, 20.0, 101.0)
+    prior = fm.profile_for_bbox(box)
+    assert prior is not None and len(prior["doy"]) == fm.DOY_BINS
+    # a box the archive never covered has no prior, and the endpoint must say so by omission
+    assert fm.profile_for_bbox((-40.0, -70.0, -35.0, -65.0)) is None
+
+
+def test_forecast_blends_the_archive_prior(trained):
+    """With a checkpoint on disk the endpoint reports it, and a short frame leans on it.
+
+    Three years of the frame's own record match the archive's evidence, so a long frame
+    keeps its own season; the demo covers five, which is why the assertion here is about
+    the blend being wired up rather than about a number moving.
+    """
+    main._invalidate()
+    fc = client.get("/forecast", params={"bbox": "17.0,98.0,20.0,101.0"}).json()
+    assert fc["model"].startswith("Seasonal climatology + archive prior")
+    assert len(fc["forecast"]) == 30 and all(f["count"] >= 0 for f in fc["forecast"])
+
+    # One season of frame data is one sample per day: there the prior is most of the curve.
+    short = pd.Series(np.linspace(0, 40, 400), index=pd.date_range("2024-01-01", periods=400))
+    curve, prior = main._seasonal_climatology(short, (17.0, 98.0, 20.0, 101.0))
+    assert prior is not None and len(curve) == main.forecast_model.DOY_BINS
+    own = short.groupby(short.index.dayofyear).mean()
+    assert not np.allclose(curve.values, own.reindex(curve.index).fillna(0).values)
+
+
+def test_broken_checkpoint_falls_back(tmp_path, monkeypatch):
+    """A half-written, truncated or foreign checkpoint is no checkpoint, not a 500."""
+    import forecast_model as fm
+
+    broken = tmp_path / "forecast.json"
+    monkeypatch.setattr(fm, "CHECKPOINT", broken)
+    monkeypatch.setattr(fm, "CELL_GRID", tmp_path / "cells.npz")
+    fm.clear_cache()
+    assert fm.load() == {}
+    broken.write_text("{not json at all", encoding="utf-8")
+    fm.clear_cache()
+    assert fm.load() == {}
+    # a checkpoint written by a *newer* build: recognized as one of ours, then refused
+    newer = tmp_path / "newer.json"
+    fm.save({}, np.array([1]), np.zeros((1, fm.DOY_BINS), "float32"), np.array([1.0]), path=newer)
+    newer.write_text('{"schema": 99}', encoding="utf-8")
+    fm.clear_cache()
+    assert fm.load(newer) == {}
+    # ...and with no checkpoint the endpoint answers exactly as it did before training existed
+    main._invalidate()
+    fc = client.get("/forecast").json()
+    assert fc["model"].startswith("Seasonal climatology")
 
 
 def test_bad_bbox_returns_400():

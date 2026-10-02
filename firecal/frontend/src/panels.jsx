@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from "react";
 import { api, errMsg, fmt } from "./lib";
 
-/* Chart panels (climatology, illusion diagnostic) live in charts.jsx so Recharts is
-   only fetched when a chart tab is opened. Everything here is chart-free. */
+/* Chart panels (climatology, illusion diagnostic) live in charts.jsx so the SVG chart kit
+   is only fetched when a chart tab is opened. Everything here is chart-free. */
 
 /* Letter-case rule for this file: micro-labels and prose go in sentence case and let
    CSS uppercase them (see the contract at the top of styles.css). Acronyms are always
@@ -29,11 +29,17 @@ export function HeroStats({ meta }) {
 }
 
 /* ------------- Live FIRMS feed panel ------------- */
-const REGIONS = ["Global", "South_East_Asia", "South_America", "North_and_Central_America",
-  "Africa", "Europe", "Northern_and_Central_Australia", "South_Asia"];
+/* The region list is the server's (`/meta.live_regions`), not a second copy kept here: an
+   allowlist that only one side knows about turns into a 400 the day somebody edits it. The
+   one-entry fallback is for an API that predates the field, and is always a valid choice. */
+const FALLBACK_REGIONS = ["Global"];
 
-export function LivePanel({ onLoaded, wide, bbox, region: aoRegion, onDatasetChanged }) {
-  const [region, setRegion] = useState("Global");
+export function LivePanel({ onLoaded, wide, bbox, region: aoRegion, onDatasetChanged, liveRegions }) {
+  const options = liveRegions?.length ? liveRegions : FALLBACK_REGIONS;
+  const [wanted, setWanted] = useState("Global");
+  // Derived rather than stored, so a region that disappears from the list can never be the
+  // value of the <select> while `pull` sends something else.
+  const region = options.includes(wanted) ? wanted : options[0];
   const [busy, setBusy] = useState(false);
   const [res, setRes] = useState(null);
   const [err, setErr] = useState(null);
@@ -77,8 +83,8 @@ export function LivePanel({ onLoaded, wide, bbox, region: aoRegion, onDatasetCha
     <h3>Live FIRMS 24 h feed
       <span className="mut">MODIS C6.1 + VIIRS S-NPP/NOAA-20/NOAA-21 · on-the-fly harmonization + DBSCAN</span>
       <span className="tools">
-        <select value={region} onChange={e => setRegion(e.target.value)}>
-          {REGIONS.map(r => <option key={r}>{r}</option>)}
+        <select value={region} onChange={e => setWanted(e.target.value)}>
+          {options.map(r => <option key={r}>{r}</option>)}
         </select>
         <button className={"btn sm" + (busy ? "" : " primary")} onClick={pull} disabled={busy}>
           {busy ? "Fetching feeds… (up to ~2 min for Global)" : "Pull live hotspots"}
@@ -130,9 +136,16 @@ export function BriefingPanel({ bbox, onPickDay, refreshKey, mini, detail }) {
   const [note, setNote] = useState(null);
   const [copied, setCopied] = useState(false);
   const [sub, setSub] = useState("situation");
-  const load = (format, cb) => api("/briefing", { bbox, format }).then(cb)
-    .catch(() => setNote("Briefing needs ≥ 60 days of data."));
-  useEffect(() => { setNote(null); setB(null); load("json", setB); }, [bbox, refreshKey]);
+  const load = (format, cb, onFail) => api("/briefing", { bbox, format }).then(cb).catch(onFail);
+  // Guarded like the charts: `/briefing` is answered from a client-side cache, so a slow
+  // response for the previous AOI can land after a faster one for the next and overwrite it.
+  useEffect(() => {
+    let live = true;
+    setNote(null); setB(null);
+    load("json", b => { if (live) setB(b); },
+         () => { if (live) setNote("Briefing needs ≥ 60 days of data."); });
+    return () => { live = false; };
+  }, [bbox, refreshKey]);
 
   async function copyMd() {
     try {

@@ -25,3 +25,10 @@ github setup
 **/.env
 .env
 *.csv
+
+# The FIRMS training archive is ~10 GB and never belongs in a build context. Its output does:
+# `firecal/backend/model/` is deliberately *not* excluded, so an image built from a trained
+# checkout ships the archive-trained forecast. A fresh clone simply has no checkpoint, which
+# the API handles by fitting its own climatology.
+Data Training
+data_training
