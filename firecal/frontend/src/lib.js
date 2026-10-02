@@ -54,3 +54,12 @@ export const ramp = ["#1d262a", "#5a3524", "#9a5327", "#cf7239", "#eda15f", "#ff
 export const doyLabel = d => new Date(2001, 0, d).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 
 export const fmt = n => n == null ? "—" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(Math.round(n * 10) / 10);
+
+/** A file size, in the unit that keeps it readable. The archive picker needs this because the
+    inventory runs from 135 KB to 1.87 GB: rounding every file to whole megabytes printed
+    "0 MB" for the small near-real-time exports, which reads as an empty file rather than a
+    small one. Decimal MB, matching how FIRMS reports its downloads. */
+export const fmtBytes = b => b == null ? "—"
+  : b >= 1e9 ? (b / 1e9).toFixed(2) + " GB"
+  : b >= 1e6 ? (b / 1e6).toFixed(1) + " MB"
+  : Math.max(1, Math.round(b / 1e3)) + " KB";

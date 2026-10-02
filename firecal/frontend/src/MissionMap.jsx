@@ -9,7 +9,7 @@ import "maplibre-gl/dist/maplibre-gl.css";
 import maplibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
 import { fmt, SLOW_LINK } from "./lib";
 import { createQualityGovernor } from "./adaptiveQuality";
-import { spinHolds, spinRate, spinStep } from "./autoRotate";
+import { AXIAL_TILT_DEG, spinHolds, spinRate, spinStep } from "./autoRotate";
 // The basemap style documents and the globe/mercator thresholds live in their own module, so
 // the style that is drawn and the badge that reports it read the same constants.
 import { GLOBE_ZOOM, FLAT_ZOOM, START_ZOOM, rasterStyle, mergeOverlays, VECTOR_STYLE_URL } from "./basemapStyles";
@@ -41,6 +41,26 @@ const PLACEHOLDER_STYLE = mergeOverlays({ version: 8, name: "Pyro-Harmony missio
 const LOW_END = typeof navigator !== "undefined" &&
   ((navigator.hardwareConcurrency || 8) <= 4 || (navigator.deviceMemory || 8) <= 4);
 const MOTION_MS = LOW_END ? 0 : 800;
+
+// MapLibre draws with WebGL2 and nothing else, and a browser that cannot hand it a context
+// throws during construction: the well then stays black, which reads as "the map is broken"
+// with nothing on screen to say otherwise. It happens on real machines -- hardware
+// acceleration switched off, a GPU on the driver blocklist, a remote-desktop or virtual
+// session -- and it is not the same thing as a slow link, so the console says which it is. The
+// probe context is released immediately: browsers cap how many live WebGL contexts a page may
+// hold, and this one is only a question.
+const WEBGL2 = (() => {
+  if (typeof document === "undefined") return false;
+  try {
+    const probe = document.createElement("canvas");
+    const gl = probe.getContext("webgl2");
+    gl?.getExtension("WEBGL_lose_context")?.loseContext();
+    return !!gl;
+  } catch { return false; }
+})();
+
+const NO_WEBGL = "This browser cannot start the map's WebGL2 renderer. Turn on hardware " +
+  "acceleration (or open the console in another browser) and reload — every panel below still works.";
 
 // Rendering cost scales with canvas pixels, and a HiDPI canvas shades roughly four times the
 // fragments of a 1x one. Capping the ratio keeps the raster basemaps legible -- there are no
@@ -148,17 +168,20 @@ export default function MissionMap({
 }) {
   const containerRef = useRef(null);
   const rootRef = useRef(null);
+  const bottomRef = useRef(null);
   const mapRef = useRef(null);
   const firstCornerRef = useRef(null);
   const onSelectBoundsRef = useRef(onSelectBounds);
   const onTilesChangeRef = useRef(onTilesChange);
   const pickingRef = useRef(picking);
   const tilesRef = useRef(tiles);
-  // Which family of style is currently on the map. Switching inside a family is a visibility
-  // flip; crossing the boundary is a `setStyle`, which is why it has to be tracked. It starts at
-  // "raster" even when the console opens on vector: the map is created on the placeholder, so
-  // the vector style is precisely what the switch effect below still has to fetch and install.
-  const styleKindRef = useRef("raster");
+  // Which family of style is currently on the map: "placeholder" (the map was built before the
+  // vector document arrived), "raster" (the Esri pair) or "vector". Switching inside the raster
+  // pair is a visibility flip; crossing any other boundary is a `setStyle`. It is seeded from
+  // the style the map is actually constructed with below, so the switch effect can tell an
+  // installed raster style from one that is still only the loading placeholder -- flipping a
+  // layer of a placeholder that has no raster layer in it leaves the well empty.
+  const styleKindRef = useRef(tiles === "vector" ? "placeholder" : "raster");
   const initialCenterRef = useRef(center);
   const lastCenterRef = useRef(center);
   const pointData = useMemo(() => makePointData(points, live?.rows || []), [points, live]);
@@ -172,6 +195,14 @@ export default function MissionMap({
   const [view, setView] = useState("3D globe");
   const [spin, setSpin] = useState(false);
   const [vectorErr, setVectorErr] = useState(null);
+  // Set only when the map cannot be drawn at all (no WebGL2, or a constructor that refused).
+  // Everything else in the console keeps working, so this is a notice, not an error page.
+  const [mapErr, setMapErr] = useState(null);
+  // A request the page's own policy refused. The browser reports that to nobody: the fetch simply
+  // rejects and the map stays empty, which is exactly what a policy that forbids a tile host looks
+  // like from the outside. The browser's own refusal notice is the fastest route from "the map is
+  // blank" to "the policy is wrong", so it is surfaced rather than left in devtools.
+  const [policyErr, setPolicyErr] = useState(null);
   const viewRef = useRef("3D globe");
   // True while a gesture is being served at reduced detail, so the correction survives a
   // basemap swap (a new style would otherwise hand the full-detail layers back mid-drag).
@@ -224,60 +255,105 @@ export default function MissionMap({
   };
 
   useEffect(() => {
+    const onViolation = event => setPolicyErr(
+      `This page's security policy blocked ${event.blockedURI || "a map resource"} — the map cannot draw it.`);
+    document.addEventListener("securitypolicyviolation", onViolation);
+    return () => document.removeEventListener("securitypolicyviolation", onViolation);
+  }, []);
+
+  useEffect(() => {
     if (!containerRef.current) return undefined;
+    if (!WEBGL2) {
+      setMapErr(NO_WEBGL);
+      return undefined;
+    }
 
     const start = initialCenterRef.current;
-    const map = new MapLibreMap({
-      container: containerRef.current,
-      // The raster pair is built here; the vector basemap arrives over the network, so an
-      // opening on a slow link starts on our layers alone and swaps the real style in below.
-      style: tilesRef.current === "vector" ? PLACEHOLDER_STYLE : rasterStyle(tilesRef.current),
-      center: [start[1], start[0]],
-      zoom: START_ZOOM,
-      minZoom: 0.5,
-      maxZoom: 19,
-      maxPitch: 60,
-      attributionControl: { compact: true },
-      // No MSAA on the shared canvas -- MapLibre's own default, and the right one here. A
-      // multisampled buffer costs a full-resolution resolve every frame, while the only edges
-      // it would smooth are the round fire dots: both basemaps are textures, drawn either
-      // fully covered or not at all. Satellite and terrain pay the same bill.
-      canvasContextAttributes: { antialias: false },
-      // Both basemaps are raster layers that keep streaming during a zoom or a drag, and
-      // MapLibre's default 300 ms crossfade is per-frame work for every layer it draws, so
-      // it is off. The cap on the render ratio applies to the satellite and terrain views
-      // alike -- it is a property of the canvas, not of the tiles.
-      fadeDuration: 0,
-      pixelRatio: PIXEL_RATIO,
-      // Esri tiles do not change minute to minute. Re-validating an expired tile mid-gesture
-      // buys a conditional request, a decode and a texture re-upload -- a visible hitch -- for
-      // pixels that are almost always identical, so expiry checking stays off for the session.
-      refreshExpiredTiles: false,
-      // At the opening zoom the same world can be drawn up to seven times in one frame, and
-      // each copy is another tile cover to project and rasterize. A fire console never shows
-      // a repeated Earth, so the extra covers are pure cost.
-      renderWorldCopies: false,
-    });
+    let map;
+    try {
+      // The style the map opens on and `styleKindRef` above have to agree: this is the line the
+      // seed for that ref describes.
+      map = new MapLibreMap({
+        container: containerRef.current,
+        // The raster pair is built here; the vector basemap arrives over the network, so an
+        // opening on a slow link starts on our layers alone and swaps the real style in below.
+        style: tilesRef.current === "vector" ? PLACEHOLDER_STYLE : rasterStyle(tilesRef.current),
+        center: [start[1], start[0]],
+        zoom: START_ZOOM,
+        minZoom: 0.5,
+        maxZoom: 19,
+        maxPitch: 60,
+        attributionControl: { compact: true },
+        // No MSAA on the shared canvas -- MapLibre's own default, and the right one here. A
+        // multisampled buffer costs a full-resolution resolve every frame, while the only edges
+        // it would smooth are the round fire dots: both basemaps are textures, drawn either
+        // fully covered or not at all. Satellite and terrain pay the same bill.
+        canvasContextAttributes: { antialias: false },
+        // Both basemaps are raster layers that keep streaming during a zoom or a drag, and
+        // MapLibre's default 300 ms crossfade is per-frame work for every layer it draws, so
+        // it is off. The cap on the render ratio applies to the satellite and terrain views
+        // alike -- it is a property of the canvas, not of the tiles.
+        fadeDuration: 0,
+        pixelRatio: PIXEL_RATIO,
+        // Esri tiles do not change minute to minute. Re-validating an expired tile mid-gesture
+        // buys a conditional request, a decode and a texture re-upload -- a visible hitch -- for
+        // pixels that are almost always identical, so expiry checking stays off for the session.
+        refreshExpiredTiles: false,
+        // At the opening zoom the same world can be drawn up to seven times in one frame, and
+        // each copy is another tile cover to project and rasterize. A fire console never shows
+        // a repeated Earth, so the extra covers are pure cost.
+        renderWorldCopies: false,
+      });
+    } catch (error) {
+      // A driver that answered the probe and then refused the real context lands here too.
+      setMapErr(`The map renderer would not start (${error?.message || "unknown reason"}). ` +
+                "Every panel below still works.");
+      return undefined;
+    }
     mapRef.current = map;
+    setMapErr(null);
     map.addControl(new NavigationControl({ showCompass: true, showZoom: true }), "bottom-right");
 
-    // The bottom-left column has to clear MapLibre's attribution notice, and that notice is a
-    // legal requirement whose height we do not control: it grows a line or two on a narrow map
-    // and for a moment when both basemaps report. Measure it rather than guess, and hand the
-    // measurement to the CSS as the height the column sits above, so the controls are never
-    // parked on the notice at any width.
+    // The readout and the view controls sit on the map's own bottom edge, the way the legend
+    // chip sits on its top edge. The one thing that can genuinely collide with them is
+    // MapLibre's attribution notice, which is a legal requirement we do not control: collapsed
+    // it is a small button in the corner, and expanded it is a bar that can reach under the
+    // controls. So the band is not a constant -- it is the notice's height, and only while the
+    // notice is actually wide enough to overlap the column at this window width. Both rects come
+    // from the same frame, and lifting the column changes neither its right edge nor the
+    // notice's top, so the measurement settles in one pass instead of oscillating.
     const attribEl = map.getContainer().querySelector(".maplibregl-ctrl-attrib");
+    const columnEl = bottomRef.current;
     const syncAttribBand = () => {
       const root = rootRef.current;
-      // An empty notice is display:none: keep the stylesheet's default band until it appears.
-      if (!root || !attribEl || !attribEl.getClientRects().length) return;
-      const gap = map.getContainer().getBoundingClientRect().bottom - attribEl.getBoundingClientRect().top;
-      if (gap > 0) root.style.setProperty("--attribBand", `${Math.min(Math.ceil(gap) + 6, 120)}px`);
+      if (!root) return;
+      // An empty notice is display:none. Reset the inline value as well: if it was expanded
+      // earlier, leaving that measurement behind would keep the controls floating after it
+      // disappears.
+      if (!attribEl || !attribEl.getClientRects().length) {
+        root.style.setProperty("--attribBand", "0px");
+        return;
+      }
+      const notice = attribEl.getBoundingClientRect();
+      const column = columnEl?.getBoundingClientRect();
+      // Test the horizontal overlap only. Once the band lifts the column clear of the notice,
+      // checking vertical overlap against the already-lifted rect would clear the band again
+      // and park the controls back on top of the attribution.
+      const overlaps = !!column && column.right > notice.left && column.left < notice.right;
+      const gap = map.getContainer().getBoundingClientRect().bottom - notice.top;
+      const band = overlaps && gap > 0 ? Math.min(Math.ceil(gap) + 6, 120) : 0;
+      root.style.setProperty("--attribBand", `${band}px`);
     };
     syncAttribBand();
     const attribObserver = attribEl && typeof ResizeObserver !== "undefined"
       ? new ResizeObserver(syncAttribBand) : null;
-    attribObserver?.observe(attribEl);
+    if (attribEl) attribObserver?.observe(attribEl);
+    // A responsive map can get narrower while both controls keep their own dimensions; the
+    // attribution moves left as it stays right-anchored, so observe the map's size as well.
+    attribObserver?.observe(map.getContainer());
+    // The column is observed too: a wrapped row of controls changes how far right it reaches,
+    // which is half of the overlap test above.
+    if (columnEl) attribObserver?.observe(columnEl);
     map.on("styledata", syncAttribBand);
 
     // ---- adaptive detail -------------------------------------------------
@@ -364,6 +440,17 @@ export default function MissionMap({
     map.getSource("selection")?.setData(makeSelectionData(bbox, firstCorner));
   }, [bbox, firstCorner]);
 
+  // Installing the Esri pair. `setStyle` rebuilds every source and layer, so it runs only when
+  // the style on the map is not the raster pair already: entering it from the vector document,
+  // from the loading placeholder, or landing on it as a fallback. A fallback from a raster view
+  // therefore keeps its warm tile caches instead of re-downloading what is on screen.
+  const showRaster = kind => {
+    const map = mapRef.current;
+    if (!map || styleKindRef.current === "raster") return;
+    styleKindRef.current = "raster";
+    map.setStyle(rasterStyle(kind));
+  };
+
   // Basemap switching. Inside the raster pair both sources are already in the style, so this is
   // a visibility flip and the tile caches stay warm; entering or leaving the vector basemap
   // means a whole new style document, and the overlays are re-hydrated once it loads.
@@ -381,19 +468,25 @@ export default function MissionMap({
           styleKindRef.current = "vector";
           map.setStyle(mergeOverlays(base));
         })
-        .catch(() => {
-          // Keep the console usable: report it on the button and land back on imagery, which
-          // needs no third party beyond the Esri tiles already in the style.
+        .catch(error => {
+          // The vector document lives on a third-party host, so this can be a blocked request, a
+          // captive portal, or a plain outage. Land on the imagery, which needs no third party
+          // beyond the Esri tiles -- and INSTALL it, because an opening on vector begins on the
+          // placeholder style, whose raster layers do not exist, so a visibility flip would
+          // leave the well black while the badge claimed satellite.
           if (cancelled) return;
-          setVectorErr("Vector basemap unavailable — retry, or stay on the imagery");
+          setVectorErr(`Vector basemap unavailable — imagery kept (${error?.message || "fetch failed"})`);
+          showRaster("sat");
           onTilesChangeRef.current?.("sat");
         });
       return () => { cancelled = true; };
     }
 
-    if (styleKindRef.current === "vector") {
-      styleKindRef.current = "raster";
-      map.setStyle(rasterStyle(tiles));
+    // Only a loaded raster style can be panned by flipping visibility. Anything else -- the
+    // vector document, or the placeholder that stands in for it while it loads -- has to be
+    // replaced wholesale, or the console would report a basemap it never drew.
+    if (styleKindRef.current !== "raster") {
+      showRaster(tiles);
       return undefined;
     }
     if (map.getLayer("satellite-imagery")) map.setLayoutProperty("satellite-imagery", "visibility", tiles === "sat" ? "visible" : "none");
@@ -436,6 +529,11 @@ export default function MissionMap({
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !spin) return undefined;
+    // Point the camera at the real axis first. `setBearing` turns the globe about the camera's
+    // vertical, so level it turns like a spinning top; at Earth's own 23.44° of obliquity it
+    // turns the way the planet does, with the north pole tracing its small circle. The ease is
+    // why the drift holds for a moment before it starts -- see spinHolds.
+    map.easeTo({ pitch: AXIAL_TILT_DEG, duration: MOTION_MS + 250 });
     const rate = spinRate(LOW_END);
     // Our own unwrapped bearing. MapLibre wraps whatever it is handed into (-180, 180] and
     // picks the nearest equivalent angle, so letting this grow keeps the globe turning the same
@@ -462,7 +560,14 @@ export default function MissionMap({
       spinningRef.current = false;
     };
     frame = requestAnimationFrame(tick);
-    return () => { cancelAnimationFrame(frame); spinningRef.current = false; };
+    return () => {
+      cancelAnimationFrame(frame);
+      spinningRef.current = false;
+      // Level the camera again, but only if the tilt is still ours: an operator who pitched the
+      // view while the drift was on keeps the angle they chose.
+      const live = mapRef.current;
+      if (live && Math.abs(live.getPitch() - AXIAL_TILT_DEG) < 0.5) live.easeTo({ pitch: 0, duration: MOTION_MS });
+    };
   }, [spin]);
   useEffect(() => {
     const el = mapRef.current?.getCanvas();
@@ -488,11 +593,18 @@ export default function MissionMap({
       <span className="hint mapGestureHint">Scroll to zoom · drag to rotate Earth</span>
     </div>
     <div className="scan" />
+    {/* One line of prose in the middle of the well, only when the map cannot be drawn at all.
+        Never a replacement for the console: the panels, the tabs and the briefing are unaffected
+        by a browser that will not give us a WebGL2 context. */}
+    {(mapErr || policyErr || vectorErr) && <div className="mapNotice" role="status">
+      <span className="chip">{mapErr || policyErr || vectorErr}</span>
+    </div>}
     {/* Bottom-left column: the day/hotspot readout first, then every view control beneath it.
         One bottom-anchored column means a wrapped row of buttons grows upward instead of
         colliding with the numbers, and its right margin keeps the compact corner free for the
-        Esri attribution. The bottom offset is `--attribBand`, the notice height measured above. */}
-    <div className="mapBottom">
+        Esri attribution. It sits on the map's bottom edge like the legend chip on its top edge;
+        `--attribBand` lifts it, and only while the expanded notice would reach under it. */}
+    <div className="mapBottom" ref={bottomRef}>
       <div className="chip mapReadout">
         <span>{day || "—"}{span > 1 && <> → {end}</>}</span>
         <span>· {fmt(hotspotTotal)} hotspots · {fmt(clusters.length)} clusters · {fmt(totalFrp)} MW</span>

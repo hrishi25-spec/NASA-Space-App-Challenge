@@ -19,7 +19,7 @@ export default function ForecastChart({ series, model }) {
   // tighter drag inside a zoomed view composes instead of re-zooming from the full series.
   const [zoom, setZoom] = useState(null);
   if (!series || !series.length)
-    return <span className="hint">No calendar data yet — load a demo or upload FIRMS CSVs to fit a forecast.</span>;
+    return <span className="hint">No calendar data yet — open a local archive or upload FIRMS CSVs to fit a forecast.</span>;
 
   const observed = series.filter(d => d.actual != null).length;
   const lookahead = series.filter(d => d.forecast != null).length;

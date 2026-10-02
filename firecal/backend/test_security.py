@@ -10,6 +10,9 @@ Note on ordering: this module runs before test_smoke.py (alphabetical), which re
 standard demo in its session fixture, so the datasets swapped in here do not leak.
 """
 import io
+import re
+from pathlib import Path
+from urllib.parse import urlsplit
 
 import pandas as pd
 import pytest
@@ -253,6 +256,74 @@ def test_security_headers_are_on_every_response():
         assert "base-uri 'none'" in csp and "form-action 'none'" in csp
         assert "unsafe-eval" not in csp            # nothing here needs eval
         assert "*" not in csp.replace("https://*.basemaps.cartocdn.com", "")
+
+
+# -------------------------------------------------- the policy vs. what the console loads
+# The map is the one part of the console that talks to third parties, and a policy that forbids
+# a tile host fails *silently in the browser*: the request is refused, MapLibre reports nothing
+# to the UI, and the operator is left looking at a black map well. That happened: `img-src` and
+# `connect-src` listed `https://*.basemaps.cartocdn.com`, which does not match the bare
+# `basemaps.cartocdn.com` the vector style document is served from -- a CSP wildcard covers
+# subdomains only, never the domain itself. So the hosts are checked here against what the
+# frontend really loads, and the wildcard rule is pinned, instead of trusted to memory.
+FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
+
+# Every external host the built console loads and the directive that governs each request. The
+# CARTO entries are what its style document pulls in once fetched: the document itself, then the
+# TileJSON, glyph tiles and sprite sheet behind it.
+CONSOLE_HOSTS = [
+    ("connect-src", "https://basemaps.cartocdn.com"),        # the vector style document
+    ("connect-src", "https://tiles.basemaps.cartocdn.com"),  # its TileJSON, glyphs, vector tiles
+    ("img-src", "https://tiles.basemaps.cartocdn.com"),       # its sprite sheet
+    # Esri under both directives: MapLibre loads a raster tile with an `<img>` or with `fetch`
+    # depending on whether it may need to re-validate it, so one of the two is not enough.
+    ("img-src", "https://server.arcgisonline.com"),           # Esri raster tiles
+    ("connect-src", "https://server.arcgisonline.com"),
+]
+
+
+def _csp_directives():
+    csp = main.SECURITY_HEADERS["Content-Security-Policy"]
+    return {d.split(" ", 1)[0]: d.split(" ", 1)[1] for d in csp.split("; ")}
+
+
+def _host_covered(source, host):
+    """CSP3 host-source matching: `*.example.com` covers subdomains, not `example.com`."""
+    for entry in source.split():
+        if entry.startswith("'") or "://" not in entry:
+            continue
+        allowed = urlsplit(entry).hostname or ""
+        if allowed == host:
+            return True
+        if allowed.startswith("*.") and host.endswith(allowed[1:]) and host != allowed[2:]:
+            return True
+    return False
+
+
+def test_csp_host_sources_come_from_the_frontend_basemaps():
+    """A tile host added to the map has to be allowed here in the same commit, or the suite --
+    rather than the map -- fails."""
+    source = (FRONTEND / "src" / "basemapStyles.js").read_text()
+    declared = {urlsplit(url).hostname for url in re.findall(r"https://[\w.\-]+", source)}
+    assert declared, "the basemap module no longer names any tile host"
+    directives = _csp_directives()
+    for host in sorted(declared):
+        assert (_host_covered(directives["connect-src"], host)
+                or _host_covered(directives["img-src"], host)), host
+
+
+def test_csp_allows_every_host_the_map_loads():
+    directives = _csp_directives()
+    for directive, url in CONSOLE_HOSTS:
+        assert _host_covered(directives[directive], urlsplit(url).hostname), (directive, url)
+
+
+def test_csp_wildcard_covers_subdomains_only():
+    """The mistake this suite exists to prevent: a wildcard is not a domain."""
+    assert _host_covered("https://*.example.com", "tiles.example.com")
+    assert not _host_covered("https://*.example.com", "example.com")
+    assert not _host_covered("https://*.example.com", "notexample.com")
+
 
 # ----------------------------------------------------------------- upload bounds
 def test_oversize_request_is_refused_before_it_is_read(monkeypatch):

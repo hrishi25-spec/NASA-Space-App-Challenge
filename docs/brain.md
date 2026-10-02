@@ -10,8 +10,8 @@ Satellites have tracked active fires for 20+ years, but the record is fragmented
 
 | Thing | State |
 |---|---|
-| Tests | 59 passing — 37 API smoke + 22 security, run in-process via `TestClient` |
-| Frontend build | Clean, including the prebuild lazy-export, adaptive-detail and chart-layout guards |
+| Tests | 98 passing — 40 API smoke + 34 security + 24 local-archive, run in-process via `TestClient` |
+| Frontend build | Clean, including the prebuild lazy-export, adaptive-detail, chart-layout and orbital-drift guards |
 | Startup weight | Import ≈ 2.2 s, baseline RSS ≈ 104 MB (measured on the dev machine after the lazy scipy/sklearn change) |
 | Layout | Arranged per the repo standard; see [decisions/0001](decisions/0001-repository-layout.md) |
 
@@ -41,18 +41,21 @@ Two structural decisions do most of the work:
 | `firecal/backend/train.py` | Trains the model from the FIRMS archive in chunks and writes `model/` |
 | `firecal/backend/forecast_model.py` | The trained prior — 2° cell × day-of-year shape, bbox lookup, checkpoint IO |
 | `firecal/backend/model/` | The trained checkpoint. Gitignored, rebuilt by `train.py`, optional to the API |
-| `firecal/backend/demo.py` | Synthetic FIRMS generator (2020–24 standard + 2002–24 transition) |
+| `firecal/backend/archives.py` | The local-archive inventory under `.data/`, the bounded spread slice reader, `allocate()` (a merge budget split by file size) and `read_merge()` (all of them at once) |
+| `firecal/backend/demo.py` | Synthetic FIRMS generator (2020–24 standard + 2002–24 transition) — the test fixture; nothing in the UI calls it |
 | `firecal/backend/regions.py` | Five curated AOI presets |
-| `firecal/backend/test_*.py` | Smoke and security suites, colocated with the app |
+| `firecal/backend/test_*.py` | Smoke, security and archive suites, colocated with the app |
 | `firecal/frontend/src/` | Console: `App.jsx`, `MissionMap.jsx`, `panels.jsx`, `charts.jsx`, `plot.jsx`, `chartGeometry.js`, `lib.js`, `styles.css` |
 | `docs/` | This page, PRD, sensor review, challenge brief, ADRs |
-| `scripts/check.sh` / `.bat` | The same checks CI runs |
+| `scripts/check.sh` / `.bat` + `scripts/check-doc-figures.py` | The same checks CI runs, and the guard that fails when a documented figure drifts from the code |
 | `Dockerfile` | Console build + API in one image, one port ([decisions/0002](decisions/0002-single-image-deployment.md)) |
-| `.github/workflows/ci.yml` | pytest job + frontend build job |
+| `.github/workflows/ci.yml` | pytest job + doc-figures job + frontend build job |
 
 ## Data flow
 
-**Upload, live pull, archive window, or demo → harmonize (confidence floor, UTC time, de-duplicate, per-sensor rescale, ESFP/HFII) → one DataFrame → derived endpoints (memoized, invalidated on change) → gzip → client cache → panels.**
+**Open a local archive, upload, live pull, or archive window → harmonize (confidence floor, UTC time, de-duplicate, per-sensor rescale, ESFP/HFII) → one DataFrame → derived endpoints (memoized, invalidated on change) → gzip → client cache → panels.**
+
+The console's opening move is the first of those: `GET /datasets` publishes the archive files on the machine (id, sensor, kind, size — never a path), and `POST /datasets/load` opens one by reading a capped number of rows from evenly spaced offsets across the file. What was read comes back in `meta.load` and is shown in the console, because a 750,000-row slice of a 16M-row export is a sample and the panels must not read as if it were the file.
 
 ## Constants worth knowing
 
@@ -66,26 +69,31 @@ Two structural decisions do most of the work:
 | Data thresholds | climatology/briefing ≥ 60 days · anomalies > 400 days · forecast ≥ 120 days |
 | Threat | `max_z + 0.5·streak_days + min(2, recent_mean/25)`; Watch ≥ 3.5, Critical ≥ 6 |
 | Caps | 2 M rows total, 200 MB/file, 400 MB/request, ≤ 20 files, 64 MB per outbound feed, 2 concurrent live ingests |
-| Camera | globe ≤ 3.7 · flat ≥ 5.2 · start 1.65 · tiles ≤ 16 · `LOW_END` = ≤ 4 cores or ≤ 4 GB |
+| Local archive slice | 750,000 rows read (1,000–2,000,000) across ≤ 24 evenly spaced offsets; 1 concurrent open; `.data/` is gitignored so CI and the image see none |
+| Merged archives | `all=true` · 2,000,000 rows split by file bytes · per-file accounting + per-file skips |
+| Sensor naming | instrument, not platform — `SNPP`/`NPP`/`N20`/`N21`/`NOAA-20`/`NOAA-21` → **VIIRS**, so the three VIIRS platforms are one sensor (they are the same instrument; `SENSOR_ALIASES` in `main.py`) |
+| Camera | globe ≤ 3.7 · flat ≥ 5.2 · start 1.65 · tiles ≤ 16 · axial tilt 23.44° while auto-rotating · `LOW_END` = ≤ 4 cores or ≤ 4 GB |
 
 ## Commands
 
 ```bash
 python run.py                      # set up + start both servers (any OS)
-scripts/check.sh                   # backend tests + frontend build (scripts\check.bat on Windows)
-cd firecal/backend && python demo.py   # write demo_modis.csv / demo_viirs.csv to upload
+scripts/check.sh                   # backend tests + doc figures + frontend build (scripts\check.bat on Windows)
+cd firecal/backend && python train.py # train the forecast prior over .data/ (~15 min)
+cd firecal/backend && python demo.py   # write demo_modis.csv / demo_viirs.csv to upload (fixture)
 FIRMS_MAP_KEY=… in .env            # enables POST /archive (real 1–5 day windows)
 ```
 
 ## Invariants and traps
 
 - **A filename is data, not a command.** The transition demo loads via `POST /demo` or `?demo_transition=true` — never by naming a file.
+- **An archive id is a name, not a path.** `/datasets/load` resolves its `id` against the inventory the scan produced and re-checks containment against the root; no request string is ever joined onto a path, so a traversal id has nothing to escape from.
 - **Client input never selects a URL.** `region` is allowlisted before any outbound fetch; writes are origin-gated; uploads are capped before buffering; `FIRMS_MAP_KEY` is read from the environment only and never echoed.
 - **scipy and scikit-learn import lazily** inside clustering/briefing. Do not move them back to module scope — it costs ~2.5 s of startup.
 - **Never import chart code in the shell.** `charts.jsx` and `ForecastChart.jsx` are lazy for a reason; a new lazy target must resolve to a default export or the build guard fails.
 - **Derived values must degrade honestly.** Thin selections answer `200` with a `note`; every panel is required to show that note instead of spinning.
 - **`torch` is optional.** Without it the forecast falls back to scaled seasonal climatology — archive-trained when a checkpoint exists — and names the fallback in the UI.
-- **The training archive is never committed.** `Data Training/` is ~10 GB of local NASA exports and `firecal/backend/model/` is derived from it; both are gitignored, and a missing or malformed checkpoint is not an error.
+- **The training archive is never committed.** `.data/` is ~10 GB of local NASA exports and `firecal/backend/model/` is derived from it; both are gitignored, and a missing or malformed checkpoint is not an error.
 - **Training and serving must harmonize identically.** `train.py` reads the archive through the server's own `harmonize(geometry=False)` and `harmonized_daily()`. A second implementation of the sensor rescale would train the model on a different quantity than the endpoint predicts.
 - **CSS uppercases labels.** Write labels in sentence case and let the contract do the casing; acronyms are the only all-caps strings in source.
 

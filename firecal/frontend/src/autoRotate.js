@@ -10,6 +10,17 @@
    (numbers in, number out) so scripts/check-spin-policy.mjs can assert it without a browser.
 */
 
+/** Earth's axial tilt, in degrees: the angle between the planet's rotation axis and the plane
+    of its orbit, 23.44° (NASA's own figure; the obliquity varies by ±0.0025° over 40,000 years,
+    which is not a thing a screen shows).
+
+    Auto-rotate turns the globe with `setBearing`, and a bearing set with the camera level turns
+    the planet about a *vertical* axis -- which is what a spinning top does, not what Earth does.
+    The camera is pitched to this angle for as long as the drift runs, so the axis the globe
+    turns about is the real one and the north pole traces the same small circle it does from
+    orbit. Pinned by check-spin-policy.mjs against the range Earth's tilt actually occupies. */
+export const AXIAL_TILT_DEG = 23.44;
+
 /** Degrees per second: a full revolution every 60 s, or every 120 s where frames are costly.
     Fast enough that the globe obviously turns, slow enough to read a coastline while it does. */
 export const SPIN_DEG_PER_SEC = 6;

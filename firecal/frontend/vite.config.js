@@ -5,6 +5,12 @@ import { defineConfig } from "vite"; import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
   build: {
+    // Budget, not a silencer: MapLibre ships prebundled (entry 554 kB minified, its
+    // worker 510 kB) and neither can be split below 500 kB -- the library is also only
+    // fetched when the map opens (React.lazy). 600 kB sits just above those two, so the
+    // warning still fires the moment anything else grows past MapLibre's own halves:
+    // a charting library creeping back in, React code leaking into the app chunk.
+    chunkSizeWarningLimit: 600,
     // NOTE: no lower `target` here. MapLibre's worker uses BigInt literals and the map
     // itself needs WebGL2, so anything old enough to miss ES2020 syntax can't run the
     // map at all -- downleveling would only slow the build and grow the bundle.
@@ -18,6 +24,9 @@ export default defineConfig({
         // chunk -- and that pulled Recharts back into the first paint.
         manualChunks(id) {
           if (!id.includes("node_modules")) return undefined;
+          // MapLibre ships prebundled as entry -> shared (its worker is emitted separately):
+          // one forced chunk puts both over the size warning, so shared gets its own name.
+          if (id.includes("maplibre-gl-shared")) return "vendor-maplibre-shared";
           if (id.includes("maplibre-gl")) return "vendor-maplibre";
           if (/[\\/]node_modules[\\/](react|react-dom|react-is|scheduler)[\\/]/.test(id)) return "vendor-react";
           return undefined;

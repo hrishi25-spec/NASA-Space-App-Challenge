@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState, Suspense, lazy } from "react";
-import { api, errMsg, ramp, fmt, invalidateApiCache, SLOW_LINK } from "./lib";
+import { api, errMsg, ramp, fmt, fmtBytes, invalidateApiCache, SLOW_LINK } from "./lib";
 import { HeroStats, LivePanel, BriefingPanel } from "./panels";
 
 // Code-split the heavy optional pieces so a low-end machine can paint the console
@@ -8,6 +8,10 @@ import { HeroStats, LivePanel, BriefingPanel } from "./panels";
 // neither is needed to show the shell, and no chart code is needed until a chart tab
 // opens.
 const MissionMap = lazy(() => import("./MissionMap"));
+
+// Not an archive id: the picker's "merge everything" entry. `/datasets/load?all=true` reads a
+// bounded slice of every archive into one record -- every sensor, every year.
+const MERGE_ALL = "__merge_all__";
 // charts.jsx exposes NAMED exports only, and React.lazy resolves `module.default`.
 // Wrapping a multi-export module directly yields `undefined` as a component type,
 // which throws inside <Suspense> and (without a boundary) blanks the whole console.
@@ -118,7 +122,7 @@ export default function App() {
   const [day, setDay] = useState(null), [span, setSpan] = useState(1), [busy, setBusy] = useState(false), [err, setErr] = useState(null);
   const [live, setLive] = useState(null), [diagKey, setDiagKey] = useState(0), [yearSel, setYearSel] = useState("all");
   // Bumped whenever the dataset itself is replaced. The reload effect keyed on meta.n alone
-  // would not re-run when you load a demo with the same hotspot count, leaving the cursor day
+  // would not re-run when the next dataset has the same hotspot count, leaving the cursor day
   // null and the calendar empty, so the dataset gets its own version counter.
   const [dataKey, setDataKey] = useState(0);
   // The basemap the console opens on. A slow connection starts on vector tiles -- the lightest
@@ -127,11 +131,17 @@ export default function App() {
   // Curated AOI presets: the picker sets the bbox filter and flies the camera. `fly` carries
   // a nonce so picking the same region twice still re-flies.
   const [regions, setRegions] = useState([]), [presetKey, setPresetKey] = useState(null), [fly, setFly] = useState(null);
+  // Local FIRMS archives offered by the API (see GET /datasets): null while the listing is in
+  // flight, [] when this machine has none.
+  const [archives, setArchives] = useState(null);
   const flyNonce = useRef(0);
   const bb = bbox?.join(",");
 
   useEffect(() => { api("/meta").then(setMeta).catch(() => { /* intro card covers the down state */ }); }, []);
   useEffect(() => { api("/regions").then(setRegions).catch(() => setRegions([])); }, []);
+  // The FIRMS archives on this machine. `null` until the listing arrives, so the opening card
+  // can say it is still looking instead of claiming there are none.
+  useEffect(() => { api("/datasets").then(d => setArchives(d.items || [])).catch(() => setArchives([])); }, []);
 
   // The picked preset, or whichever preset the current bbox matches: a hand-picked box that
   // happens to line up with a preset gets that region's facts too, so the panel describes
@@ -160,26 +170,26 @@ export default function App() {
     setYearSel("all");
     setDiagKey(k => k + 1);
   }, [meta.n, dataKey, bb]);
-  async function loadDemo(mode, region) {
-    // Follow the selected AOI: clicking "Load demo" while a region is active must put the
-    // demo inside that region instead of back in the default box, which would look empty.
-    const target = region ?? preset?.key ?? null;
+  // Open one of the real FIRMS archives this machine holds. The backend reads a bounded slice
+  // of the file and reports what it read, so the console can say how much of the archive is on
+  // screen rather than implying it holds all of it.
+  async function loadArchive(datasetId) {
+    if (!datasetId) return;
     setBusy(true); setDay(null); setErr(null);
-    if (!target) setBbox(null);
     try {
-      const q = new URLSearchParams();
-      if (mode === "transition") q.set("mode", "transition");
-      if (target) q.set("region", target);
-      const r = await fetch("/api/demo" + (q.toString() ? "?" + q : ""), { method: "POST" });
-      if (!r.ok) {
-        const msg = await errMsg(r);
-        throw new Error(msg === "Method Not Allowed" ? "wrong HTTP method" : msg);
-      }
+      // MERGE_ALL is not an id: it asks the API to read every archive at once into one record,
+      // split by size (the API's default budget for a merge is the store's whole row cap).
+      const query = datasetId === MERGE_ALL ? "all=true" : "id=" + encodeURIComponent(datasetId);
+      const r = await fetch("/api/datasets/load?" + query, { method: "POST" });
+      if (!r.ok) throw new Error(await errMsg(r));
       datasetChanged(await r.json());
-    } catch (e) { setErr("Could not load demo data — " + (e && e.message && e.message !== "Failed to fetch" ? e.message : "the API server isn't reachable on :8000. Start it with start.bat / start.sh (backend: uvicorn main:app --port 8000), then try again.")); }
+    } catch (e) {
+      setErr("Could not open that archive — " + (e && e.message && e.message !== "Failed to fetch" ? e.message : "the API server isn't reachable on :8000. Start it with start.bat / start.sh (backend: uvicorn main:app --port 8000), then try again."));
+    }
     setBusy(false);
   }
-  // Any loader that changes the dataset (upload, demo, real FIRMS window) lands here, so the
+  // Any loader that changes the dataset (a local archive, an upload, a real FIRMS window)
+  // lands here, so the
   // memoized queries are dropped and the panels refetch against the new record.
   function datasetChanged(m) {
     setMeta(m); invalidateApiCache(); setDay(null); setDataKey(k => k + 1); setDiagKey(k => k + 1);
@@ -224,8 +234,14 @@ export default function App() {
         <input type="file" multiple accept=".csv,.txt" onChange={upload} />
         <button className="btn primary" disabled={busy}>{busy ? "SYNCING…" : "Upload CSVs"}</button>
       </label>
-      <button className="btn" onClick={() => loadDemo()} disabled={busy}>Load demo</button>
-      <button className="btn" onClick={() => loadDemo("transition")} disabled={busy}>2002–2024</button>
+      {archives?.length > 0 && <select value="" onChange={e => loadArchive(e.target.value)} disabled={busy}
+        title="Open a FIRMS archive from this machine (a bounded slice of the selected file), or merge them all">
+        <option value="">{busy ? "Opening…" : "Local archives…"}</option>
+        {archives.length > 1 && <option value={MERGE_ALL}>
+          All {archives.length} archives merged — every sensor, every year
+        </option>}
+        {archives.map(a => <option key={a.id} value={a.id}>{a.label} — {fmtBytes(a.bytes)}</option>)}
+      </select>}
       {regions.length > 0 && <select value={preset?.key || ""} onChange={e => gotoRegion(e.target.value)}
         title="Fly the map to a curated fire region">
         <option value="">Fly to…</option>
@@ -238,14 +254,28 @@ export default function App() {
     {err && <div className="banner">⚠ {err}</div>}
 
     {!meta.n ? <div className="panel" style={{ margin: 18, maxWidth: 760 }}>
-      <h3>Standby — no data link</h3>
+      <h3>Standby — choose a dataset</h3>
       <p style={{ margin: "4px 0 10px" }}>Pyro-Harmony harmonizes MODIS + VIIRS active-fire records into one burning-activity calendar: climatology, the Sensor Transition Illusion diagnostic, live FIRMS clustering, and an Incident Commander briefing.</p>
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-        <button className="btn primary" onClick={loadDemo} disabled={busy}>{busy ? "Generating…" : "Load 2020–2024 demo"}</button>
-        <button className="btn" onClick={() => loadDemo("transition")} disabled={busy}>Load 2002–2024 transition demo</button>
-      </div>
+      {archives === null ? <div className="hint">Looking for FIRMS archives on this machine…</div>
+        : archives.length ? <>
+          <div className="hint" style={{ marginBottom: 8 }}>
+            Found {archives.length} FIRMS archive{archives.length === 1 ? "" : "s"} on this machine. Opening one reads a
+            bounded slice of it — a few hundred thousand detections spread across the whole file, so the calendar keeps its
+            span — and the console reports what it read.
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {archives.length > 1 && <button className="btn primary" onClick={() => loadArchive(MERGE_ALL)} disabled={busy}
+              title="Read a bounded slice of every archive into one record — all sensors, all years">
+              Merge all {archives.length} archives — every sensor, every year
+            </button>}
+            {archives.map(a => <button key={a.id} className="btn" onClick={() => loadArchive(a.id)} disabled={busy}
+              title={a.name}>{a.label} — {fmtBytes(a.bytes)}</button>)}
+          </div>
+        </> : <div className="hint">
+          No local archives found. Put FIRMS exports in <code>.data/</code> (the directory <code>train.py</code> reads), or upload CSVs below.
+        </div>}
       <div className="hint" style={{ marginTop: 10 }}>
-        Or upload NASA FIRMS archive CSVs (MODIS C6.1 / VIIRS S-NPP + NOAA-20/21). Confidence scales unified, low-confidence drops,
+        Upload NASA FIRMS archive CSVs (MODIS C6.1 / VIIRS S-NPP + NOAA-20/21). Confidence scales unified, low-confidence drops,
         per-sensor rescaling over the overlap period, ESFP footprint normalization.
       </div>
     </div> :
@@ -254,6 +284,55 @@ export default function App() {
         {/* ------- left rail: telemetry ------- */}
         <div className="rail">
           <HeroStats meta={meta} />
+          {/* What is actually open. A local archive is read as a bounded slice, so the panel
+              says which file, which sensor, and how much of it the numbers above came from.
+              A merge of every archive answers the same three questions in aggregate, and lists
+              what each export contributed underneath -- the totals alone would hide how uneven
+              that split is. */}
+          {meta.load && <div className="panel">
+            <h3>Dataset <span className="mut">{meta.load.merged ? "merged" : meta.load.kind}</span></h3>
+            <div className="kv"><span className="mut">{meta.load.merged ? "Archives" : "File"}</span>
+              <b title={meta.load.file} style={{ overflowWrap: "anywhere" }}>{meta.load.file}</b></div>
+            <div className="kv"><span className="mut">{meta.load.merged ? "Sensors" : "Sensor"}</span>
+              <b>{meta.load.merged ? (meta.load.sensors || []).join(" · ") : meta.load.sensor}
+                {!meta.load.merged && meta.load.mb >= 1 && <span className="mut"> · {meta.load.mb} MB</span>}</b></div>
+            <div className="kv"><span className="mut">Slice</span>
+              <b>{fmt(meta.load.rows_kept)} of ~{fmt(meta.load.rows_estimate)} rows{meta.load.spread ? " · spread" : ""}{meta.load.capped ? <span title="The reader stopped at the row cap; the rest of this file was not read"> · capped</span> : ""}</b></div>
+            {meta.load.files && (() => {
+              // The inventory this merge was drawn from (GET /datasets), so the summary can say
+              // how much of the machine the record actually covers, not just what arrived.
+              const found = archives?.length;
+              const skipped = meta.load.skipped || [];
+              const read = meta.load.files.length;
+              return <details style={{ marginTop: 8 }} open={!!meta.load.merged}>
+                <summary className="hint" style={{ cursor: "pointer" }}>
+                  {found != null ? `${read} of ${found} on this machine read` : `${read} file${read === 1 ? "" : "s"} read`}
+                  {skipped.length > 0 && ` · ${skipped.length} skipped`}
+                </summary>
+                <div style={{ marginTop: 6 }}>
+                  {meta.load.files.map((f, i) => {
+                    // What each export contributed to this record: which file, what it is, and
+                    // its slice against the merge's own budget -- the aggregate rows above hide
+                    // how uneven a size-weighted split actually is.
+                    const share = meta.load.rows_read ? Math.round(100 * f.rows_read / meta.load.rows_read) : 0;
+                    return <div key={f.file} style={{ padding: "5px 0", borderTop: i ? "1px solid var(--sh-lite)" : "none" }}
+                      title={`spread: ${f.spread ? "yes" : "no"}`}>
+                      <div style={{ fontSize: 12, overflowWrap: "anywhere" }}><b>{f.file}</b></div>
+                      <div style={{ fontSize: 11, color: "var(--mut)", overflowWrap: "anywhere" }}>
+                        {f.sensor} · {f.kind}{f.mb >= 1 ? ` · ${f.mb} MB` : ""} — {fmt(f.rows_read)} of ~{fmt(f.rows_estimate)} rows · {share}% of the slice
+                      </div>
+                    </div>;
+                  })}
+                  {skipped.map(f => <div key={f.file} style={{ padding: "5px 0", borderTop: "1px solid var(--sh-lite)" }}>
+                    <div style={{ fontSize: 12, overflowWrap: "anywhere" }}><b>{f.file}</b></div>
+                    <div style={{ fontSize: 11, color: "var(--bad)", overflowWrap: "anywhere" }}>
+                      skipped — {f.reason || "unreadable"}
+                    </div>
+                  </div>)}
+                </div>
+              </details>;
+            })()}
+          </div>}
           <div className="panel">
             <h3>Selection</h3>
             <div className="kv"><span className="mut">AOI</span><b>{bbox ? `${bbox[0].toFixed(2)}, ${bbox[1].toFixed(2)} → ${bbox[2].toFixed(2)}, ${bbox[3].toFixed(2)}` : "global"}</b></div>
@@ -267,10 +346,10 @@ export default function App() {
             <div style={{ display: "flex", gap: 4, marginTop: 8 }}>
               {[1, 3, 7, 14].map(n => <button key={n} className={"btn sm" + (span === n ? " on" : "")} onClick={() => setSpan(n)}>{n}d</button>)}
             </div>
-            {preset && !cal.length && <div className="hint" style={{ marginTop: 9 }}>
-              No detections in this AOI yet.
-              <button className="btn sm" style={{ marginTop: 6, width: "100%" }} disabled={busy}
-                onClick={() => loadDemo("standard", preset.key)}>Load demo for {preset.name}</button>
+            {bbox && !cal.length && <div className="hint" style={{ marginTop: 9 }}>
+              No detections in this AOI — the open archive may not cover it.
+              <button className="btn sm" style={{ marginTop: 6, width: "100%" }}
+                onClick={() => gotoRegion("")}>Clear area</button>
             </div>}
           </div>
           <div className="panel">

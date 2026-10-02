@@ -13,7 +13,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { MAX_FRAME_MS, SPIN_DEG_PER_SEC, SPIN_DEG_PER_SEC_LOW_END, spinHolds, spinRate, spinStep } from "../src/autoRotate.js";
+import { AXIAL_TILT_DEG, MAX_FRAME_MS, SPIN_DEG_PER_SEC, SPIN_DEG_PER_SEC_LOW_END, spinHolds, spinRate, spinStep } from "../src/autoRotate.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const failures = [];
@@ -98,7 +98,15 @@ check("the clamp is a quarter of a second", MAX_FRAME_MS, 250);
 check("an idle map is stepped", spinHolds(false), false);
 check("a gesture, or an animated camera move, is not fought", spinHolds(true), true);
 
-// 6. Wiring. The drift has to run on animation frames — a timer cannot be a speed — and it has
+// 6. The axis. A bearing set with the camera level turns the globe about a vertical line — a
+//    spinning top — so the drift pitches the camera to Earth's own obliquity for as long as it
+//    runs, and levels it again when it stops. Pinned as a range rather than a number: the point
+//    is that it is Earth's axial tilt and not someone's idea of a jaunty angle.
+check("the drift turns the globe on its real axis", AXIAL_TILT_DEG >= 22 && AXIAL_TILT_DEG <= 25, true);
+check("…which is the planet's 23.4° of obliquity", Math.abs(AXIAL_TILT_DEG - 23.44) < 0.01, true);
+check("and it is not so steep that it reads as a camera move", AXIAL_TILT_DEG < 30, true);
+
+// 7. Wiring. The drift has to run on animation frames — a timer cannot be a speed — and it has
 //    to mark its own rotation so the frame-rate sampler does not treat it as a gesture.
 {
   const src = readFileSync(join(here, "..", "src", "MissionMap.jsx"), "utf8");
@@ -111,6 +119,8 @@ check("a gesture, or an animated camera move, is not fought", spinHolds(true), t
   // throws inside the frame callback and the globe simply stops turning.
   check("it does not call an API the public Map does not have", /isEasing/.test(src), false);
   check("its own rotation does not arm the sampler", /if \(spinningRef\.current\) return;/.test(src), true);
+  check("the tilt is applied to the camera, not to the data", /easeTo\(\{ pitch: AXIAL_TILT_DEG/.test(src), true);
+  check("and the camera is levelled again when the drift stops", /getPitch\(\) - AXIAL_TILT_DEG/.test(src), true);
 }
 
 console.log(failures.length ? `\n${failures.length} FAILED` : "\norbital drift: all checks passed");

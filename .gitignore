@@ -11,10 +11,9 @@ dist/
 *.csv
 
 # The FIRMS training archive (~10 GB of NASA area exports) and the forecast checkpoint
-# trained from it.  Both are local: `python firecal/backend/train.py` rebuilds the
-# checkpoint from whatever is in the directory, and the API works without either.
-Data Training/
-data_training/
+# trained from it. Both are local: `python firecal/backend/train.py` rebuilds the
+# checkpoint from `.data/`, and the API works without either.
+.data/
 firecal/backend/model/
 
 # Local configuration and secrets
@@ -24,6 +23,11 @@ firecal/backend/model/
 
 # Local workspace scaffold (reference only — not part of the product)
 github setup/
+
+# Agent / assistant local state (per-machine caches, transcripts, permissions)
+.freebuff/
+.claude/
+.claude-flow/
 
 # Editor and OS cruft
 .DS_Store

@@ -35,3 +35,13 @@ jobs:
           cache-dependency-path: firecal/frontend/package-lock.json
       - run: npm ci
       - run: npm run build
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Zero-dependency: parses the test files and the docs, so no pip install.
+      - run: python scripts/check-doc-figures.py

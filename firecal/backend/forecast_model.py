@@ -51,10 +51,9 @@ MIN_CELL_DAYS = 25
 # Sequence length the LSTM sees; the endpoint builds the same window when it fine-tunes.
 WINDOW = 30
 
-# Where the archive normally lives.  Searched in this order, relative to the repository
-# root, this file's directory, and the working directory -- the download folder comes out
-# of a browser as `Data Training`, but a script may well have made `data_training`.
-DATA_DIRS = ("Data Training", "data_training", "data-training")
+# Where the archive normally lives. Searched relative to the repository root, this file's
+# directory, and the working directory.
+DATA_DIRS = (".data",)
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent

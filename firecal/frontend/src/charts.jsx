@@ -142,7 +142,9 @@ export function DiagnosticPanel({ bbox, refreshKey, embedded }) {
           ESFP ratio {cal.esfp_ratio_viirs_to_modis ?? "—"}.
         </div>}
         {!hasPre && <div className="hint">
-          This dataset starts after 2012, so the illusion can't be measured. Load the transition demo (or 2002+ archives) to see it.
+          {/* The endpoint says *why* in words, because a merged modern archive hits this every
+              time and "n/a" alone reads like a bug rather than a question that was not asked. */}
+          {d.note || "This dataset starts after 2012, so the illusion can't be measured."} Open an archive that reaches back past the sensor transition to see it.
         </div>}
       </div>
     </>;

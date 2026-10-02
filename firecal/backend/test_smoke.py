@@ -207,6 +207,28 @@ RAW = pd.DataFrame({
 })
 
 
+def test_a_platform_name_is_not_a_sensor():
+    """FIRMS names the instrument differently per product: `instrument` is `VIIRS` in the
+    NOAA-20/21 C2 files but `SNPP` in the S-NPP ones, which names the satellite. Taken
+    literally that made VIIRS S-NPP a third sensor -- invisible to `/diagnostic`, rescaled
+    against itself, and handed MODIS's 1 km nadir cell by `_esfp`, so its footprint area came
+    out 7.1x too large. Three satellites, one instrument: they are counted as one.
+    """
+    snpp = RAW.copy()
+    snpp["instrument"] = "SNPP"        # a real S-NPP export: one product, one value throughout
+    d = main.harmonize(snpp)
+    assert set(d.sensor) == {"VIIRS"}
+    assert main.sensor_of("SNPP") == "VIIRS"
+    assert main.sensor_of("viirs") == "VIIRS"          # case is not a distinction
+    assert main.sensor_of("N20") == "VIIRS"            # and the platform column's spelling
+    assert main.sensor_of("MODIS") == "MODIS"
+    # The nadir cell follows the instrument: an S-NPP detection is a 375 m one, so a wide-scan
+    # detection is worth several standard pixels -- not the 1.0 a MODIS cell would have given.
+    assert d["esfp"].max() > 5.0
+    # An unrecognized product string still passes through, as it always has.
+    assert main.sensor_of("SLSTR") == "SLSTR"
+
+
 def test_harmonize_without_geometry_counts_the_same():
     """The training pass skips the footprint columns to avoid ~80M wasted clip passes.
 
@@ -229,7 +251,7 @@ def trained(tmp_path, monkeypatch):
     import forecast_model as fm
     import train
 
-    archive = tmp_path / "Data Training"
+    archive = tmp_path / ".data"
     archive.mkdir()
     days, rows = [], []
     for year in (2024, 2025):                       # a season, twice, so the cell is storable

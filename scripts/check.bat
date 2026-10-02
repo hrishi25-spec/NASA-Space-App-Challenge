@@ -1,9 +1,18 @@
 @echo off
-rem The same checks CI runs: backend tests, then the frontend production build.
+rem The same checks CI runs: doc figures, backend tests, then the frontend production build.
 rem Dependency setup is the launcher's job: run.py.
 setlocal
 cd /d "%~dp0.."
 
+echo == doc figures ==
+if exist "firecal\backend\.venv\Scripts\python.exe" (
+    "firecal\backend\.venv\Scripts\python.exe" scripts\check-doc-figures.py
+) else (
+    python scripts\check-doc-figures.py
+)
+if errorlevel 1 goto fail
+
+echo.
 echo == backend tests ==
 cd firecal\backend
 if exist ".venv\Scripts\python.exe" (
@@ -21,7 +30,7 @@ call npm run build
 if errorlevel 1 goto fail
 
 echo.
-echo OK - backend tests and frontend build both passed.
+echo OK - doc figures, backend tests and frontend build all passed.
 endlocal & exit /b 0
 
 :fail

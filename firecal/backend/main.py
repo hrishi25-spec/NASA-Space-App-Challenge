@@ -33,6 +33,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+import archives
 import forecast_model
 from demo import BOX, make_demo, make_transition_demo
 from regions import REGIONS, region_box, region_keys
@@ -86,6 +87,15 @@ LIVE_MAX_ROWS = 200_000             # safety cap for one live ingest
 MAX_FEED_BYTES = 64 * 1024 * 1024   # safety cap on one outbound FIRMS download
 CLUSTER_MAX_POINTS = 60_000         # detections fed to one DBSCAN pass (strided above this)
 CLUSTER_RETURN = 300                # clusters returned; only these get a convex hull
+
+# Where the real FIRMS exports are looked for: the repository's git-ignored `.data/`, so
+# the archives the model was trained on are the ones the
+# console can open. Empty and absent are both normal -- there is an upload path and a live
+# feed without it, so this is a list of directories to try, not a requirement.
+ARCHIVE_ROOTS = archives.roots(Path(__file__).resolve().parent.parent.parent)
+# One bounded archive read at a time: it is seconds of pandas work, and two at once would
+# double peak memory for no benefit.
+_LOAD_SLOTS = threading.Semaphore(1)
 
 # The dev server proxies /api to this process, so the browser talks same-origin and needs
 # no CORS grant at all. Defaulting to `*` let any web page the operator visits drive
@@ -200,11 +210,20 @@ _CACHE_HELD = 0
 _ACCEPTS_GZIP: contextvars.ContextVar = contextvars.ContextVar("accepts_gzip", default=False)
 
 
+# What the open dataset was sliced from, when it was opened from a local archive. A module
+# global like `DF` itself, because that is exactly what it is: a fact about the current dataset.
+_LOAD_INFO: dict | None = None
+
+
 def _invalidate() -> None:
     """Drop every derived cache. Call after DF changes."""
-    global _CACHE_HELD
+    global _CACHE_HELD, _LOAD_INFO
     _AGG_CACHE.clear()
     _CACHE_HELD = 0
+    # A note about where the dataset came from is dropped with the caches: every other way of
+    # replacing the dataset (upload, archive pull, demo, clear) passes through here, and a
+    # "this is a slice of that archive" line must never outlive the slice it describes.
+    _LOAD_INFO = None
 
 
 # Starlette's own encoder settings, so a cache hit is byte-identical to a cache miss --
@@ -317,6 +336,33 @@ def read_firms_csv(blob: bytes) -> pd.DataFrame:
 # Scan and track reflect actual pixel size."
 NADIR_KM2 = {"MODIS": 1.0, "VIIRS": 0.140625}
 
+# What FIRMS calls the sensor, per product, mapped onto the two instruments this API knows.
+#
+# It is not one string. The real exports in `.data/` say `instrument = VIIRS` for the
+# NOAA-20 (J1V) and NOAA-21 (J2V) C2 files and `instrument = MODIS` for C6.1 -- but the
+# S-NPP (SV-C2) files say `SNPP`, naming the *platform* instead of the instrument. Copying that
+# into `sensor` gave every S-NPP detection a sensor of its own, which quietly broke three things
+# at once: `/diagnostic` splits on `sensor == "MODIS"` / `== "VIIRS"`, so a third name is
+# invisible to the illusion diagnostic; `_esfp` fell through to MODIS's 1 km nadir cell, so a
+# 375 m detection's footprint came out 7.1x too large (and with it HFII); and the per-sensor
+# rescaling learned a ratio against a sensor that is the same instrument as VIIRS.
+#
+# Platform is not instrument. Suomi NPP, NOAA-20 and NOAA-21 are three satellites carrying the
+# same VIIRS, and the entire premise of the harmonization is that a fire any of them saw is
+# counted once. Anything unlisted passes through unchanged, which is the old behaviour.
+SENSOR_ALIASES = {
+    "MODIS": "MODIS",
+    "VIIRS": "VIIRS",
+    "SNPP": "VIIRS", "S-NPP": "VIIRS", "SUOMI NPP": "VIIRS", "NPP": "VIIRS",
+    "N20": "VIIRS", "N21": "VIIRS", "NOAA-20": "VIIRS", "NOAA-21": "VIIRS",
+}
+
+
+def sensor_of(stated: str, default: str = "MODIS") -> str:
+    """The instrument a FIRMS product string names, or `default` if it names none."""
+    key = str(stated).strip().upper()
+    return SENSOR_ALIASES.get(key, key or default)
+
 
 def _esfp(scan, track, sensor):
     """Equivalent Standard Fire Pixels (footprint expansion ratio) and the physical
@@ -354,7 +400,7 @@ def harmonize(raw: pd.DataFrame, geometry: bool = True) -> pd.DataFrame:
     bt_col = "bright_ti4" if viirs else "brightness"
     sensor = "VIIRS" if viirs else "MODIS"
     if "instrument" in d.columns and d["instrument"].notna().any():
-        sensor = str(d["instrument"].dropna().iloc[0]).upper()
+        sensor = sensor_of(d["instrument"].dropna().iloc[0], default=sensor)
     #    numeric confidence if parseable (MODIS 0-100), else l/n/h map (VIIRS); unknown -> dropped
     conf = pd.to_numeric(d["confidence"], errors="coerce")
     if conf.isna().any():
@@ -470,10 +516,112 @@ async def upload(files: list[UploadFile] = File(...), demo_transition: bool = Fa
     return meta()
 
 
+@app.get("/datasets")
+def list_datasets():
+    """The FIRMS archives sitting on this machine, smallest first.
+
+    The picker the console opens on. Absolute paths are not in the response: a relative id and
+    a byte count are all a caller needs, and a path is not a thing to publish. An empty list is
+    the normal answer on a fresh clone and in the container image, where the archives (10 GB,
+    git-ignored) simply are not there.
+    """
+    return {"items": [archives.public(item) for item in archives.scan_all(ARCHIVE_ROOTS)]}
+
+
+@app.post("/datasets/load")
+def load_dataset(id: str = None, limit: int = None, spread: bool = True, all: bool = False):
+    """Open local archives as the working dataset: one by id, or every archive merged.
+
+    `limit` is rows *read*, and the reader stops as soon as it has them, so a 1.5 GB file costs
+    about what a 50 MB one does. Those rows come from evenly spaced offsets across the whole
+    file (`spread=false` reads from the top instead): a dense head of a global export is two
+    weeks, and two weeks cannot answer a calendar question. What was read is reported back in
+    `load` -- rows read, the file's estimated total, whether it was spread -- because "a slice
+    of a year" and "the whole archive" are different datasets, and the console says which one
+    is on screen.
+
+    `all=true` merges the whole directory instead of one file: every sensor, every year, one
+    record. The same budget is split across the files by size (archives.allocate), because
+    these exports are wildly unequal -- one 136 KB window beside a 1.87 GB year -- and a merged
+    record whose balance is set by which file was downloaded first is worse than no merge. The
+    default budget for a merge is the store's own row cap rather than the single-file default,
+    because a record meant to cover every year is the case where the cap is the budget.
+
+    Ids come from GET /datasets and are resolved inside that same inventory: no request value
+    is ever joined into a path (see archives.find). POST, so the Origin gate applies.
+    """
+    global DF, _LOAD_INFO
+    items = archives.scan_all(ARCHIVE_ROOTS)
+    if all:
+        if not items:
+            raise HTTPException(400, "no local archives to merge; list them with GET /datasets")
+        merged = True
+    else:
+        item = archives.find(items, id or "")
+        if item is None:
+            raise HTTPException(404, "no such local archive; list them with GET /datasets")
+        items, merged = [item], False
+    limit = min(max(limit or (MAX_ROWS if merged else archives.DEFAULT_LIMIT),
+                    archives.MIN_LIMIT), MAX_ROWS)
+    if not _LOAD_SLOTS.acquire(blocking=False):
+        raise HTTPException(429, "another archive is opening; retry in a moment")
+    try:
+        if merged:
+            sliced = archives.read_merge(items, limit, spread=spread)
+        else:
+            try:
+                sliced = archives.read_slice(items[0]["_path"], limit, spread=spread)
+            except Exception as e:
+                raise HTTPException(400, f"{items[0]['name']}: not a readable FIRMS CSV ({e})")
+    finally:
+        _LOAD_SLOTS.release()
+    try:
+        parts = [h for h in (harmonize(frame) for frame in sliced["frames"]) if not h.empty]
+    except ValueError as e:      # a CSV in the folder that is not a FIRMS export
+        raise HTTPException(400, f"{items[0]['name']}: {e}")
+    if not parts:
+        raise HTTPException(400, f"no usable rows in {sliced['rows']:,} of the "
+                                 f"{len(sliced.get('files') or [items[0]])} archive(s) read "
+                                 "(all low-confidence or not FIRMS columns)")
+    DF = pd.concat(parts).drop_duplicates(["lat", "lon", "time", "sensor"]).reset_index(drop=True)
+    if len(DF) > MAX_ROWS:
+        DF = DF.tail(MAX_ROWS).reset_index(drop=True)
+    _invalidate()
+    # `rows_estimate` is measured from each file's size and its own record width, and the console
+    # prints it as the approximate total the slice came out of: the difference between the three
+    # weeks it holds and the year it does not is exactly what an operator would otherwise
+    # misread off the calendar. Set after _invalidate(), which clears it.
+    _LOAD_INFO = {
+        "rows_read": sliced["rows"], "rows_kept": int(len(DF)),
+        "rows_estimate": sliced["estimate"], "spread": sliced["spread"],
+        "limit": limit, "merged": merged,
+    }
+    if merged:
+        sensors = sorted({entry["sensor"] for entry in sliced["files"]})
+        _LOAD_INFO.update({
+            "file": f"{len(sliced['files'])} archives · {len(sensors)} sensors",
+            "sensors": sensors, "archives": len(sliced["files"]),
+            "files": sliced["files"], "skipped": sliced["skipped"],
+        })
+    else:
+        item = items[0]
+        _LOAD_INFO.update({
+            "file": item["name"], "sensor": item["sensor"], "kind": item["kind"],
+            "mb": item["mb"], "capped": sliced["capped"],
+        })
+    return meta()
+
+
 @app.post("/demo")
 def demo(mode: str = "standard", region: str = None):
-    """Generate the synthetic demo record. `region` scopes it to a preset AOI, so the
-    demo -- and therefore every panel -- works for any region in the catalog."""
+    """Generate the synthetic demo record.
+
+    Not offered anywhere in the console: the UI opens the real archives on this machine (GET
+    /datasets) or an upload. This stays because it is the only dataset that exists on a machine
+    with no archives at all, which is every CI run and every fresh clone -- it is the fixture
+    the test suite is built on, and it keeps `/demo` a documented API endpoint rather than a
+    hidden path in the code. `region` scopes it to a preset AOI, so the panels have something to
+    show for any region in the catalog."""
     global DF
     if region is not None and region not in REGIONS:
         raise HTTPException(400, f"unknown region {region!r}; expected one of: {region_keys()}")
@@ -583,13 +731,18 @@ def meta():
     # this server enforces. The two were separate hand-kept lists, which is a 400 waiting
     # for whoever edits one of them.
     if DF.empty: return {"n": 0, "live_regions": LIVE_REGIONS}
-    return {"n": len(DF), "live_regions": LIVE_REGIONS,
-            "start": str(DF.date.min().date()), "end": str(DF.date.max().date()),
-            "sensors": DF.groupby("sensor").size().to_dict(),
-            "bounds": [DF.lat.min(), DF.lon.min(), DF.lat.max(), DF.lon.max()],
-            "hfi": round(float(DF.frp.mul(DF.esfp).sum()), 1),
-            "esfp": round(float(DF.esfp.sum()), 1),
-            "pixels": int(len(DF))}
+    m = {"n": len(DF), "live_regions": LIVE_REGIONS,
+         "start": str(DF.date.min().date()), "end": str(DF.date.max().date()),
+         "sensors": DF.groupby("sensor").size().to_dict(),
+         "bounds": [DF.lat.min(), DF.lon.min(), DF.lat.max(), DF.lon.max()],
+         "hfi": round(float(DF.frp.mul(DF.esfp).sum()), 1),
+         "esfp": round(float(DF.esfp.sum()), 1),
+         "pixels": int(len(DF))}
+    # Present only when the dataset came from a local archive, and carried by every later GET
+    # as well as the load response, so the console's Dataset panel survives a page refresh
+    # instead of quietly claiming it no longer knows what is on screen.
+    if _LOAD_INFO: m["load"] = _LOAD_INFO
+    return m
 
 
 @app.get("/regions")
@@ -859,8 +1012,20 @@ def diagnostic(bbox: str = None):
     growth = round((post_c / pre_c - 1) * 100, 1) if pre_c > 0 else None
     adj_growth = round((post_k / pre_k - 1) * 100, 1) if pre_k > 0 else None
     scale = round(post_c / post_k, 3) if post_k > 0 else None   # era inflation of the raw count
+    # The illusion is a question about the 2011→2012 transition, so it needs a record on both
+    # sides of it. A recent-only archive -- which is what merging a modern `.data/`
+    # directory produces -- cannot answer it, and the honest answer is the sentence rather than
+    # a row of zeros that reads as "no fire burned in 2011". The chart below is still true: the
+    # per-year bars are what was detected each year, artifact or not.
+    span = (f"{d.date.min().date()} → {d.date.max().date()}" if len(d) else "no data")
+    note = None
+    if growth is None or adj_growth is None:
+        note = (f"The illusion measures the VIIRS deployment artifact, so it needs detections "
+                f"from both before 2012 and in the 2012–2015 overlap. This record "
+                f"({span}) has {pre_n} pre-2012 day(s) and {post_n} overlap day(s), so the "
+                f"growth figures are n/a — the per-year bars below are still real.")
     return {"series": series, "observed_growth_pct": growth, "adjusted_growth_pct": adj_growth,
-            "viirs_scaling": scale,
+            "viirs_scaling": scale, "note": note,
             "artifact_pct": None if (growth is None or adj_growth is None) else round(growth - adj_growth, 1),
             "calibration": cal or None,
             "stats": {"hfi": round(float(d.frp.mul(d.esfp).sum()), 1),
@@ -1287,15 +1452,28 @@ async def strip_api_prefix(request, call_next):
 #   * `worker-src ... blob:` is for MapLibre, which spawns its geometry worker; the bundled
 #     worker is same-origin, and the blob form is what it falls back to.
 #
+# Every tile host is named BOTH bare and wildcarded, and that is not redundancy: a CSP host
+# source of the form `*.example.com` matches subdomains only, never `example.com` itself. The
+# CARTO vector style document is served from the bare `basemaps.cartocdn.com` while its sprite,
+# glyphs and tiles come from the `tiles.basemaps.cartocdn.com` subdomain -- spell out only the
+# wildcard and the basemap fetch is refused, which is a blank map with no hint in the UI.
+#
+# Esri appears under `img-src` AND `connect-src` for the same reason MapLibre has two ways to
+# load a picture: an `<img>` request when it will not need to re-validate the tile, and `fetch`
+# when it might. Which one runs depends on `refreshExpiredTiles`, a rendering option the map is
+# free to change, so both paths are allowed rather than the one this build happens to take.
+#
 # This header only ever constrains documents *this* process serves, so it changes nothing in
 # development: there the page is served by Vite on :5173 and only its /api calls come here.
+# `firecal/backend/test_security.py` checks this policy against the hosts the frontend really
+# loads, so adding a basemap without allowing it here fails the suite rather than the map.
 SECURITY_HEADERS = {
     "Content-Security-Policy": "; ".join([
         "default-src 'self'",
         "script-src 'self'",
         "style-src 'self' 'unsafe-inline'",
-        "img-src 'self' data: blob: https://server.arcgisonline.com https://*.basemaps.cartocdn.com",
-        "connect-src 'self' https://*.basemaps.cartocdn.com",
+        "img-src 'self' data: blob: https://server.arcgisonline.com https://basemaps.cartocdn.com https://*.basemaps.cartocdn.com",
+        "connect-src 'self' https://server.arcgisonline.com https://basemaps.cartocdn.com https://*.basemaps.cartocdn.com",
         "worker-src 'self' blob:",
         "font-src 'self' data:",
         "object-src 'none'",

@@ -56,15 +56,21 @@ Four consequences, and the requirements that answer them:
 |---|---|---|
 | **Earth-science analyst / researcher** | "Show me the long-term burning season here, and how much of the trend is instrumentation." | Calendar, Seasonal climatology, Illusion diagnostic, bbox selection |
 | **Land manager / responder** | "Where is it burning right now, what kind of fuel, and what should we do first?" | Live FIRMS feed, map clusters, IC briefing (Situation + Actions) |
-| **Hackathon judge / reviewer** | "Prove the science is real and the engineering works." | Demo buttons, Method section, test suite, measured performance |
+| **Hackathon judge / reviewer** | "Prove the science is real and the engineering works." | Real-archive dataset picker, Method section, test suite, measured performance |
 | **Operator** | "Get this running on my machine in one command." | `run.py` / `start.sh` / `start.bat` |
 
 ## 5. Product scope
 
-Two demo datasets ship with the app so every pillar is demonstrable with no downloads:
+**The console opens on real data.** At startup it lists the NASA FIRMS exports it finds in `.data/` — the same directory `train.py` reads — and the operator opens one, or merges the whole directory into a single record covering every VIIRS, every MODIS and every year it covers. Every number in every panel is then computed from those files. There is no synthetic dataset anywhere in the UI.
 
-- **2020–2024 standard demo** — a plausible 5-year bilateral record (used for the default console state).
-- **2002–2024 transition demo** — MODIS-only era into the VIIRS ramp-up; the dataset that makes the illusion visible. Measured on load: **57,867 hotspots** (MODIS 18,310 / VIIRS 39,557), 2002-01-19 → 2024-12-21, HFII 1,771,574.5, ESFP 136,409.8.
+Those exports are large (188 KB to 1.87 GB), so opening one reads a **bounded slice** (750,000 rows by default, from evenly spaced offsets across the file) and the console reports exactly what it loaded, in a **Dataset** panel. A calendar drawn from a sample is a sample, and the difference between the record on screen and the record on disk is stated rather than implied.
+
+The synthetic records are still generated, and still part of the product, as **API fixtures rather than UI features** — nothing in the console offers them:
+
+- **2020–2024 standard** — a plausible 5-year bilateral record.
+- **2002–2024 transition** — MODIS-only era into the VIIRS ramp-up; the dataset that makes the illusion visible. Measured on load: **57,867 hotspots** (MODIS 18,310 / VIIRS 39,557), 2002-01-19 → 2024-12-21, HFII 1,771,574.5, ESFP 136,409.8.
+
+They are what the test suite loads (a checkout with no `.data/` has nothing else), and every reference figure quoted in these docs is measured on them.
 
 The console is a single screen: left rail (telemetry, selection, clustering), centre stage (the globe⇄map), right rail (briefing, anomalies), and a full-width analytics drawer with five tabs.
 
@@ -83,7 +89,11 @@ Status key: **✅ implemented** · **⚠️ partial** · **❌ not started**. "V
 | FR-1.5 | Rescale per-sensor daily counts over the overlap period | ✅ | Corrects the VIIRS-sees-more-fires bias before summing |
 | FR-1.6 | Reject unreadable/oversized/too-many files with a precise reason | ✅ | HTTP 400 with the sanitised filename + what is missing; HTTP 413 for an oversized request |
 | FR-1.7 | Never let a filename select server behaviour | ✅ | Verified: junk named `demo_transition.csv` used to return 200 with the full demo and ignore the bytes; now 400, and the demo loads via `?demo_transition=true` |
-| FR-1.8 | Generate synthetic data for demo/testing | ✅ | `demo.py` writes real CSVs and feeds the identical pipeline |
+| FR-1.8 | Generate synthetic data for demo/testing | ✅ | `demo.py` writes real CSVs and feeds the identical pipeline. Deliberately **not** reachable from the UI: it is the suite's fixture, kept as a documented endpoint so a checkout with no archive can still be exercised |
+| FR-1.9 | Offer this machine's real archives as selectable datasets | ✅ | `GET /datasets` walks `.data/` recursively, smallest file first, labelling each by sensor (`VIIRS NOAA-20`, `MODIS C6.1`, …) and kind (archive / near-real-time). The response publishes **no absolute path** — not even the roots that were walked — and an empty list is the normal answer in CI, in the image and on a fresh clone. `POST /datasets/load` resolves the id **inside that inventory** (plus a containment check against the root), so no request string is ever joined onto a path: traversal, absolute paths and sibling files are all 404 |
+| FR-1.10 | Open a multi-gigabyte archive without reading all of it, and say what was read | ✅ | At most `limit` rows (750,000 default, clamped to the store's 2,000,000) are **read** — the reader stops at the cap — taken from up to 24 evenly spaced byte offsets across the file so the slice spans the record rather than its opening fortnight, with a sequential fallback when a seek lands mid-record. `meta.load` reports file, sensor, rows read/kept, the file's estimated total, whether the read was spread, and the limit; the Dataset panel shows it, and the report survives a page refresh because it describes the dataset rather than the response. Measured: 308 MB archive → 750,000 read / 712,800 kept / ~3,830,728 estimated, span 2024-09-30 → 2025-09-17, ~6 s; 1,384 MB → 750,000 read / ~16,605,695 estimated, span 2024-01-17 → 2024-09-20, ~9 s |
+| FR-1.11 | Merge every archive into one record — all sensors, all years | ✅ | `POST /datasets/load?all=true` reads a bounded slice of every export and concatenates them. The budget (default the store's 2,000,000-row cap) is split **by file size**, because these exports are unequal by three orders of magnitude and an even split would spend it on a 136 KB window while a 1.87 GB year contributed the same few thousand rows. Per-file accounting (`load.files[]`) and per-file failures (`load.skipped[]`) are reported; merging an empty directory is a 400. Measured on this machine's 15 files (~125M rows, 2023-09-30 → 2026-09-22): **1,799,078 detections, 2023-09-30 → 2026-07-05, MODIS 131,226 + VIIRS 1,667,852, ~37 s**, a four-year calendar and a 1,010-day climatology |
+| FR-1.12 | Count sensors by instrument, not by platform | ✅ | FIRMS states the instrument per product — `instrument` is `VIIRS` in the NOAA-20/21 C2 exports and `SNPP` in the S-NPP ones, which names the satellite. Taken literally that made VIIRS S-NPP a third sensor: invisible to `/diagnostic`, rescaled against itself, and handed MODIS's 1 km nadir cell by `_esfp`, so its footprint area (and HFII) came out 7.1× too large. Platform names now map to the instrument they carry, so a merged record reports **two** sensors. Verified on the real directory: 15 files / 4 platforms → MODIS + VIIRS |
 
 ### FR-2 — Burning activity calendar
 
@@ -109,7 +119,7 @@ Status key: **✅ implemented** · **⚠️ partial** · **❌ not started**. "V
 | FR-3.7 | Overlay live-feed points and clusters | ✅ | Pale-gold points, live polygons |
 | FR-3.8 | Chronological readout never covers required attribution | ✅ | Readout and view controls are one bottom-left column whose height clears the notice by measurement, not by assumption: 0 px overlap at 1440, 1200, 900, 820, 700, 640, 560 and 500 px viewports, with the notice collapsed, expanded, and wrapped to four lines |
 | FR-3.9 | Map engine must load under Vite (worker + dep pre-bundling) | ✅ | Worker URL handed to MapLibre explicitly, otherwise every source stays unparsed |
-| FR-3.10 | Camera controls beyond zooming out | ✅ | **Fly to AOI** fits the drawn box (disabled without one), **Reset orbit** restores the default global attitude (centre 0,0, bearing 0, pitch 0), **Auto-rotate** drifts the bearing at a rate of **6°/s** (3°/s on a low-end probe) accumulated from frame times, so the same second of drift is the same number of degrees at 60 fps or at 10 fps, and a frame that took longer than 250 ms advances one clamped slice instead of teleporting the globe. It holds whenever another move owns the camera (a gesture, or Fly to AOI / Globe view / Reset orbit), and its own rotation never arms the adaptive-detail sampler. Verified live in a real browser: the bearing advanced monotonically in the clamped step this probe's rate predicts, **Reset orbit completed back to 0.000°** while the drift was on, the drift then resumed from there, toggling it off froze the bearing, and `data-quality` was never set |
+| FR-3.10 | Camera controls beyond zooming out | ✅ | **Fly to AOI** fits the drawn box (disabled without one), **Reset orbit** restores the default global attitude (centre 0,0, bearing 0, pitch 0), **Auto-rotate** drifts the bearing at a rate of **6°/s** about **Earth's real axis** — the camera is eased to the planet's **23.44° obliquity** while the drift runs, so the globe turns the way Earth turns and the pole traces the small circle it traces from orbit, rather than spinning like a top about a vertical line, and is levelled again on stop **only if** the pitch is still the one the drift set (a camera the operator tilted by hand is left alone) — (3°/s on a low-end probe) accumulated from frame times, so the same second of drift is the same number of degrees at 60 fps or at 10 fps, and a frame that took longer than 250 ms advances one clamped slice instead of teleporting the globe. It holds whenever another move owns the camera (a gesture, or Fly to AOI / Globe view / Reset orbit), and its own rotation never arms the adaptive-detail sampler. Verified live in a real browser: the bearing advanced monotonically in the clamped step this probe's rate predicts, **Reset orbit completed back to 0.000°** while the drift was on, the drift then resumed from there, toggling it off froze the bearing, and `data-quality` was never set |
 
 ### FR-4 — Multi-decadal climatology (pillar 1)
 
@@ -128,7 +138,7 @@ Status key: **✅ implemented** · **⚠️ partial** · **❌ not started**. "V
 | FR-5.2 | Quantify the post-2012 surge before and after harmonization | ✅ | Demo: **+304.0 % raw → +11.7 % harmonized**, artifact **292.3 pp** |
 | FR-5.3 | Derive the VIIRS scaling factor from the overlap era | ✅ | Detection ratio measured on days both sensors flew (2012–2015), applied so a fire both sensors saw is counted once; demo factor **3.618** |
 | FR-5.4 | Report cross-sensor calibration quality | ✅ | 9,767 matchups, daily-count R² **0.867**, RMSE **2.91 MW**, FRP ratio 0.997, ESFP ratio 0.948 |
-| FR-5.5 | State plainly when the illusion is unmeasurable | ✅ | If the dataset starts after 2012 the panel says so and points at the transition demo |
+| FR-5.5 | State plainly when the illusion is unmeasurable | ✅ | The growth figures need detections on both sides of the 2011→2012 transition, so a modern record cannot produce them. The endpoint returns a `note` naming the eras it needs, the days of each the record has, and that the per-year bars are still real — rather than the zeros that used to read as "no fire burned in 2011", which is what a merged 2023-onward archive hit every time |
 | FR-5.6 | Never render `NaN` for a sensor-year with no detections | ✅ | Missing per-year keys default to 0 (was `NaN` bars — fixed) |
 
 ### FR-6 — Clustering (pillar 3a)
@@ -159,7 +169,7 @@ Status key: **✅ implemented** · **⚠️ partial** · **❌ not started**. "V
 | FR-8.1 | Threat level + score | ✅ | `max_z + 0.5·streak_days + min(2, recent_mean/25)` → Low / Watch (≥3.5) / Elevated / Critical (≥6) |
 | FR-8.2 | Critical streaks (z ≥ 2σ) with click-through | ✅ | Consecutive days above threshold, 2-day gap tolerance; clicking a streak moves the map |
 | FR-8.3 | Fuel-biome stratification | ✅ | K-means k=4 on projected position + FRP. Demo: Forest 19,271 fires (mean FRP 12.9 MW, spread ≈76.5 km), Agricultural Crop Residue 16,240, Savanna 12,475, Mediterranean Shrubland 11,036 |
-| FR-8.4 | Rule-based recommendations | ✅ | 3 in the demo state; Markdown export via **Copy MD** |
+| FR-8.4 | Rule-based recommendations | ✅ | 3 on the 2002–2024 fixture record; Markdown export via **Copy MD** |
 | FR-8.5 | **The report must be presented as tabs** | ✅ | Four sub-tabs — Situation, Critical streaks, Fuel types, Actions — each with a count badge; only the active section renders |
 | FR-8.6 | Headline summary in the rail | ✅ | Compact card: threat, record mean, last 30 days, top streaks, first two actions |
 | FR-8.7 | Honest state for a thin window | ✅ | Verified: a <60-day AOI returns `{note, threat, streaks, biomes, recommendations}` with no `record`/`recent`; the panel previously threw on `b.record.mean_daily`, and now shows the note and keeps the console alive |
@@ -189,7 +199,7 @@ Status key: **✅ implemented** · **⚠️ partial** · **❌ not started**. "V
 | ID | Requirement | Status | Acceptance criteria |
 |---|---|---|---|
 | FR-11.1 | Five analytics tabs in a drawer | ✅ | Burning calendar, Forecast, Climatology, Illusion diagnostic, Briefing detail |
-| FR-11.2 | One-click demo loading | ✅ | Demo cached server-side, so repeat loads are ~26 ms |
+| FR-11.2 | Choose a dataset rather than be handed one | ✅ | The standby card lists every archive found (one button each, sensor · kind · size) plus **Merge all N archives** when there is more than one, and the header carries the same choices in its **Local archives…** selector; `null` while scanning, `[]` with a pointer to the upload path when the machine has none. Loading is busy-locked, and the Dataset panel then names the file and the slice — or, after a merge, the archive count, the sensors, the slice against the directory's total, and a per-file breakdown under a disclosure. A region/AOI with no detections says *Clear area* instead of offering to fabricate data into the selection |
 | FR-11.3 | Area selection and clearing | ✅ | |
 | FR-11.4 | Live status indicators | ✅ | Link pulse, hotspot count, record window, per-sensor totals |
 | FR-11.5 | Prefetch chart chunks on hover/focus | ✅ | The chart bundle (≈5 KB gzipped, hand-rolled SVG) is warm before the click |
@@ -227,17 +237,17 @@ Status key: **✅ implemented** · **⚠️ partial** · **❌ not started**. "V
 
 ### FR-15 — Curated region presets (AOI navigation)
 
-The useful idea taken from the sibling Pyro-Harmony repo: a demo should walk an audience through
-named fire regimes, not one anonymous bounding box. Here the presets are a **view** — they never
-substitute for real data by themselves.
+The useful idea taken from the sibling Pyro-Harmony repo: the console should walk an audience
+through named fire regimes, not one anonymous bounding box. Here the presets are a **view** —
+they never substitute for real data by themselves.
 
 | ID | Requirement | Status | Acceptance criteria |
 |---|---|---|---|
 | FR-15.1 | Serve a curated AOI catalog | ✅ | `GET /regions`, five presets (California, Amazon & Pantanal, Southeastern Australia, Punjab & Haryana, Mediterranean basin) with bbox, centre, zoom, biome, peak months and notable fire years |
 | FR-15.2 | Selecting a preset sets the AOI filter and flies the camera | ✅ | Picker in the command bar; every panel recomputes for that bbox; verified live (badge `SATELLITE · 2D MAP` on arrival, region facts in the Selection panel) |
 | FR-15.3 | Preset facts follow the AOI, not the click | ✅ | A hand-drawn box that matches a preset shows that region's facts too (bbox match, not just picker state) |
-| FR-15.4 | The demo works for any preset | ✅ | `POST /demo?region=…` scopes the synthetic record to the preset bbox and gives it its own seed, so regions differ statistically; a per-region demo is cached after its first build (~2 s) |
-| FR-15.5 | An empty AOI says so and offers a way forward | ✅ | "No detections in this AOI yet" + *Load demo for {region}*; verified live on Southeastern Australia before loading |
+| FR-15.4 | A preset can be exercised with data of its own | ✅ | The console opens an archive and filters it; `POST /demo?region=…` remains the fixture path for the same thing (scoped to the preset bbox, its own seed so regions differ statistically, cached after its first build). A preset AOI outside the open archive's area is the honest limit, and the Selection panel says so |
+| FR-15.5 | An empty AOI says so and says why | ✅ | "No detections in this AOI — the open archive may not cover it" + *Clear area*; verified live on Southeastern Australia. It no longer offers to fabricate a record into the selection |
 | FR-15.6 | A preset's live region stays on the allowlist | ✅ | Every `firms_region` is asserted to be a member of `LIVE_REGIONS` in the test suite, so "pull live" can follow a preset without tripping the 400 |
 
 ### FR-16 — Real FIRMS windows via the area API (optional key)
@@ -272,6 +282,9 @@ Target: a responsive console on a 4-core, 8 GB machine with integrated graphics.
 | `/clusters` warm | 0.71 s | **0.020 s** | ≤ 100 ms |
 | `/calendar` warm | 0.47 s | **0.058 s** | ≤ 100 ms |
 | `POST /demo` warm | 2.56 s | **0.026 s** | ≤ 100 ms |
+| `POST /datasets/load` (308 MB MODIS archive) | — | **~6 s** for 750,000 rows / ~3.83 M estimated | bounded by `limit`, not by file size |
+| `POST /datasets/load` (1,384 MB archive) | — | **~9 s** for 750,000 rows / ~16.6 M estimated | a 7.4× bigger file costs 1.5× longer |
+| `POST /datasets/load?all=true` (15 archives, ~125 M rows) | — | **~37 s** for 2,000,000 rows / 1,799,078 kept | bounded by the row cap, not by the 9.6 GB directory |
 
 Mechanisms: lazy `React.lazy` splits gated by a path-based `manualChunks` function (the object form only matched entry files and pulled the charting vendor chunk back into first paint), charts drawn as hand-rolled SVG in `plot.jsx` so no charting dependency exists at all, gzip with a 1 KiB floor, server-side memoization of every derived endpoint plus explicit invalidation on dataset change, a client-side in-memory response cache with in-flight request collapsing, a cached demo generator, raster tiles capped at zoom 16 with fade animation disabled, no per-frame React render on zoom, and `LOW_END` degraded effects (1× render ratio, instant camera moves) on ≤4-core or ≤4 GB devices.
 
@@ -286,6 +299,7 @@ Anonymous, no accounts, no keys. The dataset is public NASA data and a user may 
 - Client input never selects a URL (`region` allowlisted; `bbox` range-validated; numerics clamped).
 - Uploads are bounded before buffering: `Content-Length` gate → 413; 200 MB/file and 400 MB/request; ≤20 files; 1 MiB slice reads that abort at the cap.
 - A filename is data, not a command.
+- An archive id is a name, not a path: `/datasets/load` resolves it against the inventory the scan produced and re-checks containment against the root, so no request-supplied string is ever joined onto a path. The inventory response publishes no absolute path, and opening an archive is a write, so the `Origin` gate covers it.
 - Reflected filenames are sanitised (basename, printable only, 80 chars) so they cannot forge log lines.
 - CORS defaults to the local origins, never `*`, and is never paired with credentials.
 - Writes need an `Origin` of this host or an explicit `ALLOW_ORIGINS` entry (403 otherwise). CORS only governs *reading* a response, and a form POST is never preflighted, so without this guard any page the operator had open could drive `/upload`, `/demo`, `/archive` and `/live`. A no-`Origin` caller (curl, pytest, launcher) still writes; reads are never gated.
@@ -301,7 +315,7 @@ Partial. Honoured: `prefers-reduced-motion`, `aria-label` on the map and basemap
 
 ### NFR-4 — Reliability & correctness
 
-59 automated tests (37 smoke + 22 security) run in CI on every push and PR, plus the frontend production build, whose prebuild step runs the lazy-export guard and the adaptive-detail, chart-layout and orbital-drift policy checks. The tests need no archive: the training path is exercised on a few dozen synthetic rows pushed through the same scan/save/load code `train.py` runs. Derived values are asserted against invariants (percentile ordering, cluster hull sizes, threat ladder membership, growth relationships) rather than hard-coded snapshots where possible.
+98 automated tests (40 smoke + 34 security + 24 archive) run in CI on every push and PR, plus the doc-figure check (`scripts/check-doc-figures.py`, which fails when a count quoted in the docs drifts from the suite) and the frontend production build, whose prebuild step runs the lazy-export guard and the adaptive-detail, chart-layout and orbital-drift policy checks. The tests need no archive: the training path is exercised on a few dozen synthetic rows pushed through the same scan/save/load code `train.py` runs, and the archive suite builds its own fixture directory of FIRMS exports — three files, two instruments, one of them naming its platform — and points the app at it. Derived values are asserted against invariants (percentile ordering, cluster hull sizes, threat ladder membership, growth relationships) rather than hard-coded snapshots where possible.
 
 ### NFR-5 — Portability
 
@@ -354,7 +368,9 @@ Canonical detection record after harmonization: `lat, lon, time (UTC), sensor, c
 | Method & path | Key parameters | Returns |
 |---|---|---|
 | `POST /upload` | multipart `files[]`, `demo_transition` | `meta` |
-| `POST /demo` | `mode=standard\|transition`, `region` (preset key) | `meta` |
+| `POST /demo` | `mode=standard\|transition`, `region` (preset key) | `meta` (fixture endpoint — no UI caller) |
+| `GET /datasets` | — | `{items: [{id, name, sensor, kind, label, bytes, mb}]}`, smallest file first; no paths; `{items: []}` when there is no archive directory |
+| `POST /datasets/load` | `id`, `all` (bool), `limit` (1,000–2,000,000; 750,000 default, 2,000,000 when `all=true`), `spread` (default true) | `meta` + `load {rows_read, rows_kept, rows_estimate, spread, limit, merged}`, plus `file/sensor/kind/mb/capped` for one archive or `archives/sensors/files[]/skipped[]` for a merge; 404 unknown id, 400 nothing to merge or not a FIRMS export, 429 while another archive is opening. The `load` block is a property of the dataset, not of the response: every later `GET /meta` carries it until the dataset is replaced or cleared |
 | `POST /archive` | `region` \| `bbox`, `source`, `days` 1–5, `date`, `append` | `meta` + `{source, region, days}` (needs `FIRMS_MAP_KEY`) |
 | `GET /regions` | — | `[{key, name, subtitle, bbox, center, zoom, biome, peak_months, events[], firms_region}]` |
 | `DELETE /data` | — | `{n: 0}` |
@@ -363,7 +379,7 @@ Canonical detection record after harmonization: `lat, lon, time (UTC), sensor, c
 | `GET /points` | `bbox`, `start`, `end`, `limit ≤ 20000` | `[{lat, lon, frp, sensor, conf, time}]` |
 | `GET /clusters` | `bbox`, `start`, `end`, `eps`, `min_pts`, `hours` | top 300 clusters with `hull` |
 | `GET /climatology` | `bbox`, `window`, `step` | per-year DOY series, percentile envelope, summary (peak/onset/cessation) |
-| `GET /diagnostic` | `bbox` | per-year per-sensor series, growth %, artifact pp, scaling factor, calibration |
+| `GET /diagnostic` | `bbox` | per-year per-sensor series, growth %, artifact pp, scaling factor, calibration, `note` when the record cannot span the 2012 transition |
 | `GET /anomalies` | `bbox`, `z` | `{anomalies[], critical[], monthly[]}` (needs >400 days) |
 | `GET /forecast` | `bbox`, `horizon`, `epochs` | `{model, forecast[], prior?}` (needs ≥120 days) |
 | `GET /briefing` | `bbox`, `z`, `min_days`, `format=json\|markdown` | threat, streaks, biomes, recent/record, recommendations |
@@ -392,6 +408,10 @@ Canonical detection record after harmonization: `lat, lon, time (UTC), sensor, c
 | Region presets | 5 AOIs; `firms_region` must be a `LIVE_REGIONS` member; per-region demo seed = base + `crc32(key) % 997` (default keeps 7 / 11, so the documented demo numbers stay valid) |
 | Area API | 1–5 days per pull; area passed as `west,south,east,north` (the API's order, not the internal `bbox` order); sources `MODIS_C6_1`, `VIIRS_SNPP_C2`, `VIIRS_NOAA20_C2`, `VIIRS_NOAA21_C2` |
 | Camera flights | preset fly-to uses the preset `zoom` (4.6–6.6); `Fly to AOI` uses `fitBounds` with 56 px padding; all durations are 0 ms on the low-end probe |
+| Axial tilt | `AXIAL_TILT_DEG = 23.44°` (Earth's obliquity) held for the duration of the drift, eased back to 0 only if the drift is still what pitched the camera |
+| Local archive slice | 750,000 rows read by default (clamped to the 2,000,000 store cap, minimum 1,000) across ≤ 24 evenly spaced byte offsets, chunked at 250,000 rows per read; one open at a time; `spread=false` reads the head; total rows estimated from file size ÷ mean record width |
+| Merged archives | the same 2,000,000-row cap, divided across the inventory by each file's byte count (floored, so the sum never exceeds it); per-file accounting and per-file failure reporting |
+| Sensor naming | instrument, not platform: `SNPP`/`S-NPP`/`NPP`/`N20`/`N21`/`NOAA-20`/`NOAA-21` → VIIRS, `MODIS` → MODIS, anything unrecognised passed through as before |
 | Map zooms | globe ≤3.7 · flat ≥5.2 · start 1.65 · max tiles 16 (map 0.5–19, pitch ≤60°) |
 | Low-end probe | `hardwareConcurrency ≤ 4` or `deviceMemory ≤ 4` → 1× canvas render ratio, 0 ms camera moves |
 
@@ -402,25 +422,30 @@ Nothing in this document is aspirational scaffolding: each pillar was exercised 
 | Area | How it was verified |
 |---|---|
 | Harmonization & encodings | Tests for UTF-8 / cp1252 / UTF-16-BOM uploads; merge and clear paths |
-| Illusion diagnostic | Live render on the 2002–2024 demo: +304.0 % → +11.7 %, 292.3 pp artifact, R² 0.867, RMSE 2.91 MW, era factor 3.618, ESFP ratio 0.948 (was 1.739 while VIIRS was divided by the 750 m cell) |
+| Illusion diagnostic | Live render on the 2002–2024 fixture record: +304.0 % → +11.7 %, 292.3 pp artifact, R² 0.867, RMSE 2.91 MW, era factor 3.618, ESFP ratio 0.948 (was 1.739 while VIIRS was divided by the 750 m cell) |
+| Local archive picker | The 15 real CSVs in `.data/` (9.6 GB) walked through the running app: the inventory lists all 15, smallest first, each labelled with its sensor and kind and its real size (136 KB → 1.87 GB); a 308 MB MODIS C6.1 archive was opened from the standby card and the header, map and every panel rendered from it, with the Dataset panel reporting `712.8k of ~3.8M rows · spread` over 2024-09-30 → 2025-09-17 — and the panel still said exactly that after a page refresh. A 1,384 MB file opened the same way (~16.6 M rows estimated, 2024-01-17 → 2024-09-20) |
+| Merged archive | Every file in the directory merged through the running app: **1,799,078 detections, 2023-09-30 → 2026-07-05, MODIS 131,226 + VIIRS 1,667,852, ~37 s**, 0 skipped. The Dataset panel showed `15 archives · 4 sensors` and `1.8M of ~125.2M rows · spread` with a 15-file breakdown; the header read `HOTSPOTS 1,799,078 · WINDOW 2023-09-30 → 2026-07-05 · SENSORS MODIS 131.2K · VIIRS 1.7M`; the calendar drew four year-rows; `/climatology` returned a percentile envelope over 1,010 days (peak DOY 226, season 195→281); `/diagnostic` returned per-year MODIS and VIIRS counts for 2023–2026 plus the `note` explaining that this record cannot span the 2012 transition. 24 tests cover the picker and merge: three archives → two sensors, the size-weighted split, a broken export skipped by name, an empty directory as 400 |
+| Sensor naming on real files | Read directly from the 15 headers: `instrument` is `VIIRS` in the 8 NOAA-20/21 files, `MODIS` in the 4 C6.1 files and **`SNPP`** in the 4 S-NPP files. Before the alias map those last four were a third sensor — invisible to the diagnostic, rescaled against themselves, and given MODIS's 1 km nadir cell (a 7.1× footprint error). After it, the merged record reports two sensors, which is what the 1,799,078 figure above is composed of |
+| Synthetic data in the UI | Verified absent: no demo button, no *2002–2024* button and no *Load demo for …* state remain in `App.jsx`, `charts.jsx` or `ForecastChart.jsx`; the fixture endpoints are still documented and still what the suite loads |
 | ESFP nadir cells | Unit-tested against the FIRMS attribute table: 1.0 at MODIS 1 km and at VIIRS 0.375 km, ≈9.67 at the VIIRS scan edge, never below 1.0 |
 | Demo footprints | Synthetic `scan`/`track` asserted inside the product ranges (MODIS 1–4.83 km, VIIRS 0.375–1.17 km) in `test_demo_footprints_are_product_shaped` |
 | Climatology | Live render: peak 19 Mar, season 22 Feb → 7 Apr; envelope ordering asserted in tests |
 | Calendar | 22-year heatmap plus single-year view; day selection drives the map readout |
 | Map stage | Zoom simulated in-browser; badge walked `3D globe → Transition → 2D map` and back with a continuous morph; terrain tiles confirmed loading |
+| Browser compatibility | The built console served by the backend with its real security headers was driven in headless Firefox (Gecko 157) and Chromium against the running app: the lazy map chunk, MapLibre's worker chunk, 31 Esri tile requests and the CARTO vector style all loaded, `securitypolicyviolation` fired zero times, and switching Satellite → Vector stayed on Vector with no fallback notice. The vector switch is asserted end-to-end because it is the one path that crosses a three-party host from the page's own policy. A browser that cannot provide WebGL2 is verified to render the notice instead of an empty well |
 | Clustering | 246 hotspots → 29 clusters on a demo day; hull invariants asserted |
 | Briefing | All four sub-tabs exercised; thin-AOI payload reproduced from the API and confirmed to render the note instead of crashing |
 | Live feed | Region allowlist, 429 guard and outbound cap covered by tests; real feeds are network-dependent and skipped offline |
 | Performance | Cold-load and warm-endpoint timings measured before/after (NFR-1); `/clusters` cold 32,893 → 2,841 ms after ranking clusters before hulling |
 | Charts | Hand-rolled SVG kit rendered live on all three panels (band envelope, grouped bars, forecast lines); payload 411 → ~11 KB raw (~5 KB gzipped) after removing four charting dependencies. Layout verified in a headless browser against the real components: each of the three charts filled its container exactly (868/868 px, viewBox units = CSS px), hover placed the readout card inside the frame with a crosshair and one marker per series, `←` walked the readout, a drag reported the zoom range, the bar chart's outer columns stayed inside the frame, and a series with a gap drew as two paths instead of one through zero |
-| Orbital drift | Rate and behaviour driven from Node: 6°/s (3°/s on a low-end probe) whatever the frame cadence — 100 fps, 50, 20 and 10 fps all travel the same degrees in the same second — a 5 s frame advances one clamped 250 ms slice (1.5°) rather than 30°, and the globe never turns backwards across the ±180 seam at any starting bearing (23 assertions, run by `prebuild`). Live: bearing 0 → 0.75° → 1.915° → 2.715° with each step the clamped slice for this probe's 3°/s |
+| Orbital drift | Rate and behaviour driven from Node: 6°/s (3°/s on a low-end probe) whatever the frame cadence — 100 fps, 50, 20 and 10 fps all travel the same degrees in the same second — a 5 s frame advances one clamped 250 ms slice (1.5°) rather than 30°, the globe never turns backwards across the ±180 seam at any starting bearing, the tilt is 23.44° (asserted inside Earth's actual range) and the map is wired to pitch to it on start and level on stop (assertions run by `prebuild`). Live in the running app, against the map's own camera: pitch reads **23.44°** for the whole drift while the bearing advanced 1.099° → 3.247° → 5.395° → 7.543° (≈3°/s, this probe's low-end rate); stopping returned pitch to **0** and froze the bearing; and a camera the operator tilted to 50° by hand mid-drift was left at 50° instead of being levelled |
 | Adaptive detail | Policy replayed against simulated frame times from Node: a 60 fps drag is never touched, a 20 fps drag degrades exactly once after ≥400 ms and ≥12 frames, a three-frame stutter and a 1.2 s stall leave it alone, and detail returns only when the gesture ends (22 assertions, run by `prebuild`) |
 | Basemaps | Both style documents — `rasterStyle('sat' | 'terrain')` and `mergeOverlays(fetched)` — validated with MapLibre's own style spec from Node: 0 errors, 99 layers after the merge, no duplicate ids, mission layers drawn last, world morph intact |
-| Layout integrity | Overlap between the map readout, the legend chip, the view-control row, the zoom/compass group and the Esri attribution measured at 1440, 1200, 900, 820, 700, 640, 560 and 500 px: 0 px. The readout/control column is lifted by the notice's measured height, so the 0 holds while the notice is collapsed, expanded, or wrapped to three and four lines (a real 2-line wrap happens at ≤ 1200 px, and the stylesheet's static fallback band alone would have overlapped there by 1,315 px²) |
-| Security | Before/after reproductions against the running server (NFR-2), plus 22 regression tests |
+| Layout integrity | Overlap between the map readout, the legend chip, the view-control row, the zoom/compass group and the Esri attribution measured at 1440, 1200, 900, 820, 700, 640, 560 and 500 px: 0 px. The readout/control column sits on the map's own bottom edge (12 px, the inset the legend chip uses on the top edge) and is lifted only while the *expanded* attribution notice reaches left as far as the column: measured in the running app, the collapsed notice leaves the band at 0 px and the column 12 px off the edge, and expanding it sets the band to the notice's height — 40 px here, putting the column 52 px clear — then returns to 0 px when it collapses |
+| Security | Before/after reproductions against the running server (NFR-2), plus 34 regression tests |
 | Key handling & cross-site writes | `/archive` with a live `FIRMS_MAP_KEY` and a refused transport: the 502 body never contains the key. Foreign-origin writes refused 403 while same-host, allowlisted-origin and no-Origin writes pass — both covered in `test_security.py`, and the foreign-origin 403 re-checked against the running server |
 | Model training | Full archive run in this environment: 15 CSVs / 10.30 GB / 126,178,412 rows read in 876 s, 112,174,057 detections kept over 1,089 days (2023-09-30 → 2026-09-22), 3,390 cells stored in 1.8 MB. The learned shape is checked against the known seasons rather than a fixture: Thailand peaks 29 Mar (the app's own climatology puts the peak at 19 Mar), the Amazon 13 Sep, California 10 Jul, and the global mean July-to-December ratio is 1.49 : 0.55. `harmonize(geometry=False)` is asserted frame-identical to `harmonize()` and to the same `daily()` series; a truncated, foreign-schema or missing checkpoint is asserted to fall back to the pre-training answer |
-| Full suite | `pytest` 59 passed · `npm run build` (incl. the lazy-export, adaptive-detail, chart-layout and orbital-drift guards) passed · browser console clean across all tabs |
+| Full suite | `pytest` 98 passed · `npm run build` (incl. the lazy-export, adaptive-detail, chart-layout and orbital-drift guards) passed · browser console clean across all tabs |
 
 ## 12. Status summary
 
@@ -440,7 +465,8 @@ Nothing in this document is aspirational scaffolding: each pillar was exercised 
 | Region presets & AOI navigation | ✅ Complete (five presets, per-region demo, camera flights) |
 | Real FIRMS window pull (`MAP_KEY`) | ✅ Complete; needs the operator's own free key, reported plainly when absent |
 | Chart rendering | ✅ Hand-rolled SVG kit; `recharts`, `cobe`, `leaflet`, `react-leaflet` removed |
-| Test suite | ✅ 55 tests green (33 smoke + 22 hardening); CI runs pytest + build |
+| Test suite | ✅ 98 tests green (40 smoke + 34 hardening + 24 archive); CI runs pytest + doc figures + build |
+| Dataset picker | ✅ Complete — real archives listed at startup, opened individually or merged into one all-sensor, all-year record, each labelled with what was loaded |
 
 ## 13. Known gaps & risks
 
@@ -454,15 +480,17 @@ Nothing in this document is aspirational scaffolding: each pillar was exercised 
 | 6 | No formal accessibility audit; map two-corner selection is pointer-only | Medium | Add keyboard selection, raise contrast checks, audit with a screen reader |
 | 7 | `npm audit` flags Vite/esbuild dev-server advisories | Low (dev-only) | Not in the production bundle; dev server bound to loopback; fix = major Vite upgrade |
 | 8 | `/upload` silently ignores a file whose rows all fail harmonization when a dataset already exists (returns 200, unchanged data) | Low | Make the response report per-file accepted/rejected counts |
-| 9 | Synthetic demo data is plausible but not real; scientific claims rest on the method, not the demo numbers | Low | Ship the Method section and cite the reference papers; the pipeline is identical for real FIRMS files |
-| 10 | Region-preset demos are seeded per region, so the headline demo figures quoted in the docs (57,867 hotspots; +304.0 % → +11.7 %) apply only to the default dataset | Low | Stated in the README next to the quoted numbers; the acceptance criterion is "a per-region demo lands in its bbox", not "reproduces the default numbers" |
-| 11 | `POST /archive` depends on the operator supplying `FIRMS_MAP_KEY`, and 5 days per request means a multi-decadal record still comes from downloaded archive CSVs | Low (by design) | The key-gated path is for real windows; the download+upload path remains the documented route for 20-year records. Could be automated with a loop over date windows later |
+| 9 | The dataset on screen is a bounded slice of a file, so every figure describes the sample rather than the whole record | Low | The Dataset panel states the file, the sensor, and `rows_kept of ~rows_estimate`; `limit` is operator-adjustable, and `POST /demo` still builds a complete synthetic record when a whole-record reference is wanted |
+| 10 | A fresh clone, CI and the container image have **no** archives — `.data/` is ~10 GB and git-ignored — so the console opens on the standby card there | Low (by design) | The empty list is a 200, not an error; the standby card names the directory and keeps the upload path, and the synthetic fixture endpoint remains for anyone who needs a dataset without one |
+| 11 | A local archive is only as good as its bounding area: an export for one country cannot answer an AOI question about another continent | Low | The Selection panel says when an AOI holds no detections and offers *Clear area*; opening a second archive is one click |
+| 12 | Region-preset demo records are seeded per region, so the headline figures quoted in the docs (57,867 hotspots; +304.0 % → +11.7 %) apply only to the default fixture | Low | Stated in the README next to the quoted numbers; the acceptance criterion is "a per-region record lands in its bbox", not "reproduces the default numbers" |
+| 13 | `POST /archive` depends on the operator supplying `FIRMS_MAP_KEY`, and 5 days per request means a multi-decadal record still comes from downloaded archive CSVs | Low (by design) | The key-gated path is for real windows; the download+upload path and the local-archive picker remain the documented route for 20-year records. Could be automated with a loop over date windows later |
 
 ## 14. Roadmap
 
 **Near term (highest value per unit effort)**
 1. Report per-file upload outcomes honestly (gap 8) and chart the monthly anomaly series (gap 3).
-2. Add a date-window loop so `POST /archive` can assemble a multi-year record (gap 11) from repeated 5-day pulls.
+2. Add a date-window loop so `POST /archive` can assemble a multi-year record (gap 13) from repeated 5-day pulls.
 3. Keyboard-accessible area selection plus an accessibility pass (gap 6).
 
 **Mid term**
@@ -476,7 +504,7 @@ Nothing in this document is aspirational scaffolding: each pillar was exercised 
 9. Multi-decadal trend attribution beyond the sensor artifact (climate vs land-use signals).
 10. Optional deployment profile with auth, quotas and a managed dataset.
 
-**Done this cycle:** dropped the three unused frontend dependencies plus `recharts` in favour of the SVG kit (gap 8, now closed); corrected the VIIRS nadir cell to the 375 m I-band value and replaced the illusion correction's footprint-ratio factor with the measured collocated detection ratio (§10, §11).
+**Done this cycle:** dropped the three unused frontend dependencies plus `recharts` in favour of the SVG kit (gap 8, now closed); corrected the VIIRS nadir cell to the 375 m I-band value and replaced the illusion correction's footprint-ratio factor with the measured collocated detection ratio (§10, §11); took the synthetic demo out of the console and made the machine's real archives the opening dataset, with a bounded, labelled slice instead of a whole-file read (FR-1.9, FR-1.10, FR-11.2); and set auto-rotate to Earth's 23.44° obliquity instead of a vertical spin (FR-3.10).
 
 ## 15. Glossary
 

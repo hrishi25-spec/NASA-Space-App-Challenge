@@ -152,11 +152,12 @@ select{
   border-radius:var(--r);overflow:hidden;z-index:1;
   background:#0f1518;box-shadow:var(--inset),0 0 0 1px #ffffff08;
   /* Height of the strip at the bottom of the map that belongs to MapLibre's attribution
-     notice. It is a legal notice, so the console chrome never enters it: the readout and the
-     view controls stop above. MissionMap measures the real notice and overwrites this on the
-     same element — the value here is the band for the common one-line notice, used until the
-     style has loaded and the notice exists. */
-  --attribBand:40px;
+     notice, and zero is the resting value: the readout and the view controls sit on the same
+     12 px edge as the legend chip on the top edge. MissionMap raises this only while the
+     notice is expanded into a bar wide enough to reach under them — which is the one state,
+     and the one legal requirement, that has to be kept clear. Measuring it is what lets the
+     controls stay on the edge instead of floating a notice's height above it. */
+  --attribBand:0px;
 }
 .mapCanvas{width:100%;height:100%}
 /* Soft vignette instead of the old scanline overlay, on its own composited layer: the map
@@ -186,9 +187,12 @@ select{
 .stage .chip.tl{top:12px;left:12px;max-width:calc(100% - 24px);transform:translateZ(0)}
 /* The bottom-left telemetry column: the day/hotspot readout, then the view controls under it.
    One bottom-anchored flex column means a wrapped row of buttons grows upward instead of
-   colliding with the numbers. The right-hand margin keeps the corner clear for the Esri
-   attribution at narrow widths, and the column is its own composited layer so its shadows
-   are rasterised once rather than on every frame of a drag over the live canvas. */
+   colliding with the numbers, and it sits on the map's own bottom edge — 12 px, the same inset
+   the legend chip uses on the top edge. The right-hand margin keeps the corner clear for the
+   collapsed Esri attribution at narrow widths; `--attribBand` is what lifts the column when
+   that notice is expanded wide enough to reach under the controls. The column is its own
+   composited layer so its shadows are rasterised once rather than on every frame of a drag
+   over the live canvas. */
 .missionMap .mapBottom{
   position:absolute;z-index:4;left:12px;bottom:calc(12px + var(--attribBand));
   display:flex;flex-direction:column;align-items:flex-start;gap:8px;
@@ -208,6 +212,16 @@ select{
 .missionMap .mapGestureHint{opacity:.85}
 /* Explains, without a dialog, why the console opened on the vector basemap. */
 .missionMap .mapSlowLink{opacity:.85;letter-spacing:.3px}
+/* The one notice the map well can carry: shown only when the map cannot be drawn at all (no
+   WebGL2) or when the vector basemap could not be fetched. It never replaces the console — the
+   panels, the tabs and the briefing are unaffected — so it is centred, quiet and inert. */
+.missionMap .mapNotice{
+  position:absolute;inset:0;z-index:5;display:flex;align-items:center;justify-content:center;
+  padding:24px;pointer-events:none;text-align:center;
+}
+.missionMap .mapNotice .chip{
+  position:static;max-width:min(560px,100%);justify-content:center;font-size:12px;color:var(--fg);
+}
 .missionMap .mapLayerTools{display:flex;gap:8px;align-items:center}
 .missionMap .mapTools .btn.sm{background:linear-gradient(145deg,#232d33f2,#1a2226f2)}
 .missionMap .mapPickHint{color:var(--acc2)}
