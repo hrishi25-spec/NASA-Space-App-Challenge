@@ -4,6 +4,10 @@ User-facing changes, newest first. The format follows [Keep a Changelog](https:/
 
 ## Unreleased
 
+### Added
+
+- **The harmonized FIRMS year — 2024-09-30 → 2025-09-29, MODIS + every VIIRS platform — is now a dataset the console builds, publishes and reads back as a database.** `firecal/backend/hf_export.py` streams every export in `.data/` through the same `harmonize()` the API and `train.py` use, keeps only the year, de-duplicates on `(lat, lon, time, sensor)` (sorted uint64 row hashes, so tens of millions of rows cost megabytes rather than gigabytes of RAM), and writes one zstd parquet (row groups of 250k, each carrying `time` statistics) plus a manifest and README into `data/`; `hf sync ./data hf://buckets/hriishiibanerjee/FIRMS_DATA` ships it. The API treats that bucket as the database of last resort: `GET /datasets` and `POST /datasets/load` pull it into the cache on demand (`archives.hf_pull`, an `hf sync` from the bucket to `.data/hf/`) when the local folder is empty or an id is unknown — a fresh clone with no 10 GB archive still opens the shared record — and parquet files go through the same bounded reader as CSVs: already-harmonized frames pass through `ensure_harmonized()` untouched (the stored record and a live load are the same quantity by construction), evenly spaced *row groups* replace byte offsets for the spread read, and the footer's exact row count replaces the size-based estimate. The pull answers `(False, reason)` instead of raising — no `hf` CLI, no network and no auth all mean "nothing found", the same state every other missing-database path here keeps. Four new archive tests cover it (bucket parquet opens like any archive, row-group spread reaches past the head, a fake `hf` CLI pulls an empty folder, a missing CLI is an empty answer); the suite is 102 tests (40 smoke + 34 security + 28 archive) and the doc-figure guard was updated to match.
+
 ### Changed
 
 - **The FIRMS archive directory is now `.data/`.** The dataset picker and training command use this directory, and Git and Docker exclude it so local exports stay out of commits and build contexts.

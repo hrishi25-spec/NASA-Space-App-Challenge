@@ -286,8 +286,8 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
 | Method & path | Parameters | Description |
 |---|---|---|
 | `POST /upload` | multipart `files[]`, `demo_transition` (bool) | Add FIRMS CSVs (200 MB/file, 400 MB/request, ≤20 files). HTTP 400 with the sanitised filename and reason on bad files, HTTP 413 if the request declares more than 400 MB. `demo_transition=true` replaces the dataset with the 2002–2024 demo — the poster dataset is loaded by this flag, **not** by naming a file `demo_transition.csv`. |
-| `POST /datasets/load` | `id`, `all` (bool), `limit` (1,000–2,000,000; default 750,000, or 2,000,000 when `all=true`), `spread` (bool, default true) | Open a local archive — or, with `all=true`, **every** archive merged into one record: all sensors, all years. Rows are *read*, so the reader stops and a 1.87 GB file costs about what a 50 MB one does; with `all=true` the budget is split across the files by size. HTTP 404 for an id the inventory does not hold (400 when `all=true` and the directory is empty), 429 while another archive is opening, 400 when a CSV is not a FIRMS export or holds no usable rows. Returns `meta` plus a **`load`** block — for one file `file/sensor/kind/mb/capped`, for a merge `merged/archives/sensors/files[]/skipped[]` naming each export's rows — plus `rows_read`, `rows_kept`, `rows_estimate`, `spread`, `limit`. The console labels the slice from it, because the record on screen and the file it came from are not the same span. |
-| `GET /datasets` | — | The FIRMS archives found on this machine, smallest first: `{id, name, sensor, kind, label, bytes, mb}` each. `id` is relative to the archive root and is the only handle the load endpoint accepts — no absolute path is published, not even the roots that were walked. `{"items": []}` is the normal answer in CI, in the container image and on a fresh clone. |
+| `POST /datasets/load` | `id`, `all` (bool), `limit` (1,000–2,000,000; default 750,000, or 2,000,000 when `all=true`), `spread` (bool, default true) | Open a local archive — or, with `all=true`, **every** archive merged into one record: all sensors, all years. Rows are *read*, so the reader stops and a 1.87 GB file costs about what a 50 MB one does; with `all=true` the budget is split across the files by size. An id the local inventory does not hold is resolved against the Hugging Face bucket first (`hf sync hf://buckets/hriishiibanerjee/FIRMS_DATA` into the cache, then re-listed), so the shared record opens on a machine with no `.data/` at all. Parquet files (the bucket's format) open like CSVs — already-harmonized frames are passed through instead of re-harmonized. HTTP 404 for an id the inventory does not hold (400 when `all=true` and nothing exists locally or remotely), 429 while another archive is opening, 400 when a CSV is not a FIRMS export or holds no usable rows. Returns `meta` plus a **`load`** block — for one file `file/sensor/kind/mb/capped`, for a merge `merged/archives/sensors/files[]/skipped[]` naming each export's rows — plus `rows_read`, `rows_kept`, `rows_estimate`, `spread`, `limit`. The console labels the slice from it, because the record on screen and the file it came from are not the same span. |
+| `GET /datasets` | — | The FIRMS archives found on this machine, smallest first: `{id, name, sensor, kind, label, bytes, mb}` each. `id` is relative to the archive root and is the only handle the load endpoint accepts — no absolute path is published, not even the roots that were walked. When nothing is local (fresh clone, container, CI), the Hugging Face bucket is pulled into the cache first and listed; `{"items": []}` means both the folder and the bucket came up empty (or unreachable). |
 | `POST /demo` | `mode=standard\|transition`, `region` | **Fixture, not a console feature** — the console has no demo button. Replace data with the synthetic 2020–2024 set, or the 2002–2024 transition set. `region` scopes the generated record (and its own seed) to a preset AOI; HTTP 400 for an unknown key. It is what the test suite loads, and the only data source a checkout without `.data/` has. |
 | `POST /archive` | `region`, `bbox`, `source`, `days` (1–5), `date`, `append` | Load a **real** FIRMS window through the area API and merge it into the record (like an upload). Needs `FIRMS_MAP_KEY`: HTTP 400 with the link and the `.env` locations when it is missing, 400 for an unknown source/region/bad date, 502 when FIRMS is unreachable. Rows outside the requested AOI are dropped, and the response is `meta` plus `{source, region, days}`. |
 | `DELETE /data` | — | Clear all loaded data. |
@@ -341,7 +341,7 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
     │   ├── model/                  ← trained checkpoint (gitignored; rebuilt by train.py)
     │   ├── test_smoke.py           ← 40-test API smoke suite (encodings, gzip, cache, presets, archive, training, /api prefix)
     │   ├── test_security.py        ← 34-test hardening suite (URL allowlist, upload caps, CORS, CSP hosts)
-    │   ├── test_archives.py        ← 24-test suite for the local-archive picker (inventory, slice, merge, ids, gate)
+    │   ├── test_archives.py        ← 28-test suite for the local-archive picker (inventory, slice, merge, ids, gate, HF bucket)
     │   ├── requirements.txt        ← runtime deps (with security floors)
     │   └── requirements-dev.txt    ← + pytest, httpx (for tests)
     └── frontend/
@@ -474,7 +474,7 @@ scripts/check.sh          # POSIX — or scripts\check.bat on Windows
 Both are thin wrappers around the commands below, which is also what CI runs:
 
 ```bash
-# 98 tests, ~90 s — starts the app in-process via TestClient
+# 102 tests, ~2 min — starts the app in-process via TestClient
 cd firecal/backend
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest -q
@@ -502,7 +502,7 @@ and region-specific, `.env` parsing handles comments/`export`/quotes, and `/arch
 validates the request *before* the key, explains a missing key, builds the area-API URL in
 west,south,east,north order, and merges rows while dropping anything outside the AOI.
 
-**`test_archives.py` (24)** covers the local-archive picker against a purpose-built fixture
+**`test_archives.py` (28)** covers the local-archive picker against a purpose-built fixture
 directory — three archives over two instruments, one of them an S-NPP export that names its
 platform: the inventory order (smallest first) and its labels, that no filesystem path reaches
 the response, that no archive at all is an empty list rather than an error, that a CSV which is

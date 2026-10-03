@@ -19,8 +19,8 @@ It runs exactly what CI runs (`.github/workflows/ci.yml`):
    and no imports — and fails when a count the docs quote drifts from the code, when a
    tracked claim disappears from the docs, or when a prebuild-guard name in a document no
    longer matches a file on disk or the npm wiring.
-2. **Backend suite — 98 tests** (`cd firecal/backend && .venv/bin/pytest -q`):
-   40 smoke + 34 security + 24 local-archive, in-process via `TestClient`. No network,
+2. **Backend suite — 102 tests** (`cd firecal/backend && .venv/bin/pytest -q`):
+   40 smoke + 34 security + 28 local-archive, in-process via `TestClient`. No network,
    no `.data/` archive, no trained model required — fixtures are built inside the tests.
 3. **Frontend production build** (`cd firecal/frontend && npm run build`): the
    `prebuild` step runs four zero-dependency guards — `check-lazy-exports.mjs`,
@@ -46,7 +46,8 @@ seasonal climatology and the UI names the fallback.
 | Path | What it holds |
 |---|---|
 | `firecal/backend/main.py` | Every endpoint plus the cores: `harmonize`, `harmonized_daily`, `_zstats`, `_streaks`, `_threat`, `_biomes`, `_cluster_payload`, `_esfp`, `cached` |
-| `firecal/backend/archives.py` | Local-archive inventory under `.data/`, the bounded spread slice reader, `allocate()` (merge budget by file size), `read_merge()` |
+| `firecal/backend/archives.py` | Local-archive inventory under `.data/`, the bounded spread slice reader (byte offsets for CSV, row groups for parquet), `allocate()` (merge budget by file size), `read_merge()`, `hf_pull()` (the Hugging Face bucket pulled on demand) |
+| `firecal/backend/hf_export.py` | Builds the harmonized year (2024-09-30 → 2025-09-29) parquet in `data/` for `hf sync ./data hf://buckets/hriishiibanerjee/FIRMS_DATA`; runs the server's own `harmonize()` |
 | `firecal/backend/regions.py` | The five curated AOI presets behind `GET /regions` |
 | `firecal/backend/demo.py` | Synthetic FIRMS generator — the test fixture; nothing in the UI calls it |
 | `firecal/backend/train.py`, `forecast_model.py` | Train the checkpoint; carry it to `/forecast` |
@@ -76,13 +77,16 @@ seasonal climatology and the UI names the fallback.
   a default export or `check-lazy-exports.mjs` fails the build.
 - **Keep `scipy`/`scikit-learn` imports lazy** inside clustering/briefing. Moving them
   to module scope costs ~2.5 s of startup.
-- **Never commit `.data/`, `firecal/backend/model/`, `.env`, `*.csv` or build output.**
+- **Never commit `.data/`, `data/`, `firecal/backend/model/`, `.env`, `*.csv` or build output.**
   All are gitignored; the checkpoint is derived data rebuilt by `train.py`, and a
   missing or malformed checkpoint is not an error.
 - **Never diverge the two harmonizers.** `train.py` reads through the server's own
   `harmonize(geometry=False)` and `harmonized_daily()`; a second implementation of the
   sensor rescale would train the model on a different quantity than the endpoint
-  predicts.
+  predicts. `hf_export.py` must keep importing the same function for the same reason.
+- **Never hand-edit `data/`.** The bucket's parquet, manifest and README are written by
+  `hf_export.py` from the parquet's own statistics; a hand-placed file would drift from
+  what `GET /datasets` and `/datasets/load` then report about it.
 
 ## How to change the backend
 

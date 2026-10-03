@@ -23,6 +23,7 @@ Two rules this module exists to keep:
     archives are git-ignored and gigabytes), so every function here answers "nothing found"
     rather than raising. The console has an upload path and a live feed without it.
 """
+import subprocess
 from pathlib import Path
 
 import pandas as pd
@@ -37,7 +38,19 @@ SENSORS = {
     "SV-C2": "VIIRS S-NPP",
     "M-C61": "MODIS C6.1",
     "M-C6": "MODIS C6.1",
+    "ALL": "MODIS+VIIRS",         # the merged year export (hf_export.py), every sensor
 }
+
+# The bucket this console also reads from. `hf sync` runs both ways; here the bucket is the
+# source and `<root>/hf` the destination, so a machine with no `.data/` (every fresh clone,
+# every CI run with network) still has the harmonized year to open -- the database case.
+HF_BUCKET = "hf://buckets/hriishiibanerjee/FIRMS_DATA"
+HF_CACHE = "hf"                       # cache dir name under a root; inventoried like the rest
+HF_SYNC_TIMEOUT = 600                 # first pull is a few hundred MB; later ones are no-ops
+
+# What a frame must carry to be trusted as this API's record: either a raw FIRMS export or
+# the harmonized shape `harmonize()` produces (what the bucket stores).
+HARMONIZED_COLUMNS = {"lat", "lon", "time", "date", "sensor", "conf"}
 
 KINDS = {"archive": "archive", "nrt": "near-real-time"}
 
@@ -75,7 +88,9 @@ def _describe(path: Path, root: Path) -> dict:
     """One inventory entry. `id` is the path relative to its root and is the only handle the
     API accepts; the file itself never leaves this process."""
     name = path.name
-    parts = name[:-4].split("_") if name.lower().endswith(".csv") else name.split("_")
+    low = name.lower()
+    stem = name[:-4] if low.endswith(".csv") else name[:-8] if low.endswith(".parquet") else name
+    parts = stem.split("_")
     kind = KINDS.get(parts[1], parts[1]) if len(parts) > 1 else "archive"
     code = parts[2] if len(parts) > 2 else ""
     sensor = SENSORS.get(code, code or "unknown sensor")
@@ -110,7 +125,7 @@ def scan(root: Path) -> list[dict]:
     ones that open immediately at the top.
     """
     try:
-        found = sorted(root.rglob("*.csv"))
+        found = sorted([*root.rglob("*.csv"), *root.rglob("*.parquet")])
     except OSError:                                   # unreadable or not a directory
         return []
     items = [_describe(path, root) for path in found if path.is_file()]
@@ -155,8 +170,20 @@ def find(items: list[dict], dataset_id: str) -> dict | None:
 
 
 def _shape(path: Path) -> tuple[list[str], float, int]:
-    """Column names, average bytes per record, and file size -- without reading the file."""
+    """Column names, average bytes per record, and file size -- without reading the file.
+
+    Parquet answers from its footer: exact row count, exact schema, zero row data touched.
+    """
     size = path.stat().st_size
+    if path.suffix.lower() == ".parquet":
+        import pyarrow.parquet as pq
+        try:
+            meta = pq.ParquetFile(path).metadata
+        except Exception as e:                        # corrupt or not parquet at all
+            raise ValueError(f"unreadable parquet: {e}") from e
+        columns = [field.name for field in pq.ParquetFile(path).schema_arrow]
+        rows = meta.num_rows
+        return columns, (size / rows) if rows else 0.0, size
     with open(path, "rb") as fh:
         head = fh.read(HEAD_BYTES)
     lines = head.count(b"\n")
@@ -225,6 +252,108 @@ def _read_spread(path: Path, columns: list[str], per_step: int, steps: int, size
     return frames, sum(len(frame) for frame in frames)
 
 
+def _read_parquet(path: Path, limit: int, spread: bool = True) -> dict:
+    """`limit` rows from a parquet file -- columnar, so the byte-seek games are unnecessary.
+
+    A parquet read is already bounded by row groups: the sequential branch pulls batches until
+    `limit` rows are in hand (the rest of the file is never decompressed), and the spread
+    branch picks row groups *by their time statistics* instead of byte offsets -- the bucket's
+    file is one block per source export, so positional sampling would hand a calendar whichever
+    sensor was written first, while the footers' min/max let it choose `steps` groups covering
+    the record's actual span. The estimate is the footer's exact row count, not a guess.
+    """
+    import pyarrow.parquet as pq
+    try:
+        pf = pq.ParquetFile(path)
+    except Exception as e:
+        raise ValueError(f"unreadable parquet: {e}") from e
+    columns = [field.name for field in pf.schema_arrow]
+    if not REQUIRED_COLUMNS <= set(columns) and not HARMONIZED_COLUMNS <= set(columns):
+        missing = sorted((REQUIRED_COLUMNS | HARMONIZED_COLUMNS) - set(columns))
+        raise ValueError(f"missing required columns: {', '.join(missing)}")
+    total = pf.metadata.num_rows
+    groups = pf.metadata.num_row_groups
+    if not spread or total <= limit or groups <= 1:
+        frames, rows = [], 0
+        for batch in pf.iter_batches(batch_size=CHUNK_ROWS):
+            frames.append(batch.to_pandas())
+            rows += len(batch)
+            if rows >= limit:
+                break
+        while rows > limit:                           # trim the last frame to exactly `limit`
+            over, last = rows - limit, frames[-1]
+            if len(last) <= over:
+                rows -= len(last)
+                frames.pop()
+            else:
+                frames[-1] = last.iloc[: len(last) - over]
+                rows -= over
+        return {"frames": frames, "rows": rows, "capped": total > limit,
+                "spread": False, "estimate": total}
+    steps = max(1, min(SPREAD_STEPS_MAX, groups, limit // ROWS_PER_STEP_MIN))
+    per = max(1, limit // steps)
+    frames, rows = [], 0
+    for group in _spread_groups(pf, columns, steps):
+        part = pf.read_row_group(group).to_pandas()
+        if len(part) > per:
+            part = part.iloc[:per]
+        frames.append(part)
+        rows += len(part)
+    return {"frames": frames, "rows": rows, "capped": True,
+            "spread": True, "estimate": total}
+
+
+def _stride_groups(groups: int, steps: int) -> list[int]:
+    """Evenly spaced row-group indices -- the positional fallback for the spread read."""
+    return [step * groups // steps for step in range(steps)]
+
+
+def _spread_groups(pf, columns: list[str], steps: int) -> list[int]:
+    """Row-group indices covering `steps` moments evenly across the record's time range.
+
+    Every row group in a parquet footer carries min/max statistics for each column, and
+    `time` is one of them -- so the spread can ask the *data* where the moments are instead of
+    assuming the file's layout says. `steps` bins from first detection to last; each bin takes
+    the first not-yet-chosen group whose [min, max] overlaps it, falling back to any unchosen
+    group (bins can be narrower than a group). If any group has no statistics, or there is no
+    `time` column to ask, the answer is the positional stride -- the same shape the CSV spread
+    takes over byte offsets.
+    """
+    groups = pf.metadata.num_row_groups
+    if "time" not in columns or steps > groups:
+        return _stride_groups(groups, steps)
+    index = columns.index("time")
+    ranges: list[tuple[int, int] | None] = []
+    for group in range(groups):
+        try:
+            stats = pf.metadata.row_group(group).column(index).statistics
+            if stats is None or not stats.has_min_max:
+                ranges.append(None)
+            else:
+                ranges.append((pd.Timestamp(stats.min).value, pd.Timestamp(stats.max).value))
+        except Exception:                       # a footer without usable statistics
+            ranges.append(None)
+    if any(span is None for span in ranges):
+        return _stride_groups(groups, steps)
+    lo = min(span[0] for span in ranges)
+    hi = max(span[1] for span in ranges)
+    if hi <= lo:
+        return _stride_groups(groups, steps)
+    span, chosen, taken = hi - lo, [], set()
+    for step in range(steps):
+        start = lo + span * step // steps
+        end = lo + span * (step + 1) // steps
+        pick = next((g for g, r in enumerate(ranges)
+                     if g not in taken and r[0] <= end and start <= r[1]), None)
+        if pick is None:
+            pick = next((g for g in range(groups) if g not in taken), None)
+        if pick is None:
+            break
+        taken.add(pick)
+        chosen.append(pick)
+    return chosen
+
+
 def read_slice(path: Path, limit: int, chunk: int = CHUNK_ROWS,
                spread: bool = True) -> dict:
     """About `limit` rows from `path`, spread evenly over it when it is bigger than that.
@@ -233,8 +362,11 @@ def read_slice(path: Path, limit: int, chunk: int = CHUNK_ROWS,
     read was spread, and an estimate of the file's total rows -- so the console can say
     "750,000 of ~10.4M rows, spread across the file" instead of implying it holds the whole
     thing. A file without the FIRMS columns raises ValueError, which the endpoint turns into a
-    400 naming the missing columns.
+    400 naming the missing columns. Parquet files go through `_read_parquet` first -- the
+    bucket's format -- and CSVs take the byte-offset path below.
     """
+    if path.suffix.lower() == ".parquet":
+        return _read_parquet(path, limit, spread)
     columns, width, size = _shape(path)
     missing = REQUIRED_COLUMNS - set(columns)
     if missing:
@@ -254,6 +386,30 @@ def read_slice(path: Path, limit: int, chunk: int = CHUNK_ROWS,
                 "estimate": max(estimate, rows)}
     return {"frames": frames, "rows": rows, "capped": True, "spread": True,
             "estimate": max(estimate, rows)}
+
+
+def hf_pull(root: Path, timeout: int = HF_SYNC_TIMEOUT) -> tuple[bool, str]:
+    """Pull the Hugging Face bucket into `<root>/hf`; answer (ok, message), never raise.
+
+    This is the "database" half: `.data/` is a download folder on *this* machine, the bucket
+    is the shared record, and when the inventory comes up empty (fresh clone, container,
+    another laptop) this is how the console gets something to open. Every failure mode -- no
+    `hf` CLI, no network, no auth, a timeout -- is a reason string, because a machine that
+    cannot reach the database is in the same state as one that has no archives: nothing found.
+    """
+    dest = root / HF_CACHE
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.run(["hf", "sync", HF_BUCKET, str(dest)], capture_output=True,
+                              text=True, timeout=timeout)
+    except FileNotFoundError:
+        return False, "hf CLI not installed"
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"{type(e).__name__}: {e}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+        return False, detail[-400:]
+    return True, f"synced {HF_BUCKET} -> {dest}"
 
 
 def allocate(items: list[dict], limit: int) -> list[tuple[dict, int]]:

@@ -23,6 +23,9 @@ from main import app
 
 client = TestClient(app)
 
+# The real pull, captured before any fixture stubs it: the network tests below put it back.
+_REAL_HF_PULL = archives.hf_pull
+
 HEADER = "latitude,longitude,acq_date,acq_time,confidence,frp,brightness,satellite,instrument\n"
 
 NRT_ID = "DL_FIRE_J1V-C2_814284/fire_nrt_J1V-C2_814284.csv"
@@ -68,6 +71,19 @@ def archive_root(tmp_path_factory):
 def point_at_fixture_archives(archive_root, monkeypatch):
     """Point the API at the fixture archives for every test in this module."""
     monkeypatch.setattr(main, "ARCHIVE_ROOTS", [archive_root])
+
+
+@pytest.fixture(autouse=True)
+def bucket_pull_cannot_reach_the_network(monkeypatch):
+    """`hf sync` dials out to the real bucket; tests answer "unreachable" instead.
+
+    Every pull path in main.py exists to make an empty inventory ask the database -- which is
+    exactly what a CI root is -- so without this stub a passing test run would download the
+    bucket. The tests that exercise the pull put the real function back and fake the `hf` CLI.
+    """
+    monkeypatch.setattr(
+        archives, "hf_pull",
+        lambda root, timeout=archives.HF_SYNC_TIMEOUT: (False, "tests: bucket is unreachable"))
 
 
 # ------------------------------------------------------------------ the inventory
@@ -296,3 +312,96 @@ def test_the_scan_survives_a_root_that_is_a_file(tmp_path):
     root = tmp_path / ".data"
     root.write_text("not a directory", encoding="utf-8")
     assert archives.scan(root) == []
+
+
+# --------------------------------------------------- the Hugging Face bucket as a database
+# The filename hf_export.py ships: `_ALL_` is the sensor code the inventory publishes as
+# "MODIS+VIIRS" (archives.SENSORS), and the two dates are the record's window.
+from hf_export import NAME as BUCKET_PARQUET  # noqa: E402
+
+
+def _bucket_parquet(csv_path, out_path, days, per_day, row_group=0):
+    """A parquet in the bucket's shape: FIRMS rows through the real `harmonize()`, written
+    the way `hf_export.py` writes them."""
+    _write_firms(csv_path, days=days, per_day=per_day)
+    frame = main.harmonize(pd.read_csv(csv_path))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(out_path, row_group_size=row_group or None, compression="zstd")
+    return out_path
+
+
+def test_the_bucket_parquet_is_inventoried_and_opens(tmp_path, monkeypatch):
+    """The stored record is *already* harmonized, so opening it must pass through -- not die
+    on the FIRMS columns it no longer carries. Same inventory, same slice report, same
+    calendar as any CSV archive: the bucket is a database, not a special case in the UI."""
+    root = tmp_path / ".data"
+    parquet = _bucket_parquet(tmp_path / "raw.csv", root / "hf" / BUCKET_PARQUET,
+                              days=3, per_day=4)
+    monkeypatch.setattr(main, "ARCHIVE_ROOTS", [root])
+    items = client.get("/datasets").json()["items"]
+    assert [item["id"] for item in items] == [f"hf/{BUCKET_PARQUET}"]
+    item = items[0]
+    assert item["sensor"] == "MODIS+VIIRS" and item["kind"] == "archive"
+    m = client.post("/datasets/load", params={"id": item["id"]}).json()
+    assert m["n"] == 12 and m["load"]["rows_kept"] == 12
+    assert m["load"]["capped"] is False and m["load"]["spread"] is False
+    assert m["load"]["rows_estimate"] == 12      # the footer's exact count, not an estimate
+    assert [m["start"], m["end"]] == ["2024-01-01", "2024-01-03"]
+
+
+def test_a_parquet_slice_samples_row_groups_instead_of_reading_the_head(tmp_path, monkeypatch):
+    """Parquet replaces the byte-seek spread with a row-group spread: the file is time-sorted,
+    so evenly spaced row groups are the same fortnight sampling the CSV reader does by byte
+    offset -- and a console comparing seasons must not be handed the first 60,000 rows only."""
+    root = tmp_path / ".data"
+    # 200,000 rows in 10 row groups of 20,000: far more groups than the spread takes, so
+    # which groups it lands on is observable in the record's span.
+    parquet = _bucket_parquet(tmp_path / "raw.csv", root / "hf" / BUCKET_PARQUET,
+                              days=400, per_day=500, row_group=20_000)
+    monkeypatch.setattr(main, "ARCHIVE_ROOTS", [root])
+    spread = client.post("/datasets/load", params={"id": f"hf/{BUCKET_PARQUET}",
+                                                   "limit": 60_000}).json()
+    assert spread["load"]["spread"] is True
+    assert spread["load"]["rows_read"] == 60_000
+    assert spread["load"]["rows_estimate"] == 200_000
+    dense = client.post("/datasets/load", params={"id": f"hf/{BUCKET_PARQUET}",
+                                                  "limit": 60_000, "spread": False}).json()
+    assert dense["load"]["spread"] is False
+    spread_span = (pd.Timestamp(spread["end"]) - pd.Timestamp(spread["start"])).days
+    dense_span = (pd.Timestamp(dense["end"]) - pd.Timestamp(dense["start"])).days
+    assert spread_span > dense_span, "row-group spread must reach further into the year"
+
+
+def test_an_empty_local_folder_pulls_the_bucket(tmp_path, monkeypatch):
+    """The database path end to end: nothing on disk, a fake `hf` CLI that answers like the
+    real one does after login, and the bucket's file arrives in the cache, is inventoried,
+    and opens. (The CLI is faked because the real one would dial out; the sync *call* is real.)"""
+    bucket = tmp_path / "bucket"
+    _bucket_parquet(tmp_path / "raw.csv", bucket / BUCKET_PARQUET, days=3, per_day=4)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "hf"
+    fake.write_text("#!/bin/sh\n# argv: sync SOURCE DEST\nmkdir -p \"$3\"\n"
+                     "cp \"$FAKE_BUCKET\"/* \"$3\"/\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("FAKE_BUCKET", str(bucket))
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    monkeypatch.setattr(archives, "hf_pull", _REAL_HF_PULL)     # undo the no-network stub
+    root = tmp_path / ".data"
+    monkeypatch.setattr(main, "ARCHIVE_ROOTS", [root])
+
+    ok, message = archives.hf_pull(root)
+    assert ok is True and str(root / "hf") in message
+    items = client.get("/datasets").json()["items"]
+    assert [item["id"] for item in items] == [f"hf/{BUCKET_PARQUET}"]
+    m = client.post("/datasets/load", params={"id": items[0]["id"]}).json()
+    assert m["n"] == 12
+
+
+def test_no_hf_cli_is_an_empty_answer_not_an_error(tmp_path, monkeypatch):
+    """No `hf` on PATH is the normal state of a CI machine: (False, reason), and the caller
+    keeps answering "nothing found" the way every other missing-database case here does."""
+    monkeypatch.setenv("PATH", str(tmp_path / "no-bin-here"))
+    monkeypatch.setattr(archives, "hf_pull", _REAL_HF_PULL)
+    ok, message = archives.hf_pull(tmp_path / ".data")
+    assert ok is False and "not installed" in message

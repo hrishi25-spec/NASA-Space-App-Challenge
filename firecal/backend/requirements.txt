@@ -10,6 +10,8 @@ starlette>=0.40
 uvicorn[standard]
 python-multipart>=0.0.18
 pandas
+# parquet: the Hugging Face bucket's format (archives.py reads it, hf_export.py writes it)
+pyarrow
 numpy
 scikit-learn
 scipy

@@ -16,6 +16,11 @@ dist/
 .data/
 firecal/backend/model/
 
+# The harmonized-year dataset staged for `hf sync ./data hf://buckets/…`. Derived: it is
+# rebuilt from `.data/` by `firecal/backend/hf_export.py` and published to the Hugging Face
+# bucket, which is where it lives. A manifest and dataset card go with it.
+data/
+
 # Local configuration and secrets
 .env
 .env.local

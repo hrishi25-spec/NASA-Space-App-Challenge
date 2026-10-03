@@ -10,7 +10,7 @@ Satellites have tracked active fires for 20+ years, but the record is fragmented
 
 | Thing | State |
 |---|---|
-| Tests | 98 passing — 40 API smoke + 34 security + 24 local-archive, run in-process via `TestClient` |
+| Tests | 102 passing — 40 API smoke + 34 security + 28 local-archive, run in-process via `TestClient` |
 | Frontend build | Clean, including the prebuild lazy-export, adaptive-detail, chart-layout and orbital-drift guards |
 | Startup weight | Import ≈ 2.2 s, baseline RSS ≈ 104 MB (measured on the dev machine after the lazy scipy/sklearn change) |
 | Layout | Arranged per the repo standard; see [decisions/0001](decisions/0001-repository-layout.md) |

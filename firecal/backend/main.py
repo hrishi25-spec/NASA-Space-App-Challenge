@@ -439,6 +439,22 @@ EMPTY_DF = harmonize(pd.DataFrame(columns=["latitude", "longitude", "acq_date", 
 DF = EMPTY_DF.copy()
 
 
+def ensure_harmonized(raw: pd.DataFrame) -> pd.DataFrame:
+    """Harmonize a FIRMS frame, or pass through one already in this API's shape.
+
+    The Hugging Face bucket stores the record *after* `harmonize()` ran (that is what
+    `hf_export.py` writes), and those frames carry `lat`/`time`/`sensor` -- none of the FIRMS
+    columns `harmonize()` requires. Detecting the shape here keeps one rule for
+    `/datasets/load`: whatever comes back is in the working frame's columns, whether it was
+    read from a raw CSV byte-offset or fetched from the bucket, and the confidence floor and
+    de-duplication are the same on both paths because the exporter applied the same function.
+    """
+    cols = {str(c).strip().lower() for c in raw.columns}
+    if {"lat", "lon", "time", "date", "sensor", "conf"} <= cols:
+        return raw
+    return harmonize(raw)
+
+
 def _safe_name(name, limit: int = 80) -> str:
     """Make a client-supplied filename safe to echo back in an error body.
 
@@ -521,11 +537,16 @@ def list_datasets():
     """The FIRMS archives sitting on this machine, smallest first.
 
     The picker the console opens on. Absolute paths are not in the response: a relative id and
-    a byte count are all a caller needs, and a path is not a thing to publish. An empty list is
-    the normal answer on a fresh clone and in the container image, where the archives (10 GB,
-    git-ignored) simply are not there.
+    a byte count are all a caller needs, and a path is not a thing to publish. An empty local
+    folder is the normal answer on a fresh clone and in the container image, where the archives
+    (10 GB, git-ignored) simply are not there -- in that case the Hugging Face bucket is pulled
+    first (archives.hf_pull), because the shared record is the database of last resort.
     """
-    return {"items": [archives.public(item) for item in archives.scan_all(ARCHIVE_ROOTS)]}
+    items = archives.scan_all(ARCHIVE_ROOTS)
+    if not items and ARCHIVE_ROOTS:
+        archives.hf_pull(ARCHIVE_ROOTS[0])       # nothing local: fetch the bucket, rescan
+        items = archives.scan_all(ARCHIVE_ROOTS)
+    return {"items": [archives.public(item) for item in items]}
 
 
 @app.post("/datasets/load")
@@ -553,11 +574,20 @@ def load_dataset(id: str = None, limit: int = None, spread: bool = True, all: bo
     global DF, _LOAD_INFO
     items = archives.scan_all(ARCHIVE_ROOTS)
     if all:
+        if not items and ARCHIVE_ROOTS:
+            archives.hf_pull(ARCHIVE_ROOTS[0])   # fresh clone: the bucket is the merge source
+            items = archives.scan_all(ARCHIVE_ROOTS)
         if not items:
             raise HTTPException(400, "no local archives to merge; list them with GET /datasets")
         merged = True
     else:
         item = archives.find(items, id or "")
+        if item is None and ARCHIVE_ROOTS:
+            # Not on disk: pull the Hugging Face bucket and resolve again -- the database
+            # answers on demand, so an id nobody has ever downloaded here is still openable.
+            archives.hf_pull(ARCHIVE_ROOTS[0])
+            items = archives.scan_all(ARCHIVE_ROOTS)
+            item = archives.find(items, id or "")
         if item is None:
             raise HTTPException(404, "no such local archive; list them with GET /datasets")
         items, merged = [item], False
@@ -576,7 +606,7 @@ def load_dataset(id: str = None, limit: int = None, spread: bool = True, all: bo
     finally:
         _LOAD_SLOTS.release()
     try:
-        parts = [h for h in (harmonize(frame) for frame in sliced["frames"]) if not h.empty]
+        parts = [h for h in (ensure_harmonized(frame) for frame in sliced["frames"]) if not h.empty]
     except ValueError as e:      # a CSV in the folder that is not a FIRMS export
         raise HTTPException(400, f"{items[0]['name']}: {e}")
     if not parts:
