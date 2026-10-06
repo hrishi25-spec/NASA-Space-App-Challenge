@@ -12,11 +12,11 @@
 2. [Individual paper summaries](#2-individual-paper-summaries)
 3. [Cross-paper synthesis](#3-cross-paper-synthesis) — 3.1 sensors · 3.2 methods · 3.3 themes · 3.4 accuracy · 3.5 band reference · 3.6 study periods · 3.7 evidence quality
 4. [Critical notes and inconsistencies](#4-critical-notes-and-inconsistencies) — incl. 4.1 cross-paper consistency checks
-5. [How the papers fit together](#5-how-the-papers-fit-together)
-6. [Collated limitations and future work](#6-collated-limitations-and-future-work)
+5. [How the papers fit together](#5-how-the-papers-fit-together-workflow-view)
+6. [Collated limitations and future work](#6-collated-limitations-and-future-work-added)
 7. [Glossary](#7-glossary)
-8. [Relevance to Pyro-Harmony](#8-relevance-to-pyro-harmony) and [feature backlog](#9-feature-backlog-from-the-review-added)
-9. [Reference list](#reference-list)
+8. [Relevance to Pyro-Harmony](#8-relevance-to-pyro-harmony-added) and [feature backlog](#9-feature-backlog-from-the-review-added)
+9. [Reference list](#reference-list-papers-covered)
 
 > **Provenance note (added during review):** sections 1–7 are as compiled from the source PDFs; sections marked *added* in this revision (TOC, §3.5–3.7, §4.1, §6, §8–9, renumbered references) derive only from the content already in this document — no new external sources were consulted. The original author's confidence tags are preserved verbatim.
 

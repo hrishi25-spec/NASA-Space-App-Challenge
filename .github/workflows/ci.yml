@@ -45,3 +45,8 @@ jobs:
           python-version: "3.12"
       # Zero-dependency: parses the test files and the docs, so no pip install.
       - run: python scripts/check-doc-figures.py
+      # Relative links must resolve: file exists, case exact, #anchor names a heading.
+      - run: python scripts/check-doc-links.py
+      # ...and the guard itself has to keep doing that: its slug rules, case check
+      # and error classes are pinned by assertions, also on stdlib unittest.
+      - run: python scripts/test_check_doc_links.py

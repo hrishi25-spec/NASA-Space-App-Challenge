@@ -333,6 +333,31 @@ def test_broken_checkpoint_falls_back(tmp_path, monkeypatch):
     assert fc["model"].startswith("Seasonal climatology")
 
 
+def test_forecast_has_no_nan_when_a_day_of_year_is_missing():
+    """A record that wraps the year end never contains every day-of-year.
+
+    Real FIRMS downloads are a rolling window (e.g. 2025-09-30 -> 2026-09-22), so the
+    forecast horizon can start inside day-of-years the record simply has no rows for --
+    the archive/NRT seam.  Reindexing the seasonal climatology there produced NaN values
+    (and a NaN scale factor, poisoning the whole horizon).
+    """
+    saved = main.DF
+    try:
+        days = pd.date_range("2023-10-01", periods=200)   # wraps into 2024, so DOY 109+ is absent
+        main.DF = pd.DataFrame({
+            "lat": 10.0, "lon": 20.0, "time": days, "date": days.normalize(),
+            "sensor": "VIIRS", "sat": "N20", "conf": 80.0, "frp": 10.0, "bt": 330.0,
+            "scan": 0.5, "track": 0.5, "daynight": "N", "esfp": 0.444, "pixel_km2": 0.25})
+        main._invalidate()
+        fc = client.get("/forecast", params={"horizon": 30}).json()
+        assert fc["model"] and len(fc["forecast"]) == 30
+        counts = [f["count"] for f in fc["forecast"]]
+        assert all(c == c and c >= 0 for c in counts), counts   # NaN != NaN
+    finally:
+        main.DF = saved
+        main._invalidate()
+
+
 def test_bad_bbox_returns_400():
     assert client.get("/calendar", params={"bbox": "1,2,3"}).status_code == 400
     assert client.get("/calendar", params={"bbox": "999,0,999,1"}).status_code == 400
@@ -352,6 +377,32 @@ def test_good_csv_merges():
         b"1.0,2.0,2022-01-01,1345,55,10.5,330\n"), "text/csv"))
     r = client.post("/upload", files=[good])
     assert r.status_code == 200 and r.json()["n"] == before + 1
+
+
+def test_real_firms_instrument_labels_collapse_to_sensor_families():
+    """Suomi-NPP downloads say instrument="SNPP" where NOAA-20/21 say "VIIRS".
+
+    Both are the same 375 m sensor family, and the ESFP nadir / per-sensor rescaling /
+    illusion diagnostic only know "MODIS" and "VIIRS".  A raw platform label used to leak
+    through as a third sensor and then get normalised with the MODIS 1 km nadir, so these
+    three real-world labels must land in exactly two buckets.
+    """
+    headers = ("latitude,longitude,acq_date,acq_time,confidence,frp,brightness,"
+               "instrument,satellite\n")
+    def one(fname, instrument, sat, lat):
+        row = f"{lat},20.0,2022-05-05,1030,80,12.0,330,{instrument},{sat}\n".encode()
+        return ("files", (fname, io.BytesIO(headers.encode() + row), "text/csv"))
+    # One file per product, which is how FIRMS ships them.
+    files = [one("snpp.csv", "SNPP", "SNPP", 10.0),
+             one("n20.csv", "VIIRS", "N20", 10.1),
+             one("modis.csv", "MODIS", "Terra", 10.2)]
+    before = client.get("/meta").json()["sensors"]
+    r = client.post("/upload", files=files)
+    assert r.status_code == 200, r.text
+    sensors = r.json()["sensors"]
+    assert set(sensors) == {"MODIS", "VIIRS"}
+    assert sensors["VIIRS"] == before["VIIRS"] + 2
+    assert sensors["MODIS"] == before["MODIS"] + 1
 
 
 def test_upload_cp1252_csv():
@@ -374,6 +425,48 @@ def test_upload_utf16_csv():
     r = client.post("/upload", files=[csv])
     assert r.status_code == 200, r.text
     assert r.json()["n"] == before + 1
+
+
+def test_upload_reports_what_every_file_contributed():
+    """PRD gap 8: a file whose rows all fail harmonization is named, not silently dropped.
+
+    One good file beside one that harmonizes to nothing, against the dataset already on
+    screen: the merge goes through and the response says, per file, what arrived and what
+    did not. The old behaviour was a 200 that never mentioned the second file at all.
+    """
+    before = client.get("/meta").json()["n"]
+    good = ("files", ("good.csv", io.BytesIO(
+        b"latitude,longitude,acq_date,acq_time,confidence,frp,brightness\n"
+        b"7.0,8.0,2022-04-04,1200,60,11.0,335\n"), "text/csv"))
+    # Parses cleanly, but confidence 10 is under the floor: harmonize() drops the only row.
+    quiet = ("files", ("lowconf.csv", io.BytesIO(
+        b"latitude,longitude,acq_date,acq_time,confidence,frp,brightness\n"
+        b"7.5,8.5,2022-04-04,1200,10,11.0,335\n"), "text/csv"))
+    r = client.post("/upload", files=[good, quiet])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["n"] == before + 1
+    report = body["upload"]
+    assert (report["accepted"], report["rejected"], report["rows"]) == (1, 1, 1)
+    by_name = {f["file"]: f for f in report["files"]}
+    assert by_name["good.csv"]["status"] == "accepted" and by_name["good.csv"]["rows"] == 1
+    assert by_name["lowconf.csv"]["status"] == "rejected" and by_name["lowconf.csv"]["rows"] == 0
+    assert "confidence" in by_name["lowconf.csv"]["reason"]
+    # The report describes the response, not the dataset: a later /meta must not carry it.
+    assert "upload" not in client.get("/meta").json()
+
+
+def test_a_file_that_contributes_nothing_is_refused_not_ignored():
+    """Against an existing dataset, an all-dropped file used to answer 200 and change nothing."""
+    before = client.get("/meta").json()["n"]
+    junk = ("files", ("nothing.csv", io.BytesIO(
+        b"latitude,longitude,acq_date,acq_time,confidence,frp,brightness\n"
+        b"9.0,9.0,2022-05-05,0100,5,1.0,300\n"), "text/csv"))
+    r = client.post("/upload", files=[junk])
+    assert r.status_code == 400, r.text
+    detail = r.json()["detail"]
+    assert "nothing.csv" in detail and "usable rows" in detail
+    assert client.get("/meta").json()["n"] == before   # ...and the dataset really is untouched
 
 
 def test_clear():

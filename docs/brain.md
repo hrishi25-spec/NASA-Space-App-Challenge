@@ -10,7 +10,7 @@ Satellites have tracked active fires for 20+ years, but the record is fragmented
 
 | Thing | State |
 |---|---|
-| Tests | 102 passing — 40 API smoke + 34 security + 28 local-archive, run in-process via `TestClient` |
+| Tests | 106 passing — 44 API smoke + 34 security + 28 local-archive, run in-process via `TestClient` |
 | Frontend build | Clean, including the prebuild lazy-export, adaptive-detail, chart-layout and orbital-drift guards |
 | Startup weight | Import ≈ 2.2 s, baseline RSS ≈ 104 MB (measured on the dev machine after the lazy scipy/sklearn change) |
 | Layout | Arranged per the repo standard; see [decisions/0001](decisions/0001-repository-layout.md) |
@@ -47,9 +47,9 @@ Two structural decisions do most of the work:
 | `firecal/backend/test_*.py` | Smoke, security and archive suites, colocated with the app |
 | `firecal/frontend/src/` | Console: `App.jsx`, `MissionMap.jsx`, `panels.jsx`, `charts.jsx`, `plot.jsx`, `chartGeometry.js`, `lib.js`, `styles.css` |
 | `docs/` | This page, PRD, sensor review, challenge brief, ADRs |
-| `scripts/check.sh` / `.bat` + `scripts/check-doc-figures.py` | The same checks CI runs, and the guard that fails when a documented figure drifts from the code |
+| `scripts/check.sh` / `.bat` + `scripts/check-doc-figures.py` + `scripts/check-doc-links.py` + `scripts/test_check_doc_links.py` | The same checks CI runs: two doc guards (one fails when a documented figure drifts from the code, the other when a relative link does not resolve) plus the link guard's own test suite, so its rules cannot drift either |
 | `Dockerfile` | Console build + API in one image, one port ([decisions/0002](decisions/0002-single-image-deployment.md)) |
-| `.github/workflows/ci.yml` | pytest job + doc-figures job + frontend build job |
+| `.github/workflows/ci.yml` | pytest job + docs job (figures + links) + frontend build job |
 
 ## Data flow
 
@@ -96,6 +96,17 @@ FIRMS_MAP_KEY=… in .env            # enables POST /archive (real 1–5 day win
 - **The training archive is never committed.** `.data/` is ~10 GB of local NASA exports and `firecal/backend/model/` is derived from it; both are gitignored, and a missing or malformed checkpoint is not an error.
 - **Training and serving must harmonize identically.** `train.py` reads the archive through the server's own `harmonize(geometry=False)` and `harmonized_daily()`. A second implementation of the sensor rescale would train the model on a different quantity than the endpoint predicts.
 - **CSS uppercases labels.** Write labels in sentence case and let the contract do the casing; acronyms are the only all-caps strings in source.
+
+## Next steps
+
+The follow-ups from the last review round, highest value first — two have landed and are marked done; the PRD's [roadmap](PRD.md#14-roadmap) and [gap list](PRD.md#13-known-gaps--risks) hold the full picture:
+
+| Step | Why it is next |
+|---|---|
+| Launch the console live and verify calendar, forecast and the dataset picker end to end | This repo is developed on Windows, the one platform the docs admit was never exercised (PRD gap 5); the suite now passes here, so the running app is the remaining check |
+| Add a Windows job to the CI matrix | The suite is green on Windows since the `hf`-CLI resolution fix (`archives.py`); CI should keep it that way (NFR-5) |
+| ✅ Done — per-file upload outcomes in `/upload` | PRD gap 8 is closed: a file whose rows all fail harmonization used to be silently ignored when a dataset already exists (200, unchanged data); the response now carries an `upload` block naming each file's rows or refusal reason, a request where nothing is accepted is a 400 naming every file, and the console shows it in a neutral banner |
+| ✅ Done — keep the root a lobby per [ADR 0001](decisions/0001-repository-layout.md) | `TRAINING_REPORT.md` and `TRAINING_BRIEFING.md` (the `train_data.py` outputs) are gitignored and the stray `~/skills/` folder a tool created in the repo root is gone — the root holds only product files again |
 
 ## Where to look next
 

@@ -116,11 +116,27 @@ const DRAWER_TABS = [
   { id: "briefing", label: "Briefing detail" },
 ];
 
+// One line for the per-file report /upload returns: what every file contributed, or why it
+// was refused. The API never drops a file in silence any more (PRD gap 8), and this is how
+// the console shows that -- a rejected file used to leave no trace in the response at all.
+function describeUpload(m) {
+  const u = m && m.upload;
+  if (!u) return null;
+  const perFile = u.files.map(f => f.status === "accepted"
+    ? `${f.file} +${fmt(f.rows)} rows`
+    : `${f.file} refused — ${f.reason}`);
+  return `Upload: ${u.accepted} accepted, ${u.rejected} refused · ${perFile.join(" · ")}`;
+}
+
 export default function App() {
   const [meta, setMeta] = useState({ n: 0 }), [bbox, setBbox] = useState(null), [pick, setPick] = useState(false);
   const [cal, setCal] = useState([]), [pts, setPts] = useState([]), [cl, setCl] = useState([]), [an, setAn] = useState(null), [fc, setFc] = useState(null);
   const [day, setDay] = useState(null), [span, setSpan] = useState(1), [busy, setBusy] = useState(false), [err, setErr] = useState(null);
   const [live, setLive] = useState(null), [diagKey, setDiagKey] = useState(0), [yearSel, setYearSel] = useState("all");
+  // What the last upload said about each file (accepted/rejected + why): a fact about that
+  // response, so it lives in component state and is dropped by the next dataset change --
+  // unlike `meta.load`, which describes the dataset and must survive a refresh.
+  const [uploadNote, setUploadNote] = useState(null);
   // Bumped whenever the dataset itself is replaced. The reload effect keyed on meta.n alone
   // would not re-run when the next dataset has the same hotspot count, leaving the cursor day
   // null and the calendar empty, so the dataset gets its own version counter.
@@ -192,6 +208,7 @@ export default function App() {
   // lands here, so the
   // memoized queries are dropped and the panels refetch against the new record.
   function datasetChanged(m) {
+    setUploadNote(null);
     setMeta(m); invalidateApiCache(); setDay(null); setDataKey(k => k + 1); setDiagKey(k => k + 1);
   }
   const end = day && new Date(new Date(day).getTime() + (span - 1) * 864e5).toISOString().slice(0, 10);
@@ -206,11 +223,11 @@ export default function App() {
 
   async function upload(e) {
     if (!e.target.files.length) return;
-    const fd = new FormData(); [...e.target.files].forEach(f => fd.append("files", f)); setBusy(true); setErr(null);
+    const fd = new FormData(); [...e.target.files].forEach(f => fd.append("files", f)); setBusy(true); setErr(null); setUploadNote(null);
     try {
       const r = await fetch("/api/upload", { method: "POST", body: fd });
       if (!r.ok) setErr("Upload failed: " + await errMsg(r));
-      else datasetChanged(await r.json());
+      else { const m = await r.json(); datasetChanged(m); setUploadNote(describeUpload(m)); }
     } catch { setErr("Upload failed — could not reach the backend."); }
     setBusy(false); e.target.value = "";
   }
@@ -252,6 +269,7 @@ export default function App() {
     </header>
 
     {err && <div className="banner">⚠ {err}</div>}
+    {!err && uploadNote && <div className="banner note">✓ {uploadNote}</div>}
 
     {!meta.n ? <div className="panel" style={{ margin: 18, maxWidth: 760 }}>
       <h3>Standby — choose a dataset</h3>

@@ -158,6 +158,26 @@ async def same_origin_writes(request, call_next):
 CONF_MAP = {"l": 20, "low": 20, "n": 60, "nominal": 60, "h": 90, "high": 90}
 REQUIRED = {"latitude", "longitude", "acq_date", "acq_time", "confidence"}
 
+# FIRMS labels every product with its own `instrument` string and they are not consistent:
+# the NOAA-20/21 downloads say instrument="VIIRS", but the Suomi-NPP download says
+# instrument="SNPP".  Every model below only knows the two sensor *families* -- `_esfp`
+# picks the nadir cell from that label, `daily()` rescales per sensor, and the illusion
+# diagnostic looks up literal "MODIS"/"VIIRS" columns -- so a raw label like "SNPP"
+# silently became a third sensor and got normalised with the MODIS 1 km nadir.
+SENSOR_FAMILIES = (
+    ("MODIS", ("MODIS", "MOD14", "MYD14", "TERRA", "AQUA")),
+    ("VIIRS", ("VIIRS", "SNPP", "SUOMI", "NPP", "N20", "N21", "NOAA-20", "NOAA-21", "JPSS")),
+)
+
+
+def _sensor_family(label, default: str) -> str:
+    """Collapse a FIRMS platform label onto the MODIS / VIIRS family it belongs to."""
+    t = str(label).upper()
+    for family, keys in SENSOR_FAMILIES:
+        if any(k in t for k in keys):
+            return family
+    return default
+
 # Live NASA FIRMS open NRT feeds (public, no key needed) — poster pillar 3.
 FIRMS_24H = ("https://firms.modaps.eosdis.nasa.gov/data/active_fire/")
 LIVE_FEEDS = {
@@ -359,9 +379,17 @@ SENSOR_ALIASES = {
 
 
 def sensor_of(stated: str, default: str = "MODIS") -> str:
-    """The instrument a FIRMS product string names, or `default` if it names none."""
+    """The instrument a FIRMS product string names, or `default` if it names none.
+
+    The exact `SENSOR_ALIASES` spelling first, then the same families by substring
+    (`SENSOR_FAMILIES`), so a label the alias table does not spell out -- `SUOMI-NPP`,
+    `VIIRS NOAA-20` -- still lands in the right family; anything neither names passes
+    through unchanged, which is the old behaviour.
+    """
     key = str(stated).strip().upper()
-    return SENSOR_ALIASES.get(key, key or default)
+    if key in SENSOR_ALIASES:
+        return SENSOR_ALIASES[key]
+    return _sensor_family(key, key or default)
 
 
 def _esfp(scan, track, sensor):
@@ -400,6 +428,7 @@ def harmonize(raw: pd.DataFrame, geometry: bool = True) -> pd.DataFrame:
     bt_col = "bright_ti4" if viirs else "brightness"
     sensor = "VIIRS" if viirs else "MODIS"
     if "instrument" in d.columns and d["instrument"].notna().any():
+        # The platform itself is still preserved per-row in `sat`.
         sensor = sensor_of(d["instrument"].dropna().iloc[0], default=sensor)
     #    numeric confidence if parseable (MODIS 0-100), else l/n/h map (VIIRS); unknown -> dropped
     conf = pd.to_numeric(d["confidence"], errors="coerce")
@@ -494,6 +523,8 @@ async def upload(files: list[UploadFile] = File(...), demo_transition: bool = Fa
         raise HTTPException(400, f"too many files: {len(files)} (limit {MAX_UPLOAD_FILES} per request)")
     parts = [DF] if len(DF) else []
     rows_in = 0
+    # One entry per uploaded file, in request order: what it contributed, or why it did not.
+    report = []
     # The poster's 2002-2024 illusion dataset used to load whenever a file happened to be
     # *named* demo_transition.csv. A filename is client-controlled input and must never
     # select server behaviour: that made the upload's real content irrelevant, and anyone
@@ -504,32 +535,55 @@ async def upload(files: list[UploadFile] = File(...), demo_transition: bool = Fa
     for f in files:
         name = _safe_name(f.filename)
         blob = await _read_capped(f, MAX_FILE_BYTES)
+        # Every file is accounted for: accepted with the rows it contributed, or refused with
+        # the reason. A file whose rows all fail harmonization used to be dropped in silence
+        # whenever a dataset already existed -- the caller got a 200 and a record that never
+        # changed (PRD gap 8).
         try:
             raw = read_firms_csv(blob)
         except Exception as e:
-            raise HTTPException(400, f"{name}: not a readable CSV ({e})")
+            report.append({"file": name, "rows": 0, "status": "rejected",
+                           "reason": f"not a readable CSV ({e})"})
+            continue
         try:
             h = harmonize(raw)
         except ValueError as e:
-            raise HTTPException(400, f"{name}: {e}")
-        if not h.empty:
-            # Capped here, not after the concat below. `MAX_UPLOAD_BYTES` bounds the bytes on
-            # the wire, but one FIRMS row expands into ~14 typed columns, so a request sitting
-            # exactly at that limit holds several hundred MB of frames -- and the old cap only
-            # ran once `pd.concat` had already copied every one of them.
-            rows_in += len(h)
-            if rows_in > MAX_ROWS:
-                raise HTTPException(413, f"too many rows in one upload: over {MAX_ROWS:,} "
-                                         f"after low-confidence filtering -- split it across requests")
-            parts.append(h)
-    if not parts:
-        raise HTTPException(400, "No usable rows found: need FIRMS-style CSVs with "
-                                 "latitude/longitude/acq_date/acq_time and confidence >= 30")
+            report.append({"file": name, "rows": 0, "status": "rejected", "reason": str(e)})
+            continue
+        if h.empty:
+            report.append({"file": name, "rows": 0, "status": "rejected",
+                           "reason": "no usable rows -- every row was low-confidence, out of "
+                                     "range or incomplete (need FIRMS-style "
+                                     "latitude/longitude/acq_date/acq_time with confidence >= 30)"})
+            continue
+        # Capped here, not after the concat below. `MAX_UPLOAD_BYTES` bounds the bytes on
+        # the wire, but one FIRMS row expands into ~14 typed columns, so a request sitting
+        # exactly at that limit holds several hundred MB of frames -- and the old cap only
+        # ran once `pd.concat` had already copied every one of them.
+        rows_in += len(h)
+        if rows_in > MAX_ROWS:
+            raise HTTPException(413, f"too many rows in one upload: over {MAX_ROWS:,} "
+                                     f"after low-confidence filtering -- split it across requests")
+        parts.append(h)
+        report.append({"file": name, "rows": int(len(h)), "status": "accepted"})
+    accepted = sum(1 for entry in report if entry["status"] == "accepted")
+    if not accepted:
+        # Nothing merged: say what every file contributed and why, instead of answering 200
+        # over an unchanged dataset. One string -- that is what `errMsg()` renders in the console.
+        raise HTTPException(400, "; ".join(
+            f"{entry['file']}: {entry['reason']}" for entry in report))
     DF = pd.concat(parts).drop_duplicates(["lat", "lon", "time", "sensor"]).reset_index(drop=True)
     if len(DF) > MAX_ROWS:
         DF = DF.tail(MAX_ROWS).reset_index(drop=True)
     _invalidate()
-    return meta()
+    # A fact about *this* response, not about the dataset: `_invalidate()` has just cleared the
+    # dataset's own note, so `upload` rides on this body only and a later `GET /meta` does not
+    # carry it (unlike `load`, which describes the archive the record was opened from).
+    m = meta()
+    m["upload"] = {"files": report, "accepted": accepted,
+                   "rejected": len(files) - accepted,
+                   "rows": sum(entry["rows"] for entry in report)}
+    return m
 
 
 @app.get("/datasets")
@@ -1432,6 +1486,12 @@ def forecast(bbox: str = None, horizon: int = 30, epochs: int = 40):
         model = "LSTM (PyTorch) + archive seed" if warm else "LSTM (PyTorch)"
     except ImportError:  # seasonal fallback: same-day climatology scaled to recent level
         clim, prior = _seasonal_climatology(s, box)
+        # A real single-season download can miss whole day-of-years: the FIRMS archive/NRT
+        # seam leaves the days between the last NRT date and the first archive date absent,
+        # and the forecast window starts exactly there. Reindexing left NaN holes -- and a
+        # NaN scale, so the whole forecast came back NaN. Interpolate across the full year
+        # before the rolling smooth.
+        clim = clim.reindex(range(1, 367)).interpolate(limit_direction="both")
         clim = clim.rolling(15, center=True, min_periods=1).mean()
         scale = (s[-30:].mean() + 1) / (clim.reindex(s[-30:].index.dayofyear).mean() + 1)
         vals = clim.reindex(idx.dayofyear).values * scale
@@ -1455,8 +1515,9 @@ def forecast(bbox: str = None, horizon: int = 30, epochs: int = 40):
 # endpoint starts with /api, so the rewrite cannot shadow one -- and the unprefixed paths keep
 # working, which is what curl, the tests and the launcher's readiness probe use.
 #
-# Registered last, which makes it the outermost middleware: gzip, CORS and the upload cap then
-# all see the same un-prefixed path they were written against.
+# Registered after gzip, CORS, the upload cap and the origin gate, so those all see the same
+# un-prefixed path they were written against. The response hardener below is registered after
+# this one (outermost of all) purely so its headers stamp every response, refusals included.
 API_PREFIX = "/api"
 
 

@@ -122,7 +122,8 @@ def check_claims(relpath: str, pattern: str, expected: tuple[int, ...], note: st
 
 
 def markdown_files():
-    skip = {".git", "node_modules", ".venv", "dist", "__pycache__", ".data", "model"}
+    skip = {".git", "node_modules", ".venv", "dist", "__pycache__", ".pytest_cache",
+            ".data", "model"}
     for path in sorted(ROOT.rglob("*.md")):
         if not any(part in skip for part in path.parts):
             yield path

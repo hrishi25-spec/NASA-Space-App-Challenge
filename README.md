@@ -155,7 +155,21 @@ The Vite dev server proxies `/api` → `:8000` automatically (`firecal/frontend/
    **MODIS C6.1** and/or **VIIRS SNPP / NOAA-20 / NOAA-21**, same country/region so the
    sensors overlap.
 2. Click **Upload FIRMS CSVs** in the app (multiple files at once are fine).
-3. For **anomalies** and the **forecast**, upload **more than one year** of data.
+3. The **forecast** needs at least ~120 days; **anomalies**, z-score streaks and the
+   **illusion diagnostic** need **more than one year** (the diagnostic needs the pre-2012
+   MODIS era and the 2012–2015 overlap specifically).
+
+To run every model over a folder of downloads at once, and get a report of what that
+record can support instead of clicking through the UI:
+
+```bash
+python firecal/backend/train_data.py ~/Downloads/DL_FIRE_*
+```
+
+It loads the CSVs through the same parse + harmonize path as `/upload`, then writes
+`TRAINING_REPORT.md` (per-model trained/partial/skipped, with the numbers) and
+`TRAINING_BRIEFING.md` (the Incident Commander report for that data). Add `--demo-compare`
+to also run the illusion diagnostic on the 2002–2024 dataset for contrast.
 
 Or let the backend pull a real window for you: with a free
 [FIRMS MAP_KEY](https://firms.modaps.eosdis.nasa.gov/api/map_key/) in `.env`, **Real 3-day
@@ -285,7 +299,7 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
 
 | Method & path | Parameters | Description |
 |---|---|---|
-| `POST /upload` | multipart `files[]`, `demo_transition` (bool) | Add FIRMS CSVs (200 MB/file, 400 MB/request, ≤20 files). HTTP 400 with the sanitised filename and reason on bad files, HTTP 413 if the request declares more than 400 MB. `demo_transition=true` replaces the dataset with the 2002–2024 demo — the poster dataset is loaded by this flag, **not** by naming a file `demo_transition.csv`. |
+| `POST /upload` | multipart `files[]`, `demo_transition` (bool) | Add FIRMS CSVs (200 MB/file, 400 MB/request, ≤20 files). Returns `meta` plus an `upload` report naming every file — `files[]` with `rows`, `status` (accepted/rejected) and `reason`, plus `accepted`/`rejected` counts — so a file that harmonizes to nothing is never dropped in silence. HTTP 400 whose detail names each file and its reason when nothing is accepted, HTTP 413 if the request declares more than 400 MB. `demo_transition=true` replaces the dataset with the 2002–2024 demo — the poster dataset is loaded by this flag, **not** by naming a file `demo_transition.csv`. |
 | `POST /datasets/load` | `id`, `all` (bool), `limit` (1,000–2,000,000; default 750,000, or 2,000,000 when `all=true`), `spread` (bool, default true) | Open a local archive — or, with `all=true`, **every** archive merged into one record: all sensors, all years. Rows are *read*, so the reader stops and a 1.87 GB file costs about what a 50 MB one does; with `all=true` the budget is split across the files by size. An id the local inventory does not hold is resolved against the Hugging Face bucket first (`hf sync hf://buckets/hriishiibanerjee/FIRMS_DATA` into the cache, then re-listed), so the shared record opens on a machine with no `.data/` at all. Parquet files (the bucket's format) open like CSVs — already-harmonized frames are passed through instead of re-harmonized. HTTP 404 for an id the inventory does not hold (400 when `all=true` and nothing exists locally or remotely), 429 while another archive is opening, 400 when a CSV is not a FIRMS export or holds no usable rows. Returns `meta` plus a **`load`** block — for one file `file/sensor/kind/mb/capped`, for a merge `merged/archives/sensors/files[]/skipped[]` naming each export's rows — plus `rows_read`, `rows_kept`, `rows_estimate`, `spread`, `limit`. The console labels the slice from it, because the record on screen and the file it came from are not the same span. |
 | `GET /datasets` | — | The FIRMS archives found on this machine, smallest first: `{id, name, sensor, kind, label, bytes, mb}` each. `id` is relative to the archive root and is the only handle the load endpoint accepts — no absolute path is published, not even the roots that were walked. When nothing is local (fresh clone, container, CI), the Hugging Face bucket is pulled into the cache first and listed; `{"items": []}` means both the folder and the bucket came up empty (or unreachable). |
 | `POST /demo` | `mode=standard\|transition`, `region` | **Fixture, not a console feature** — the console has no demo button. Replace data with the synthetic 2020–2024 set, or the 2002–2024 transition set. `region` scopes the generated record (and its own seed) to a preset AOI; HTTP 400 for an unknown key. It is what the test suite loads, and the only data source a checkout without `.data/` has. |
@@ -320,8 +334,10 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
 ├── Dockerfile                      ← console build + API in one image (see decisions/0002)
 ├── .dockerignore                   ← keeps host node_modules/.venv/dist out of the build
 ├── scripts/
-│   ├── check.sh / check.bat        ← the same checks CI runs (backend tests + doc figures + frontend build)
-│   └── check-doc-figures.py        ← fails when a documented count or guard name drifts from the code
+│   ├── check.sh / check.bat        ← the same checks CI runs (backend tests + doc figures + doc links + its self-test + frontend build)
+│   ├── check-doc-figures.py        ← fails when a documented count or guard name drifts from the code
+│   ├── check-doc-links.py          ← fails when a relative link does not resolve (file, case, anchor, or an untracked file)
+│   └── test_check_doc_links.py     ← the link guard's own tests: slug rules, case check, four error classes
 ├── docs/
 │   ├── README.md                   ← docs index
 │   ├── PRD.md                      ← product requirements: features, acceptance criteria, status
@@ -338,8 +354,8 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
     │   ├── archives.py             ← the local archive inventory + the bounded, spread slice reader
     │   ├── train.py                ← trains the model from the FIRMS archive (writes model/)
     │   ├── forecast_model.py       ← the trained prior: 2° cell × day-of-year, checkpoint IO
-    │   ├── model/                  ← trained checkpoint (gitignored; rebuilt by train.py)
-    │   ├── test_smoke.py           ← 40-test API smoke suite (encodings, gzip, cache, presets, archive, training, /api prefix)
+    │   ├── train_data.py           ← headless run of every model over your own CSVs + a Markdown report
+    │   ├── model/                  ← trained checkpoint (gitignored; rebuilt by train.py)     │   ├── test_smoke.py           ← 44-test API smoke suite (encodings, gzip, cache, presets, archive, training, /api prefix)
     │   ├── test_security.py        ← 34-test hardening suite (URL allowlist, upload caps, CORS, CSP hosts)
     │   ├── test_archives.py        ← 28-test suite for the local-archive picker (inventory, slice, merge, ids, gate, HF bucket)
     │   ├── requirements.txt        ← runtime deps (with security floors)
@@ -474,7 +490,7 @@ scripts/check.sh          # POSIX — or scripts\check.bat on Windows
 Both are thin wrappers around the commands below, which is also what CI runs:
 
 ```bash
-# 102 tests, ~2 min — starts the app in-process via TestClient
+# 106 tests, ~2 min — starts the app in-process via TestClient
 cd firecal/backend
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest -q
@@ -486,11 +502,17 @@ npm run check:charts
 
 # Doc figures — fails when a documented count or guard name drifts from the code
 python scripts/check-doc-figures.py
+
+# Doc links — fails when a relative link does not resolve
+python scripts/check-doc-links.py
+
+# …and that guard's own tests, so its rules stay put
+python scripts/test_check_doc_links.py
 ```
 
-`.github/workflows/ci.yml` runs all three on every push to `main` and on pull requests.
+`.github/workflows/ci.yml` runs all five on every push to `main` and on pull requests.
 
-**`test_smoke.py` (40)** covers every endpoint end-to-end — demo load, calendar with and
+**`test_smoke.py` (44)** covers every endpoint end-to-end — demo load, calendar with and
 without bbox, points clamping, clusters, climatology envelope, illusion diagnostic on both
 demos, briefing JSON + Markdown, live feed (skipped offline when FIRMS is unreachable),
 anomalies, forecast — plus error paths (bad bbox → 400, missing-column CSV → 400, valid CSV
@@ -559,6 +581,35 @@ but not quietly dropped. It cross-checks guard names the same way: every `check-
 in a markdown file exists on disk, every guard on disk is named in this README and the
 frontend guide, and every guard is wired into an npm script that `prebuild` chains. Zero
 dependencies, its own `docs` CI job, and the first step of `scripts/check.sh`.
+
+**`scripts/check-doc-links.py`** holds the other half of that job: every relative link in
+every markdown file has to resolve. It fails on four things — a target that does not
+exist, a target spelled with the wrong case (NTFS and macOS resolve `README.md` for
+`readme.md`; GitHub does not), a `#fragment` that names no heading, and a target that is
+not in git, so a fresh clone will not have it: a generated report, a local dataset, or a
+file nobody has committed. A tracked file that also matches a `.gitignore` line is fine —
+that combination is ordinary. The anchor check
+uses GitHub's own slug rules, so a table of contents has to name the heading in full:
+`## 5. How the Papers Fit Together (Workflow View)` is `#5-how-the-papers-fit-together-workflow-view`.
+Code blocks, external URLs and anchors on non-markdown files are left alone. It is what
+found the four dead anchors in `docs/modis-viirs-integrated-review.md` — links that had
+been quietly going nowhere. Stdlib plus `git` itself, with no network: where git is not
+available the first three checks still run and the tracked check is skipped rather than
+failing the build for the wrong reason. Same `docs` CI job, second step of
+`scripts/check.sh`.
+
+**`scripts/test_check_doc_links.py`** is that guard's own test suite, because a guard
+that fails builds deserves to have its own rules checked. 34 stdlib `unittest` tests pin
+the slug rules (lowercasing, punctuation dropped rather than hyphenated, `-1`/`-2` on
+repeated headings, and inline code keeping its contents — ``## The `x.py` guard`` is
+`#the-xpy-guard`, because GitHub strips the backticks and not what is between them), the
+case check, the link parser and all four error classes, each of those driven through
+`main()` against a throwaway git repository. It runs on stock python in the same CI job,
+so the guard needs no dependencies to be trustworthy. It has already paid for itself:
+writing it turned up two real bugs — a `#fragment` discarded whenever a link also carried
+a query string, and headings inside a fenced block offered as anchors GitHub would never
+create — and every rule it pins has been checked by reverting that rule and confirming
+the suite goes red.
 
 ## Configuration & limits
 

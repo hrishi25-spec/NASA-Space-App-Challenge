@@ -19,10 +19,20 @@ It runs exactly what CI runs (`.github/workflows/ci.yml`):
    and no imports — and fails when a count the docs quote drifts from the code, when a
    tracked claim disappears from the docs, or when a prebuild-guard name in a document no
    longer matches a file on disk or the npm wiring.
-2. **Backend suite — 102 tests** (`cd firecal/backend && .venv/bin/pytest -q`):
-   40 smoke + 34 security + 28 local-archive, in-process via `TestClient`. No network,
+2. **Doc links** (`python scripts/check-doc-links.py`): every relative link in every
+   markdown file must resolve — the target exists, spelled with the same case (the remote
+   is case-sensitive even where a checkout is not), and any `#fragment` names a real
+   heading under GitHub's slug rules; and the target is in git, because a generated
+   report or a local dataset renders on this machine and 404s for everyone else. Stdlib
+   plus `git`, no network — without git the tracked check is skipped, not failed.
+3. **Doc-link self-test** (`python scripts/test_check_doc_links.py`): the link guard's
+   own rules — slug construction, the case check, the link parser, and each of the four
+   error classes — as assertions, so changing one has to be deliberate. 34 stdlib
+   `unittest` tests, no pytest and no network, so the `docs` job still installs nothing.
+4. **Backend suite — 106 tests** (`cd firecal/backend && .venv/bin/pytest -q`):
+   44 smoke + 34 security + 28 local-archive, in-process via `TestClient`. No network,
    no `.data/` archive, no trained model required — fixtures are built inside the tests.
-3. **Frontend production build** (`cd firecal/frontend && npm run build`): the
+5. **Frontend production build** (`cd firecal/frontend && npm run build`): the
    `prebuild` step runs four zero-dependency guards — `check-lazy-exports.mjs`,
    `check-quality-policy.mjs`, `check-chart-fill.mjs`, `check-spin-policy.mjs` — then
    Vite bundles. Run one guard alone with `npm run check:charts` (or `check:lazy`,
@@ -140,8 +150,12 @@ seasonal climatology and the UI names the fallback.
   console would notice, not the diff.
 - Layout decisions that are expensive to reverse get an ADR in
   [docs/decisions/](decisions/); everything else is prose.
-- Links are checked in review: a relative link that points at a file this repository
-  does not contain is an error (this file replaced one that had several).
+- Links must resolve: a relative link that points at a file this repository does not
+  contain, spells it with the wrong case, points at an anchor no heading produces, or
+  names a file git is not tracking is an error. `scripts/check-doc-links.py` fails CI on
+  all four — it caught four dead
+  anchors in `docs/modis-viirs-integrated-review.md` the day it was added, and
+  `scripts/test_check_doc_links.py` is what keeps those rules from drifting.
 
 ## Pull requests
 

@@ -128,8 +128,13 @@ def test_live_repeats_are_served_from_a_short_cache(monkeypatch):
     assert second.json() == first.json()
     assert len(calls) == len(main.LIVE_FEEDS)      # four feeds, fetched once
 
-    # ...and it does expire, so the panel is never permanently stale
+    # ...and it does expire, so the panel is never permanently stale. The stamp is aged by
+    # hand rather than trusting the clock: `time.monotonic()` is GetTickCount64 on Windows
+    # (15.6 ms ticks), so "expired the moment TTL hit 0" only fires when the request happens
+    # to land in a later tick than the cache write -- on a warm run everything fits in one.
     monkeypatch.setattr(main, "_LIVE_TTL", 0.0)
+    for k, (stamp, entry) in list(main._LIVE_CACHE.items()):
+        main._LIVE_CACHE[k] = (stamp - 1.0, entry)
     assert client.get("/live", params={"region": "Europe"}).status_code == 200
     assert len(calls) == 2 * len(main.LIVE_FEEDS)
     main._LIVE_CACHE.clear()

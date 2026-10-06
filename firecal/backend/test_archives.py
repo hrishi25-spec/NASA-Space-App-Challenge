@@ -11,6 +11,7 @@ here do not leak into it.
 """
 import io
 import json
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -380,12 +381,21 @@ def test_an_empty_local_folder_pulls_the_bucket(tmp_path, monkeypatch):
     _bucket_parquet(tmp_path / "raw.csv", bucket / BUCKET_PARQUET, days=3, per_day=4)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    fake = bin_dir / "hf"
-    fake.write_text("#!/bin/sh\n# argv: sync SOURCE DEST\nmkdir -p \"$3\"\n"
-                     "cp \"$FAKE_BUCKET\"/* \"$3\"/\n", encoding="utf-8")
-    fake.chmod(0o755)
+    # A fake CLI per OS: a POSIX shell script where shebangs run, a batch file where
+    # PATHEXT does (`hf_pull` resolves the command through shutil.which, so a .bat is found).
+    if os.name == "nt":
+        fake = bin_dir / "hf.bat"
+        fake.write_text("@echo off\r\nif not exist \"%~3\" mkdir \"%~3\"\r\n"
+                        "copy /Y \"%FAKE_BUCKET%\\*\" \"%~3\\\" >NUL\r\n", encoding="utf-8")
+    else:
+        fake = bin_dir / "hf"
+        fake.write_text("#!/bin/sh\n# argv: sync SOURCE DEST\nmkdir -p \"$3\"\n"
+                        "cp \"$FAKE_BUCKET\"/* \"$3\"/\n", encoding="utf-8")
+        fake.chmod(0o755)
     monkeypatch.setenv("FAKE_BUCKET", str(bucket))
-    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    # Prepend only: the fake must win over any real `hf`, and the platform's own PATH
+    # (with os.pathsep, not a hardcoded `:`) supplies everything else the shim needs.
+    monkeypatch.setenv("PATH", os.pathsep.join([str(bin_dir), os.environ.get("PATH", "")]))
     monkeypatch.setattr(archives, "hf_pull", _REAL_HF_PULL)     # undo the no-network stub
     root = tmp_path / ".data"
     monkeypatch.setattr(main, "ARCHIVE_ROOTS", [root])

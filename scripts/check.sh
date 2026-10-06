@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The one command that must pass before a review — the same checks CI runs:
-# the doc-figure guard, the backend test suite, then the frontend production
-# build (whose prebuild step runs the lazy-export, adaptive-detail, chart-layout
-# and orbital-drift guards).  Dependency setup is the launcher's job: run.py.
+# the doc-figure guard, the doc-link guard and that guard's own test suite, the
+# backend test suite, then the frontend production build (whose prebuild step
+# runs the lazy-export, adaptive-detail, chart-layout and orbital-drift guards).
+# Dependency setup is the launcher's job: run.py.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -19,6 +20,14 @@ else
     fi
 fi
 "$PY" scripts/check-doc-figures.py
+
+echo
+echo "== doc links =="
+"$PY" scripts/check-doc-links.py
+
+echo
+echo "== doc-link self-test =="
+"$PY" scripts/test_check_doc_links.py
 
 echo
 echo "== backend tests =="
@@ -42,4 +51,4 @@ cd ../frontend
 npm run build
 
 echo
-echo "OK — doc figures, backend tests and frontend build all passed."
+echo "OK — doc figures, doc links, the doc-link self-test, backend tests and frontend build all passed."

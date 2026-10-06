@@ -38,3 +38,8 @@ github setup/
 .DS_Store
 Thumbs.db
 *.swp
+
+# train_data.py's run reports: written to the repo root on demand, derived from a run
+# rather than part of the product docs (ADR 0001 keeps the root a lobby)
+TRAINING_REPORT.md
+TRAINING_BRIEFING.md

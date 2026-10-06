@@ -23,6 +23,7 @@ Two rules this module exists to keep:
     archives are git-ignored and gigabytes), so every function here answers "nothing found"
     rather than raising. The console has an upload path and a live feed without it.
 """
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -398,12 +399,16 @@ def hf_pull(root: Path, timeout: int = HF_SYNC_TIMEOUT) -> tuple[bool, str]:
     cannot reach the database is in the same state as one that has no archives: nothing found.
     """
     dest = root / HF_CACHE
+    # Resolve once, here. CreateProcess on Windows appends only `.exe` to a bare name, so a
+    # `hf` that PATH lookup can see (a .bat shim, an alias) would still fail to spawn; `which`
+    # applies PATHEXT and hands subprocess a name it can always run, on every OS.
+    hf = shutil.which("hf")
+    if hf is None:
+        return False, "hf CLI not installed"
     try:
         dest.mkdir(parents=True, exist_ok=True)
-        proc = subprocess.run(["hf", "sync", HF_BUCKET, str(dest)], capture_output=True,
+        proc = subprocess.run([hf, "sync", HF_BUCKET, str(dest)], capture_output=True,
                               text=True, timeout=timeout)
-    except FileNotFoundError:
-        return False, "hf CLI not installed"
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, f"{type(e).__name__}: {e}"
     if proc.returncode != 0:

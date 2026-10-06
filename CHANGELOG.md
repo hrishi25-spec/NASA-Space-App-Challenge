@@ -6,6 +6,37 @@ User-facing changes, newest first. The format follows [Keep a Changelog](https:/
 
 ### Added
 
+- **A dead link in the docs now fails the build.** `scripts/check-doc-links.py` walks every
+  relative link in every markdown file and resolves it: the target must exist, be spelled
+  with the same case, be in git so a fresh clone has it, and any `#fragment` must name a
+  real heading under GitHub's slug rules. That last one is why a table of contents has to name a heading in full —
+  `## 5. How the Papers Fit Together (Workflow View)` is anchored as
+  `#5-how-the-papers-fit-together-workflow-view`, so a shortened `#5-how-the-papers-fit-together`
+  jumps nowhere. Code blocks, external URLs and anchors on non-markdown files are left
+  alone. Two of the four are quiet on a developer machine: a wrong-case link resolves on
+  NTFS and macOS, and an untracked one — a generated report, a local dataset, a file never
+  `git add`ed — renders here and 404s for everyone else. A tracked file that also matches a
+  `.gitignore` line is accepted, because that combination is ordinary. Adding it found four dead anchors in the
+  MODIS/VIIRS sensor review, all now fixed — `docs/AGENTS.md` had asked reviewers to catch
+  this by hand, and there was no guarantee anyone would. Stdlib plus `git` — no network, and
+  without git the tracked check is skipped rather than failing the build for the wrong
+  reason. It runs in the same CI `docs` job as the figure guard and as the second step of
+  `scripts/check.sh`.
+
+- **The link guard now has tests of its own.** `scripts/test_check_doc_links.py` pins those
+  rules with 34 stdlib `unittest` assertions instead of leaving them to a manual probe: the
+  slug rules (lowercasing, punctuation dropped rather than hyphenated, `-1`/`-2` on repeated
+  headings, inline code keeping its contents), the case check, the link parser, and each of
+  the four error classes — the last driven through `main()` against throwaway git
+  repositories. No pytest and no network, so the CI `docs` job still installs nothing. It
+  immediately caught two real bugs: a `#fragment` was discarded whenever a link also
+  carried a query string, and headings inside a fenced code block were offered as anchors
+  GitHub would never create. Both fixes left the docs themselves green, every pinned rule
+  was confirmed load-bearing by reverting it and watching the suite go red, and it runs as
+  the third step of `scripts/check.sh`.
+
+- **`POST /upload` now says what each file contributed.** The response carries an `upload` block — `files[]` with each file's `rows`, `status` (accepted/rejected) and `reason`, plus `accepted`/`rejected` counts — and when nothing is accepted the request is a 400 whose detail names every file and why, instead of the old 200 over a dataset that never changed: a file whose rows all fail harmonization (or that is not a readable FIRMS CSV) used to disappear in silence whenever a dataset already existed (PRD gap 8). The console shows the report in a neutral banner after a successful upload. Two regression tests cover it — one good file beside one that harmonizes to nothing, and an all-dropped file against an existing dataset — and a pre-existing Windows flake in the live-feed cache test is fixed by ageing the cache stamp rather than trusting `time.monotonic()`, which is `GetTickCount64` (15.6 ms ticks) there, so "a TTL of 0 expires immediately" only held when the request happened to land in a later tick. The suite is 106 tests (44 smoke + 34 security + 28 archive) and the doc-figure guard was updated to match.
+
 - **The harmonized FIRMS year — 2024-09-30 → 2025-09-29, MODIS + every VIIRS platform — is now a dataset the console builds, publishes and reads back as a database.** `firecal/backend/hf_export.py` streams every export in `.data/` through the same `harmonize()` the API and `train.py` use, keeps only the year, de-duplicates on `(lat, lon, time, sensor)` (sorted uint64 row hashes, so tens of millions of rows cost megabytes rather than gigabytes of RAM), and writes one zstd parquet (row groups of 250k, each carrying `time` statistics) plus a manifest and README into `data/`; `hf sync ./data hf://buckets/hriishiibanerjee/FIRMS_DATA` ships it. The API treats that bucket as the database of last resort: `GET /datasets` and `POST /datasets/load` pull it into the cache on demand (`archives.hf_pull`, an `hf sync` from the bucket to `.data/hf/`) when the local folder is empty or an id is unknown — a fresh clone with no 10 GB archive still opens the shared record — and parquet files go through the same bounded reader as CSVs: already-harmonized frames pass through `ensure_harmonized()` untouched (the stored record and a live load are the same quantity by construction), evenly spaced *row groups* replace byte offsets for the spread read, and the footer's exact row count replaces the size-based estimate. The pull answers `(False, reason)` instead of raising — no `hf` CLI, no network and no auth all mean "nothing found", the same state every other missing-database path here keeps. Four new archive tests cover it (bucket parquet opens like any archive, row-group spread reaches past the head, a fake `hf` CLI pulls an empty folder, a missing CLI is an empty answer); the suite is 102 tests (40 smoke + 34 security + 28 archive) and the doc-figure guard was updated to match.
 
 ### Changed
@@ -18,6 +49,8 @@ User-facing changes, newest first. The format follows [Keep a Changelog](https:/
 
 ### Fixed
 
+- **The forecast no longer returns `NaN` for a record that wraps the year end.** A real FIRMS window is a rolling slice (e.g. 2024-10 → 2025-09), so the forecast horizon can start inside day-of-years the record simply has no rows for — the archive/NRT seam. The seasonal fallback reindexed its day-of-year climatology there, left NaN holes, and the NaN scale poisoned the whole horizon. The climatology is now interpolated across the full year before the rolling smooth, and the archive-trained prior blend is kept; a regression test pins it (the suite is 104 tests: 42 smoke + 34 security + 28 archive).
+- **The Hugging Face database pull works on Windows.** `archives.hf_pull` spawned a bare `hf`, which CreateProcess on Windows resolves only against `.exe` — a PATH-visible CLI (or any `.bat` shim) still failed as "not installed". The command is now resolved once through `shutil.which` (PATHEXT-aware on every OS), and the bucket-pull test fakes a per-OS CLI so the suite is green on Windows as well as POSIX.
 - **VIIRS S-NPP detections were being counted as their own sensor.** FIRMS names the instrument per product: the NOAA-20/21 C2 exports say `instrument = VIIRS`, the S-NPP ones say `SNPP` — a *platform*. `harmonize()` copied that string into `sensor` verbatim, so every Suomi NPP detection landed in a third sensor bucket with three quiet consequences: the illusion diagnostic splits on MODIS vs VIIRS and so never saw them at all, the per-sensor rescaling learned a ratio against a sensor that is the same instrument as VIIRS, and `_esfp` fell through to MODIS's 1 km nadir cell — giving a 375 m detection a footprint area **7.1× too large**, and the same error in HFII. Platform names are now mapped to the instrument they carry (Suomi NPP, NOAA-20, NOAA-21 are all VIIRS). This only became visible when all four platforms were merged into one record: opening one archive at a time, every file happened to look right.
 - **A merged record no longer reports zeros for a question it was never asked.** The illusion panel's growth figures need detections on both sides of the 2011→2012 transition, so a modern archive (2023 onward — which is exactly what merging a current `.data/` directory produces) answered with `n/a` and no explanation. The endpoint now names the eras it needs, the days it has of each, and says the per-year bars are still real.
 

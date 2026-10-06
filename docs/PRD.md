@@ -315,7 +315,7 @@ Partial. Honoured: `prefers-reduced-motion`, `aria-label` on the map and basemap
 
 ### NFR-4 — Reliability & correctness
 
-102 automated tests (40 smoke + 34 security + 28 archive) run in CI on every push and PR, plus the doc-figure check (`scripts/check-doc-figures.py`, which fails when a count quoted in the docs drifts from the suite) and the frontend production build, whose prebuild step runs the lazy-export guard and the adaptive-detail, chart-layout and orbital-drift policy checks. The tests need no archive: the training path is exercised on a few dozen synthetic rows pushed through the same scan/save/load code `train.py` runs, and the archive suite builds its own fixture directory of FIRMS exports — three files, two instruments, one of them naming its platform — and points the app at it. Derived values are asserted against invariants (percentile ordering, cluster hull sizes, threat ladder membership, growth relationships) rather than hard-coded snapshots where possible.
+106 automated tests (44 smoke + 34 security + 28 archive) run in CI on every push and PR, plus the doc-figure check (`scripts/check-doc-figures.py`, which fails when a count quoted in the docs drifts from the suite) and the doc-link check (`scripts/check-doc-links.py`, which fails when a relative link names a file, a case, an anchor or a tracked file this repository does not have) with its own test suite (`scripts/test_check_doc_links.py`, which pins those rules so they cannot change quietly), and the frontend production build, whose prebuild step runs the lazy-export guard and the adaptive-detail, chart-layout and orbital-drift policy checks. The tests need no archive: the training path is exercised on a few dozen synthetic rows pushed through the same scan/save/load code `train.py` runs, and the archive suite builds its own fixture directory of FIRMS exports — three files, two instruments, one of them naming its platform — and points the app at it. Derived values are asserted against invariants (percentile ordering, cluster hull sizes, threat ladder membership, growth relationships) rather than hard-coded snapshots where possible.
 
 ### NFR-5 — Portability
 
@@ -367,7 +367,7 @@ Canonical detection record after harmonization: `lat, lon, time (UTC), sensor, c
 
 | Method & path | Key parameters | Returns |
 |---|---|---|
-| `POST /upload` | multipart `files[]`, `demo_transition` | `meta` |
+| `POST /upload` | multipart `files[]`, `demo_transition` | `meta` + `upload {files: [{file, rows, status, reason}], accepted, rejected, rows}` — every file is accounted for, accepted with the rows it contributed or refused with the reason (unreadable, missing columns, or no rows surviving harmonization); when nothing is accepted the request is a 400 whose `detail` names each file and why, never a 200 over an unchanged dataset |
 | `POST /demo` | `mode=standard\|transition`, `region` (preset key) | `meta` (fixture endpoint — no UI caller) |
 | `GET /datasets` | — | `{items: [{id, name, sensor, kind, label, bytes, mb}]}`, smallest file first; no paths; empty local folder → the HF bucket is pulled into the cache and listed, `{items: []}` only if folder and bucket are both empty or unreachable |
 | `POST /datasets/load` | `id`, `all` (bool), `limit` (1,000–2,000,000; 750,000 default, 2,000,000 when `all=true`), `spread` (default true) | `meta` + `load {rows_read, rows_kept, rows_estimate, spread, limit, merged}`, plus `file/sensor/kind/mb/capped` for one archive or `archives/sensors/files[]/skipped[]` for a merge; 404 unknown id (after the bucket has been tried), 400 nothing to merge or not a FIRMS export, 429 while another archive is opening. The `load` block is a property of the dataset, not of the response: every later `GET /meta` carries it until the dataset is replaced or cleared |
@@ -376,7 +376,7 @@ Canonical detection record after harmonization: `lat, lon, time (UTC), sensor, c
 | `DELETE /data` | — | `{n: 0}` |
 | `GET /meta` | — | `{n, start, end, sensors, bounds, hfi, esfp, pixels}` |
 | `GET /calendar` | `bbox`, `start`, `end` | `[{date, count, raw, frp}]` |
-| `GET /points` | `bbox`, `start`, `end`, `limit ≤ 20000` | `[{lat, lon, frp, sensor, conf, time}]` |
+| `GET /points` | `bbox`, `start`, `end`, `limit ≤ 20000` | `[{lat, lon, frp, sensor}]` |
 | `GET /clusters` | `bbox`, `start`, `end`, `eps`, `min_pts`, `hours` | top 300 clusters with `hull` |
 | `GET /climatology` | `bbox`, `window`, `step` | per-year DOY series, percentile envelope, summary (peak/onset/cessation) |
 | `GET /diagnostic` | `bbox` | per-year per-sensor series, growth %, artifact pp, scaling factor, calibration, `note` when the record cannot span the 2012 transition |
@@ -445,7 +445,7 @@ Nothing in this document is aspirational scaffolding: each pillar was exercised 
 | Security | Before/after reproductions against the running server (NFR-2), plus 34 regression tests |
 | Key handling & cross-site writes | `/archive` with a live `FIRMS_MAP_KEY` and a refused transport: the 502 body never contains the key. Foreign-origin writes refused 403 while same-host, allowlisted-origin and no-Origin writes pass — both covered in `test_security.py`, and the foreign-origin 403 re-checked against the running server |
 | Model training | Full archive run in this environment: 15 CSVs / 10.30 GB / 126,178,412 rows read in 876 s, 112,174,057 detections kept over 1,089 days (2023-09-30 → 2026-09-22), 3,390 cells stored in 1.8 MB. The learned shape is checked against the known seasons rather than a fixture: Thailand peaks 29 Mar (the app's own climatology puts the peak at 19 Mar), the Amazon 13 Sep, California 10 Jul, and the global mean July-to-December ratio is 1.49 : 0.55. `harmonize(geometry=False)` is asserted frame-identical to `harmonize()` and to the same `daily()` series; a truncated, foreign-schema or missing checkpoint is asserted to fall back to the pre-training answer |
-| Full suite | `pytest` 102 passed · `npm run build` (incl. the lazy-export, adaptive-detail, chart-layout and orbital-drift guards) passed · browser console clean across all tabs |
+| Full suite | `pytest` 106 passed · `npm run build` (incl. the lazy-export, adaptive-detail, chart-layout and orbital-drift guards) passed · browser console clean across all tabs |
 
 ## 12. Status summary
 
@@ -465,7 +465,7 @@ Nothing in this document is aspirational scaffolding: each pillar was exercised 
 | Region presets & AOI navigation | ✅ Complete (five presets, per-region demo, camera flights) |
 | Real FIRMS window pull (`MAP_KEY`) | ✅ Complete; needs the operator's own free key, reported plainly when absent |
 | Chart rendering | ✅ Hand-rolled SVG kit; `recharts`, `cobe`, `leaflet`, `react-leaflet` removed |
-| Test suite | ✅ 102 tests green (40 smoke + 34 hardening + 28 archive); CI runs pytest + doc figures + build |
+| Test suite | ✅ 106 tests green (44 smoke + 34 hardening + 28 archive); CI runs pytest + doc figures + build |
 | Dataset picker | ✅ Complete — real archives listed at startup, opened individually or merged into one all-sensor, all-year record, each labelled with what was loaded |
 
 ## 13. Known gaps & risks
@@ -479,7 +479,7 @@ Nothing in this document is aspirational scaffolding: each pillar was exercised 
 | 5 | Windows launcher branches are simulated, not executed in this environment | Low | Logic is stdlib-only and mirrors the POSIX path; verify on a Windows machine |
 | 6 | No formal accessibility audit; map two-corner selection is pointer-only | Medium | Add keyboard selection, raise contrast checks, audit with a screen reader |
 | 7 | `npm audit` flags Vite/esbuild dev-server advisories | Low (dev-only) | Not in the production bundle; dev server bound to loopback; fix = major Vite upgrade |
-| 8 | `/upload` silently ignores a file whose rows all fail harmonization when a dataset already exists (returns 200, unchanged data) | Low | Make the response report per-file accepted/rejected counts |
+| 8 | ~~`/upload` silently ignores a file whose rows all fail harmonization when a dataset already exists (returns 200, unchanged data)~~ **Closed** — the response reports per-file outcomes | — | `POST /upload` now returns an `upload` block (`files[]` with `rows`/`status`/`reason` plus `accepted`/`rejected` counts) and a 400 naming every file when nothing is accepted; the console shows the report after an upload |
 | 9 | The dataset on screen is a bounded slice of a file, so every figure describes the sample rather than the whole record | Low | The Dataset panel states the file, the sensor, and `rows_kept of ~rows_estimate`; `limit` is operator-adjustable, and `POST /demo` still builds a complete synthetic record when a whole-record reference is wanted |
 | 10 | A fresh clone, CI and the container image have **no** archives — `.data/` is ~10 GB and git-ignored — so the console opens on the standby card there | Low (by design) | The empty list is a 200, not an error; the standby card names the directory and keeps the upload path, and the synthetic fixture endpoint remains for anyone who needs a dataset without one |
 | 11 | A local archive is only as good as its bounding area: an export for one country cannot answer an AOI question about another continent | Low | The Selection panel says when an AOI holds no detections and offers *Clear area*; opening a second archive is one click |
@@ -489,7 +489,7 @@ Nothing in this document is aspirational scaffolding: each pillar was exercised 
 ## 14. Roadmap
 
 **Near term (highest value per unit effort)**
-1. Report per-file upload outcomes honestly (gap 8) and chart the monthly anomaly series (gap 3).
+1. Chart the monthly anomaly series (gap 3).
 2. Add a date-window loop so `POST /archive` can assemble a multi-year record (gap 13) from repeated 5-day pulls.
 3. Keyboard-accessible area selection plus an accessibility pass (gap 6).
 
@@ -504,7 +504,7 @@ Nothing in this document is aspirational scaffolding: each pillar was exercised 
 9. Multi-decadal trend attribution beyond the sensor artifact (climate vs land-use signals).
 10. Optional deployment profile with auth, quotas and a managed dataset.
 
-**Done this cycle:** dropped the three unused frontend dependencies plus `recharts` in favour of the SVG kit (gap 8, now closed); corrected the VIIRS nadir cell to the 375 m I-band value and replaced the illusion correction's footprint-ratio factor with the measured collocated detection ratio (§10, §11); took the synthetic demo out of the console and made the machine's real archives the opening dataset, with a bounded, labelled slice instead of a whole-file read (FR-1.9, FR-1.10, FR-11.2); and set auto-rotate to Earth's 23.44° obliquity instead of a vertical spin (FR-3.10).
+**Done this cycle:** dropped the three unused frontend dependencies plus `recharts` in favour of the SVG kit (gap 8, now closed); corrected the VIIRS nadir cell to the 375 m I-band value and replaced the illusion correction's footprint-ratio factor with the measured collocated detection ratio (§10, §11); took the synthetic demo out of the console and made the machine's real archives the opening dataset, with a bounded, labelled slice instead of a whole-file read (FR-1.9, FR-1.10, FR-11.2); and set auto-rotate to Earth's 23.44° obliquity instead of a vertical spin (FR-3.10). And `POST /upload` now reports what every file contributed — an `upload` block of per-file accepted/rejected outcomes on 200, a 400 that names every file when nothing is accepted, and a console banner showing the report — closing the §13 gap where a file dropped by harmonization disappeared in silence.
 
 ## 15. Glossary
 
