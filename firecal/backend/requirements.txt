@@ -16,5 +16,15 @@ numpy
 scikit-learn
 scipy
 requests
-# optional, enables the LSTM forecast (falls back to seasonal model without it)
+# The Hugging Face bucket read (archives.hf_pull). A real dependency, not an optional one: the
+# shared dataset is this app's database of last resort, and needing a separate `hf` CLI install
+# by hand is what kept it out of reach. Without it the code falls back to the `hf` CLI and then
+# to "nothing found", so the app still runs -- the bucket is simply not reachable.
+huggingface_hub
+# The archive-trained forecast model. Imported lazily inside the functions that use it
+# (the server's start-up budget is ~2 s), and optional at runtime: without it, or with no
+# checkpoint, `/forecast` falls back to the seasonal prior and names the fallback.
+lightgbm
+# optional, no longer used by `/forecast` (the LSTM serving path was retired in favour of
+# the LightGBM model above); `train.py`'s LSTM training pass remains available.
 # torch

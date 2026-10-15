@@ -13,8 +13,10 @@ const WINDOWS = [
   { value: "90", label: "Last 90 days" },
 ];
 
+const pct = v => `${Math.round(v * 100)}%`;
+
 /** Lazy-loaded so no charting code is part of the first paint (see charts.jsx). */
-export default function ForecastChart({ series, model }) {
+export default function ForecastChart({ series, model, coverage }) {
   // Row range into `series`: null means the whole record. Held in absolute indices so a second,
   // tighter drag inside a zoomed view composes instead of re-zooming from the full series.
   const [zoom, setZoom] = useState(null);
@@ -24,6 +26,15 @@ export default function ForecastChart({ series, model }) {
   const observed = series.filter(d => d.actual != null).length;
   const lookahead = series.filter(d => d.forecast != null).length;
   const rows = zoom ? series.slice(zoom[0], zoom[1] + 1) : series;
+
+  /* The interval is only drawn when the payload actually carries it. The archive model emits
+     `lower`/`upper` per day once it was conformally calibrated; the seasonal-prior fallback
+     emits neither, so no band appears rather than a band that was never measured. */
+  const hasBand = series.some(d => typeof d.lower === "number" && typeof d.upper === "number");
+  const nominal = coverage?.nominal;
+  const emp = coverage?.empirical
+    ? Object.values(coverage.empirical).filter(v => typeof v === "number") : [];
+  const bandName = nominal != null ? `${pct(nominal)} interval` : "Interval";
 
   const pickWindow = value =>
     value === "all" || Number(value) >= series.length
@@ -35,13 +46,17 @@ export default function ForecastChart({ series, model }) {
       <span className="kv"><span className="mut">Model</span><b>{model || "Seasonal climatology"}</b></span>
       <span className="kv"><span className="mut">Record</span>
         <b>{observed} observed · {lookahead}-day forecast</b></span>
+      {hasBand && nominal != null && <span className="kv"><span className="mut">Interval</span>
+        <b>{pct(nominal)}{emp.length ? ` · measured ${pct(Math.min(...emp))}–${pct(Math.max(...emp))}` : ""}</b></span>}
       {zoom && <span className="kv"><span className="mut">Showing</span>
         <b>{rows[0].date} → {rows[rows.length - 1].date}</b></span>}
     </div>
     <Chart rows={rows} xKey="date" height={280} xFmt={d => String(d).slice(5)}
       yLabel="Detections / day" onSelect={(a, b) => setZoom(z => [z ? z[0] + a : a, z ? z[0] + b : b])}
-      ariaLabel="Observed daily detections with the forecast appended"
+      ariaLabel="Observed daily detections with the forecast appended and its calibrated interval"
       series={[
+        ...(hasBand ? [{ key: "upper", keyLow: "lower", keyHigh: "upper", type: "band",
+                         name: bandName, color: TEAL, opacity: 0.3 }] : []),
         { key: "actual", type: "line", name: "Observed", color: AMBER },
         { key: "forecast", type: "line", name: "Forecast", color: TEAL, dash: true },
       ]} />
@@ -54,6 +69,11 @@ export default function ForecastChart({ series, model }) {
       </select>
       {zoom && <button className="btn sm" onClick={() => setZoom(null)}>Reset zoom</button>}
     </div>
+    {hasBand && coverage?.within_tolerance === false && <div className="hint" style={{ marginTop: 6 }}>
+      The nominal {pct(nominal)} band measured {pct(Math.min(...emp))}–{pct(Math.max(...emp))} coverage on the
+      held-out block it was scored against — more than a few points off, so read it as indicative
+      rather than exactly calibrated.
+    </div>}
     {lookahead === 0 && <div className="hint" style={{ marginTop: 6 }}>
       No forecast window available for this record — the model needs a longer daily series.
     </div>}

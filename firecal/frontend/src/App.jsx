@@ -231,7 +231,9 @@ export default function App() {
     } catch { setErr("Upload failed — could not reach the backend."); }
     setBusy(false); e.target.value = "";
   }
-  const series = useMemo(() => cal.slice(-365).map(d => ({ date: d.date, actual: d.count })).concat((fc?.forecast || []).map(d => ({ date: d.date, forecast: d.count }))), [cal, fc]);
+  // The forecast rows carry a calibrated `lower`/`upper` when the archive model served and was
+  // calibrated; the prior path has none, so the band is whatever the payload actually holds.
+  const series = useMemo(() => cal.slice(-365).map(d => ({ date: d.date, actual: d.count })).concat((fc?.forecast || []).map(d => ({ date: d.date, forecast: d.count, lower: d.lower, upper: d.upper }))), [cal, fc]);
   const center = meta.bounds ? [(meta.bounds[0] + meta.bounds[2]) / 2, (meta.bounds[1] + meta.bounds[3]) / 2] : [0, 0];
 
   return <>
@@ -437,7 +439,7 @@ export default function App() {
           </div>
           {tab === "calendar" && <PanelBoundary name="calendar" resetKey={tab}><Heatmap data={cal} onPick={setDay} focus={day} year={yearSel} /></PanelBoundary>}
           {tab === "forecast" && <PanelBoundary name="forecast" resetKey={tab}><Suspense fallback={<span className="hint">Loading chart…</span>}>
-            <ForecastChart series={series} model={fc?.model} />
+            <ForecastChart series={series} model={fc?.model} coverage={fc?.coverage} />
           </Suspense></PanelBoundary>}
           {tab === "climatology" && <PanelBoundary name="climatology" resetKey={tab}><Suspense fallback={<span className="hint">Loading chart…</span>}>
             <ClimatologyPanel bbox={bb} refreshKey={diagKey} embedded />

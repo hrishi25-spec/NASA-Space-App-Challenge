@@ -376,7 +376,11 @@ def test_a_parquet_slice_samples_row_groups_instead_of_reading_the_head(tmp_path
 def test_an_empty_local_folder_pulls_the_bucket(tmp_path, monkeypatch):
     """The database path end to end: nothing on disk, a fake `hf` CLI that answers like the
     real one does after login, and the bucket's file arrives in the cache, is inventoried,
-    and opens. (The CLI is faked because the real one would dial out; the sync *call* is real.)"""
+    and opens. (The CLI is faked because the real one would dial out; the sync *call* is real.)
+
+    The Python client is switched off here on purpose: this is the *fallback* -- a machine
+    that has the `hf` CLI and not the library -- and it must keep working."""
+    monkeypatch.setattr(archives, "hub_client", lambda: None)
     bucket = tmp_path / "bucket"
     _bucket_parquet(tmp_path / "raw.csv", bucket / BUCKET_PARQUET, days=3, per_day=4)
     bin_dir = tmp_path / "bin"
@@ -408,10 +412,178 @@ def test_an_empty_local_folder_pulls_the_bucket(tmp_path, monkeypatch):
     assert m["n"] == 12
 
 
-def test_no_hf_cli_is_an_empty_answer_not_an_error(tmp_path, monkeypatch):
-    """No `hf` on PATH is the normal state of a CI machine: (False, reason), and the caller
-    keeps answering "nothing found" the way every other missing-database case here does."""
+def test_no_hf_client_at_all_is_an_empty_answer_not_an_error(tmp_path, monkeypatch):
+    """No Python client and no `hf` on PATH -- a bare CI machine -- is still (False, reason),
+    and the caller keeps answering "nothing found" the way every other missing-database case
+    here does. The reason names the fix rather than the symptom."""
     monkeypatch.setenv("PATH", str(tmp_path / "no-bin-here"))
+    monkeypatch.setattr(archives, "hub_client", lambda: None)
     monkeypatch.setattr(archives, "hf_pull", _REAL_HF_PULL)
     ok, message = archives.hf_pull(tmp_path / ".data")
-    assert ok is False and "not installed" in message
+    assert ok is False and "huggingface_hub" in message and "hf CLI" in message
+
+
+# ------------------------------------------------------------------ the bucket, as a database
+# `hf_pull` reads the bucket through the Python client when it is importable and through the
+# `hf` CLI otherwise. Proving the first path needs a client object, and a test must never get
+# the real one -- it would dial out.
+class _BucketEntry:
+    """One entry of a bucket listing. `hf_pull` reads `type` and counts the entries."""
+    type = "file"
+
+    def __init__(self, path, size):
+        self.path, self.size = path, size
+
+
+class _FakeHub:
+    """A `huggingface_hub` shaped exactly like the part of it `hf_pull` uses.
+
+    `source` stands in for the bucket's contents: `sync` copies what is in it, the way a real
+    sync would, so the file that lands in the cache is a real parquet the reader can open.
+    """
+
+    def __init__(self, bucket, source=None, error=None):
+        self.bucket = bucket
+        self.source = Path(source) if source else None
+        self.error = error
+        self.synced = []
+
+    def list_bucket_tree(self, bucket, recursive=False):
+        assert bucket == self.bucket, f"listed {bucket}, expected {self.bucket}"
+        if self.error is not None:
+            raise self.error
+        if self.source is None:
+            return []
+        return [_BucketEntry(str(p.relative_to(self.source)), p.stat().st_size)
+                for p in sorted(self.source.rglob("*")) if p.is_file()]
+
+    def sync_bucket(self, source, dest):
+        assert source == f"hf://buckets/{self.bucket}", source
+        self.synced.append((source, str(dest)))
+        for path in sorted(self.source.rglob("*")) if self.source else []:
+            if path.is_file():
+                target = Path(dest) / path.relative_to(self.source)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(path.read_bytes())
+
+
+def test_the_dataset_card_is_written_as_utf8(tmp_path, monkeypatch):
+    """The card the bucket carries is not ASCII -- it quotes an arrow -- and Windows' default
+    text encoding is cp1252, which has no arrow in it. So the sidecar write has to name its
+    encoding: without this it is a hard UnicodeEncodeError on the platform this app actually
+    ships on, and the export dies after it has written the parquet."""
+    import hf_export
+    monkeypatch.setattr(hf_export, "DST", tmp_path)
+    out = tmp_path / BUCKET_PARQUET
+    pd.DataFrame({"lat": [1.0], "lon": [2.0], "time": [1], "date": ["2025-01-01"],
+                  "sensor": ["MODIS C6.1"], "conf": [80]}).to_parquet(out, compression="zstd")
+    hf_export.write_sidecars(out, {"sensors": ["MODIS C6.1"], "rows_scanned": 12,
+                                   "dataset": "x", "source": "y"})
+    card = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert "→" in card                       # the character that cp1252 cannot hold
+    assert (tmp_path / "manifest.json").read_text(encoding="utf-8").endswith("\n")
+
+
+def test_the_bucket_can_be_pointed_elsewhere_from_the_environment(monkeypatch):
+    """A bucket that moves is a config change, not a code change. Both spellings are accepted
+    -- `ns/name` and the `hf://buckets/ns/name` form -- because both are what gets pasted, and
+    the shipped default stands when nothing is set."""
+    monkeypatch.delenv(archives.HF_BUCKET_ENV, raising=False)
+    assert archives.bucket_id() == archives.HF_BUCKET.removeprefix(archives.HF_BUCKET_PREFIX)
+    monkeypatch.setenv(archives.HF_BUCKET_ENV, "someone-else/FIRMS_2026")
+    assert archives.bucket_id() == "someone-else/FIRMS_2026"
+    monkeypatch.setenv(archives.HF_BUCKET_ENV, "hf://buckets/someone-else/FIRMS_2026/")
+    assert archives.bucket_id() == "someone-else/FIRMS_2026"
+
+
+def test_the_client_pulls_the_bucket_with_no_hf_cli_anywhere(tmp_path, monkeypatch):
+    """The CLI-free path end to end: no `hf` on PATH at all and no CLI installed, only the
+    Python client -- and the bucket's file still arrives in the cache, is inventoried, and
+    opens. This is the state of a machine that installed the app and nothing else."""
+    staged = tmp_path / "staged"
+    _bucket_parquet(tmp_path / "raw.csv", staged / BUCKET_PARQUET, days=3, per_day=4)
+    hub = _FakeHub("someone-else/FIRMS_2026", staged)
+    monkeypatch.setenv(archives.HF_BUCKET_ENV, "hf://buckets/someone-else/FIRMS_2026")
+    monkeypatch.setenv("PATH", str(tmp_path / "no-bin-here"))
+    monkeypatch.setattr(archives, "hub_client", lambda: hub)
+    monkeypatch.setattr(archives, "hf_pull", _REAL_HF_PULL)     # undo the no-network stub
+    root = tmp_path / ".data"
+    monkeypatch.setattr(main, "ARCHIVE_ROOTS", [root])
+
+    ok, message = archives.hf_pull(root)
+    assert ok is True and str(root / "hf") in message and "1 file" in message
+    assert hub.synced == [("hf://buckets/someone-else/FIRMS_2026", str(root / "hf"))]
+    # The pulled record is a dataset like any other: inventoried, listed, opened.
+    items = client.get("/datasets").json()["items"]
+    assert [item["id"] for item in items] == [f"hf/{BUCKET_PARQUET}"]
+    assert client.post("/datasets/load", params={"id": items[0]["id"]}).json()["n"] == 12
+
+
+def test_an_empty_bucket_says_it_is_empty(tmp_path, monkeypatch):
+    """The state this project is actually in, and the reason the answer must be specific: the
+    bucket exists and answers, it just holds nothing. Reported as itself rather than as a
+    network failure, and it does not sync an empty bucket."""
+    hub = _FakeHub("someone/FIRMS_DATA")           # lists no files
+    monkeypatch.setenv(archives.HF_BUCKET_ENV, "someone/FIRMS_DATA")
+    monkeypatch.setattr(archives, "hub_client", lambda: hub)
+    monkeypatch.setattr(archives, "hf_pull", _REAL_HF_PULL)
+    ok, message = archives.hf_pull(tmp_path / ".data")
+    assert ok is False and "empty" in message and "0 files" in message
+    assert hub.synced == []
+
+
+def test_a_bucket_that_cannot_be_read_reports_why(tmp_path, monkeypatch):
+    """A private bucket, a wrong id and no network all reach the same contract: (False,
+    reason) with the exception named, never a raise."""
+    hub = _FakeHub("someone/FIRMS_DATA", error=PermissionError("401 Client Error: Unauthorized"))
+    monkeypatch.setenv(archives.HF_BUCKET_ENV, "someone/FIRMS_DATA")
+    monkeypatch.setattr(archives, "hub_client", lambda: hub)
+    monkeypatch.setattr(archives, "hf_pull", _REAL_HF_PULL)
+    ok, message = archives.hf_pull(tmp_path / ".data")
+    assert ok is False and "PermissionError" in message and "401" in message
+
+
+def test_a_missing_archive_says_why_the_bucket_did_not_answer(tmp_path, monkeypatch):
+    """The reason has to reach the caller to be worth computing: an id the inventory does not
+    hold is a 404 about the absence, and the bucket's own state belongs in it -- otherwise the
+    reader is left re-deriving why the database was silent."""
+    monkeypatch.setattr(main, "ARCHIVE_ROOTS", [tmp_path / ".data"])
+    monkeypatch.setattr(
+        archives, "hf_pull",
+        lambda root, timeout=archives.HF_SYNC_TIMEOUT: (False, "someone/FIRMS_DATA is empty (0 files)"))
+    r = client.post("/datasets/load", params={"id": "hf/nothing_here.parquet"})
+    assert r.status_code == 404
+    assert "someone/FIRMS_DATA is empty (0 files)" in r.json()["detail"]
+
+
+def test_the_firms_puller_resumes_instead_of_refetching(tmp_path, monkeypatch):
+    """`fetch_archive.py` is hours long, so a re-run has to continue rather than start over:
+    a window fetched twice adds its rows twice, and the training target *counts* detections,
+    so that would bias the panel rather than merely waste bandwidth. The area call is stubbed
+    (the real one needs a key and dials out), so what is pinned here is the accounting: the
+    header once, one row per window, and each window asked for exactly once."""
+    import fetch_archive as fa
+
+    asked = []
+
+    def fake_area_rows(session, key, source, box, start, span, timeout=240):
+        asked.append(str(start))
+        return ["18.5,99.5,2024-01-01,1015,80,9.5,320,NOAA-20,VIIRS"], ""
+
+    monkeypatch.setattr(fa, "area_rows", fake_area_rows)
+    monkeypatch.setenv("FIRMS_MAP_KEY", "a-test-key")
+    out = tmp_path / ".data"
+    argv = ["--regions", "amazon", "--years", "2024", "--sources", "MODIS_C6.1",
+            "--out", str(out), "--max-windows", "2"]
+    csv_path = out / "DL_FIRE_M-C61_amazon_2024" / "fire_archive_M-C61_amazon2024.csv"
+
+    assert fa.main_cli(argv) == 0
+    first = csv_path.read_text(encoding="utf-8").splitlines()
+    assert first[0].startswith("latitude,") and len(first) == 3      # a header, two windows
+
+    assert fa.main_cli(argv) == 0                                    # the same command again
+    second = csv_path.read_text(encoding="utf-8").splitlines()
+    assert len(second) == 5                                          # four windows, one header
+    assert sum(1 for line in second if line.startswith("latitude")) == 1
+    assert asked == ["2024-01-01", "2024-01-06", "2024-01-11", "2024-01-16"]
+    assert (out / fa.PROGRESS_FILE).is_file()

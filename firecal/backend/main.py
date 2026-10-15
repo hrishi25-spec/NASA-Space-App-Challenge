@@ -35,6 +35,7 @@ from fastapi.staticfiles import StaticFiles
 
 import archives
 import forecast_model
+import lgbm_forecast
 from demo import BOX, make_demo, make_transition_demo
 from regions import REGIONS, region_box, region_keys
 
@@ -586,6 +587,17 @@ async def upload(files: list[UploadFile] = File(...), demo_transition: bool = Fa
     return m
 
 
+def _bucket_note(result: tuple[bool, str]) -> str:
+    """Why the database had nothing, as a parenthetical for a "nothing found" error.
+
+    `archives.hf_pull` already answers with a specific reason -- no client installed, the
+    bucket is empty, no network -- and this is the only place that reason is worth showing.
+    Dropping it leaves the console reporting the symptom (no archive) instead of the cause.
+    """
+    ok, message = result
+    return "" if ok else f" (bucket: {message})"
+
+
 @app.get("/datasets")
 def list_datasets():
     """The FIRMS archives sitting on this machine, smallest first.
@@ -626,24 +638,27 @@ def load_dataset(id: str = None, limit: int = None, spread: bool = True, all: bo
     is ever joined into a path (see archives.find). POST, so the Origin gate applies.
     """
     global DF, _LOAD_INFO
+    pulled = (True, "")                  # only overwritten when the bucket was actually asked
     items = archives.scan_all(ARCHIVE_ROOTS)
     if all:
         if not items and ARCHIVE_ROOTS:
-            archives.hf_pull(ARCHIVE_ROOTS[0])   # fresh clone: the bucket is the merge source
+            pulled = archives.hf_pull(ARCHIVE_ROOTS[0])   # fresh clone: the bucket is the source
             items = archives.scan_all(ARCHIVE_ROOTS)
         if not items:
-            raise HTTPException(400, "no local archives to merge; list them with GET /datasets")
+            raise HTTPException(400, "no local archives to merge; list them with GET /datasets"
+                                     + _bucket_note(pulled))
         merged = True
     else:
         item = archives.find(items, id or "")
         if item is None and ARCHIVE_ROOTS:
             # Not on disk: pull the Hugging Face bucket and resolve again -- the database
             # answers on demand, so an id nobody has ever downloaded here is still openable.
-            archives.hf_pull(ARCHIVE_ROOTS[0])
+            pulled = archives.hf_pull(ARCHIVE_ROOTS[0])
             items = archives.scan_all(ARCHIVE_ROOTS)
             item = archives.find(items, id or "")
         if item is None:
-            raise HTTPException(404, "no such local archive; list them with GET /datasets")
+            raise HTTPException(404, "no such local archive; list them with GET /datasets"
+                                     + _bucket_note(pulled))
         items, merged = [item], False
     limit = min(max(limit or (MAX_ROWS if merged else archives.DEFAULT_LIMIT),
                     archives.MIN_LIMIT), MAX_ROWS)
@@ -858,6 +873,30 @@ def subset(bbox, start=None, end=None):
     return d
 
 
+def sensor_factors(piv):
+    """Per-sensor multipliers that put every sensor on the best-covered sensor's scale.
+
+    The reference is whichever sensor has the most non-zero days; every other sensor is
+    scaled by the measured collocated detection ratio over the days both saw fire. Fewer
+    than 5 overlap days is not a measurement, so that sensor is left at 1.0.
+
+    Exposed separately from `harmonized_daily` because the cell-day panel the LightGBM
+    model trains on needs the *same* multiplier applied per cell: a second implementation
+    of the rescale would train the model on a different quantity from the one `/forecast`
+    predicts. There is exactly one definition of the ratio, and both callers use it.
+    """
+    if piv is None or not len(piv.columns) or not len(piv):
+        return {}
+    ref = (piv > 0).sum().idxmax()
+    factors = {s: 1.0 for s in piv.columns}
+    for s in piv.columns:
+        if s == ref: continue
+        ov = (piv[ref] > 0) & (piv[s] > 0)
+        if ov.sum() >= 5:
+            factors[s] = float(piv.loc[ov, ref].sum() / piv.loc[ov, s].sum())
+    return factors
+
+
 def harmonized_daily(piv, frp):
     """Sum a (date x sensor) count table into one series, sensors rescaled to the
     best-covered sensor over their overlap period.
@@ -868,11 +907,8 @@ def harmonized_daily(piv, frp):
     by some second implementation would quietly be a different quantity from the one the
     API serves and predicts.
     """
-    ref = (piv > 0).sum().idxmax(); adj = piv.astype(float)
-    for s in piv.columns:
-        if s == ref: continue
-        ov = (piv[ref] > 0) & (piv[s] > 0)
-        if ov.sum() >= 5: adj[s] = piv[s] * piv.loc[ov, ref].sum() / piv.loc[ov, s].sum()
+    factors = sensor_factors(piv)
+    adj = piv.astype(float).mul(pd.Series(factors), axis="columns")
     out = pd.DataFrame({"count": adj.sum(axis=1), "raw": piv.sum(axis=1),
                         "frp": frp.reindex(piv.index).fillna(0)})
     return out.reindex(pd.date_range(out.index.min(), out.index.max()), fill_value=0)
@@ -1406,29 +1442,6 @@ def anomalies(bbox: str = None, z: float = 2.0):
             "monthly": [{"month": int(m), "avg": round(v, 1)} for m, v in mo.items()]}
 
 
-def _warm_start(model):
-    """Load the archive's LSTM weights into a freshly built model, when they fit it.
-
-    Everything about this is optional and locally produced, so every failure mode means
-    "no warm start" rather than a failed forecast: no checkpoint file, a checkpoint
-    written by a different architecture, a torch build that refuses the pickle, or a
-    directory somebody half-copied. The endpoint trains either way.
-    """
-    path = forecast_model.LSTM_WEIGHTS
-    if not path.is_file():
-        return False
-    try:
-        import torch
-        state = torch.load(path, map_location="cpu")
-        mine = model.state_dict()
-        if set(state) != set(mine) or any(tuple(state[k].shape) != tuple(mine[k].shape) for k in mine):
-            return False
-        model.load_state_dict(state)
-        return True
-    except Exception:
-        return False
-
-
 def _seasonal_climatology(s, bbox):
     """Day-of-year curve for a frame, blended with the prior the archive trained.
 
@@ -1456,6 +1469,59 @@ def _seasonal_climatology(s, bbox):
     return pd.Series(np.expm1(mixed), index=grid), prior
 
 
+def _lgbm_forecast(bbox, horizon):
+    """One LightGBM forecast for the AOI, or None to keep the seasonal prior.
+
+    The gate is the honest one the model had to earn: `lgbm_forecast.gate()` serves the
+    checkpoint only at a horizon whose *stored* backtest MASE beat the prior's. On top of
+    that the AOI has to hold cells the archive actually trained on -- a global model has
+    nothing to say about ground it never saw, and a frame that covers none of its cells
+    must fall back rather than extrapolate. Every failure mode (no lightgbm, a truncated
+    or foreign checkpoint, an empty match, a predict error) returns None; nothing here
+    raises, because a forecast is an upgrade to the console, never a dependency of it.
+    """
+    try:
+        ck = lgbm_forecast.load()
+        if not ck:
+            return None
+        use, why = lgbm_forecast.gate(ck["metrics"], horizon)
+        if not use:
+            return None
+        known = {int(c) for c in ck["climo"].columns}
+        series = lgbm_forecast.frame_cell_series(subset(bbox), cells_keep=known)
+        if series.empty or len(series) < max(lgbm_forecast.LAGS) + 1:
+            return None
+        if series.shape[1] > lgbm_forecast.MAX_CELLS:
+            top = series.sum(axis=0).sort_values(ascending=False).head(lgbm_forecast.MAX_CELLS).index
+            series = series[top]
+        dates, totals = lgbm_forecast.predict_path(series, ck["climo"], ck["booster"], horizon)
+    except Exception:
+        return None
+    meta = ck["metrics"]
+    rows = [{"date": str(d.date()), "count": round(float(v), 1)} for d, v in zip(dates, totals)]
+    payload = {
+        "model": f"LightGBM (global archive model) — {why}",
+        "method": "lgbm",
+        "model_reason": why,
+        "forecast": rows,
+        "checkpoint": {"trained": meta.get("generated"),
+                       "cells": int(ck["climo"].shape[1]),
+                       "matched_cells": int(series.shape[1]),
+                       "seasons": (meta.get("panel") or {}).get("seasons")},
+    }
+    # Conformal intervals are additive: present only when the checkpoint was calibrated, so
+    # the panel never draws a band that was not measured for this model.
+    lo, hi = lgbm_forecast.band(totals, meta.get("conformal"), horizon)
+    if lo is not None:
+        for row, a, b in zip(rows, lo, hi):
+            row["lower"] = round(float(a), 1)
+            row["upper"] = round(float(b), 1)
+        cov = lgbm_forecast.coverage(meta.get("conformal"))
+        if cov:
+            payload["coverage"] = cov
+    return payload
+
+
 @app.get("/forecast")
 @cached
 def forecast(bbox: str = None, horizon: int = 30, epochs: int = 40):
@@ -1465,40 +1531,26 @@ def forecast(bbox: str = None, horizon: int = 30, epochs: int = 40):
     idx = pd.date_range(s.index[-1] + pd.Timedelta(days=1), periods=horizon)
     # No bbox means the whole frame, so "everywhere" is the box the prior should come from.
     box = parse_bbox(bbox) or (-90.0, -180.0, 90.0, 180.0)
-    prior = None
-    try:
-        import torch, torch.nn as nn
-        y = np.log1p(s.values).astype("float32"); mu, sd = y.mean(), y.std() + 1e-6; y = (y - mu) / sd
-        W = forecast_model.WINDOW
-        doy = lambda ix: np.c_[np.sin(2*np.pi*ix.dayofyear/365.25), np.cos(2*np.pi*ix.dayofyear/365.25)].astype("float32")
-        feat = np.c_[y, doy(s.index)]
-        Xs = np.stack([feat[i:i+W] for i in range(len(y)-W)]); Ys = y[W:]
-        class M(nn.Module):
-            def __init__(s): super().__init__(); s.l = nn.LSTM(3, 32, batch_first=True); s.o = nn.Linear(32, 1)
-            def forward(s, x): return s.o(s.l(x)[0][:, -1]).squeeze(-1)
-        m = M(); warm = _warm_start(m)
-        opt = torch.optim.Adam(m.parameters(), 1e-2); Xt, Yt = torch.tensor(Xs), torch.tensor(Ys)
-        for _ in range(epochs): opt.zero_grad(); nn.functional.mse_loss(m(Xt), Yt).backward(); opt.step()
-        win, dz, out = feat[-W:].copy(), doy(idx), []
-        for k in range(horizon):
-            p = m(torch.tensor(win[None])).item(); out.append(p); win = np.vstack([win[1:], [p, *dz[k]]])
-        vals = np.expm1(np.array(out) * sd + mu).clip(0)
-        model = "LSTM (PyTorch) + archive seed" if warm else "LSTM (PyTorch)"
-    except ImportError:  # seasonal fallback: same-day climatology scaled to recent level
-        clim, prior = _seasonal_climatology(s, box)
-        # A real single-season download can miss whole day-of-years: the FIRMS archive/NRT
-        # seam leaves the days between the last NRT date and the first archive date absent,
-        # and the forecast window starts exactly there. Reindexing left NaN holes -- and a
-        # NaN scale, so the whole forecast came back NaN. Interpolate across the full year
-        # before the rolling smooth.
-        clim = clim.reindex(range(1, 367)).interpolate(limit_direction="both")
-        clim = clim.rolling(15, center=True, min_periods=1).mean()
-        scale = (s[-30:].mean() + 1) / (clim.reindex(s[-30:].index.dayofyear).mean() + 1)
-        vals = clim.reindex(idx.dayofyear).values * scale
-        model = ("Seasonal climatology + archive prior (torch for LSTM)" if prior
-                 else "Seasonal climatology (install torch for LSTM)")
-    # `out` above is the torch branch's list of predictions; the response is its own name.
-    payload = {"model": model,
+    # The archive-trained LightGBM model is the forecast when its own backtest earned it.
+    hit = _lgbm_forecast(bbox, horizon)
+    if hit is not None:
+        return hit
+    # Seasonal fallback: same-day climatology scaled to the frame's recent level, blended
+    # with the archive prior when the training checkpoint covers the AOI. torch is not
+    # required for any of this -- the LSTM path it replaced is gone.
+    clim, prior = _seasonal_climatology(s, box)
+    # A real single-season download can miss whole day-of-years: the FIRMS archive/NRT
+    # seam leaves the days between the last NRT date and the first archive date absent,
+    # and the forecast window starts exactly there. Reindexing left NaN holes -- and a
+    # NaN scale, so the whole forecast came back NaN. Interpolate across the full year
+    # before the rolling smooth.
+    clim = clim.reindex(range(1, 367)).interpolate(limit_direction="both")
+    clim = clim.rolling(15, center=True, min_periods=1).mean()
+    scale = (s[-30:].mean() + 1) / (clim.reindex(s[-30:].index.dayofyear).mean() + 1)
+    vals = clim.reindex(idx.dayofyear).values * scale
+    reason = "LightGBM checkpoint absent" if not lgbm_forecast.available() else "LightGBM not better than the prior"
+    payload = {"model": ("Seasonal climatology + archive prior" if prior else "Seasonal climatology"),
+               "method": "prior", "model_reason": reason,
                "forecast": [{"date": str(i.date()), "count": round(float(v), 1)} for i, v in zip(idx, vals)]}
     if prior:   # provenance, so the panel can be checked against the checkpoint on disk
         payload["prior"] = {"cells": prior["cells"], "trained": prior["generated"],

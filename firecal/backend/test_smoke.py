@@ -1,5 +1,8 @@
 """API smoke test: runs every endpoint end-to-end against synthetic demo data."""
+import ast
 import io
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -243,6 +246,140 @@ def test_harmonize_without_geometry_counts_the_same():
     # confidence 69 kept, "n"/"h" mapped to 60/90, "l" (20) and the 999-degree latitude gone
     assert list(lean.conf) == [69.0, 60.0, 90.0]
     pd.testing.assert_series_equal(main.daily(lean)["count"], main.daily(full)["count"])
+
+
+# ------------------------------------------------------- a real FIRMS export, verbatim
+# These bytes are captured as-is from the four `fire_nrt_*` downloads in `.data/`
+# (the 2026-10-04 pull): the literal header FIRMS writes and three of its rows, for
+# MODIS C6.1, VIIRS S-NPP and VIIRS NOAA-20. They are pinned here because `.data/` is
+# git-ignored and CI has none: if FIRMS renames, adds, drops or reshuffles a column,
+# these tests fail in the build instead of surfacing months later as a training run
+# that ingests a different quantity than the endpoint serves.
+REAL_FIRMS_MODIS_CSV = (b"latitude,longitude,brightness,scan,track,acq_date,acq_time,"
+                        b"satellite,confidence,version,bright_t31,frp,daynight\n"
+                        b"-13.60052,49.60114,301.4,1.43,1.18,2026-10-04,0033,A,38,6.1NRT,288.65,8.77,N\n"
+                        b"32.24827,51.42755,311.08,1.5,1.21,2026-10-04,0020,A,82,6.1NRT,278.94,23.82,N\n"
+                        b"-15.20455,48.98621,301.27,1.37,1.16,2026-10-04,0033,A,39,6.1NRT,288.67,8.25,N\n")
+REAL_FIRMS_SNPP_CSV = (b"latitude,longitude,bright_ti4,scan,track,acq_date,acq_time,"
+                       b"satellite,confidence,version,bright_ti5,frp,daynight\n"
+                       b"-29.78994,27.11075,299.44,0.5,0.49,2026-10-04,0001,N,nominal,2.0NRT,279.07,0.68,N\n"
+                       b"65.02583,56.72539,305.3,0.47,0.64,2026-10-04,0111,N,nominal,2.0NRT,266.75,0.97,N\n"
+                       b"65.04215,56.67452,332.27,0.47,0.64,2026-10-04,0111,N,nominal,2.0NRT,268.01,2.56,N\n")
+REAL_FIRMS_N20_CSV = (b"latitude,longitude,bright_ti4,scan,track,acq_date,acq_time,"
+                      b"satellite,confidence,version,bright_ti5,frp,daynight\n"
+                      b"42.93438,18.87675,367,0.37,0.58,2026-10-04,0001,N20,high,2.0NRT,286.87,7.38,N\n"
+                      b"42.93413,18.88209,324.51,0.37,0.58,2026-10-04,0001,N20,nominal,2.0NRT,280.52,7.83,N\n"
+                      b"42.93463,18.87132,296.2,0.37,0.58,2026-10-04,0001,N20,nominal,2.0NRT,279.73,7.38,N\n")
+
+REAL_FIRMS_PRODUCTS = {
+    "MODIS_C6.1": (REAL_FIRMS_MODIS_CSV, ("latitude", "longitude", "brightness", "scan",
+                   "track", "acq_date", "acq_time", "satellite", "confidence",
+                   "version", "bright_t31", "frp", "daynight"), "MODIS"),
+    "VIIRS_S-NPP": (REAL_FIRMS_SNPP_CSV, ("latitude", "longitude", "bright_ti4", "scan",
+                    "track", "acq_date", "acq_time", "satellite", "confidence",
+                    "version", "bright_ti5", "frp", "daynight"), "VIIRS"),
+    "VIIRS_NOAA-20": (REAL_FIRMS_N20_CSV, ("latitude", "longitude", "bright_ti4", "scan",
+                      "track", "acq_date", "acq_time", "satellite", "confidence",
+                      "version", "bright_ti5", "frp", "daynight"), "VIIRS"),
+}
+
+# The working-frame schema `harmonize()` produces -- the exact columns, in the exact
+# order, that `/upload`, `/archive`, `train.py` and `train_forecast.py` all read.
+HARMONIZED_COLUMNS = ["lat", "lon", "time", "date", "sensor", "sat", "conf", "frp", "bt",
+                      "scan", "track", "daynight", "esfp", "pixel_km2"]
+
+
+@pytest.mark.parametrize("product", ("MODIS_C6.1", "VIIRS_S-NPP", "VIIRS_NOAA-20"))
+def test_a_real_firms_export_keeps_its_columns(product):
+    """`read_firms_csv` must not reorder, rename or drop a single FIRMS column.
+
+    This is the guard against schema drift on NASA's side: the column list is FIRMS's
+    own export order, spelled exactly as the real downloads write it.
+    """
+    csv, expected_cols, _ = REAL_FIRMS_PRODUCTS[product]
+    raw = main.read_firms_csv(csv)
+    assert list(raw.columns) == list(expected_cols)
+
+
+@pytest.mark.parametrize("product", ("MODIS_C6.1", "VIIRS_S-NPP", "VIIRS_NOAA-20"))
+def test_a_real_firms_export_harmonizes_to_every_row(product):
+    """Every row of a real export survives `harmonize()` with the working schema.
+
+    Three real detections per product go in; no confidence, byte or value drops any of
+    them out, they all stamp to FIRMS's own 2026-10-04, the platform column travels
+    through `sat` unchanged, and the columns out are exactly the working frame's.
+    """
+    csv, _, sensor = REAL_FIRMS_PRODUCTS[product]
+    d = main.harmonize(main.read_firms_csv(csv))
+    assert list(d.columns) == HARMONIZED_COLUMNS
+    assert len(d) == 3 and set(d.sensor) == {sensor}
+    assert (d.date == pd.Timestamp("2026-10-04")).all()
+    assert set(d.sat) <= {"A", "N", "N20"}          # the platform column, passed through
+
+
+def test_a_real_modis_export_harmonizes_to_pinned_values():
+    """The first real MODIS C6.1 row, harmonized by hand as the expectation.
+
+    Pinned end-to-end: the timestamp build from `acq_date`+`acq_time`, the numeric
+    confidence at the >= 30 floor, MODIS's 1 km nadir cell, and `sat` = platform `A`
+    (Aqua) passing through untouched.
+    """
+    d = main.harmonize(main.read_firms_csv(REAL_FIRMS_MODIS_CSV))
+    row = d.iloc[0]
+    assert row.lat == pytest.approx(-13.60052) and row.lon == pytest.approx(49.60114)
+    assert row.time == pd.Timestamp("2026-10-04 00:33:00")
+    assert row.conf == 38.0 and row.frp == pytest.approx(8.77) and row.bt == pytest.approx(301.4)
+    assert row.sensor == "MODIS" and row.sat == "A" and row.daynight == "N"
+    assert row.scan == pytest.approx(1.43) and row.track == pytest.approx(1.18)
+    assert row.esfp == pytest.approx(1.43 * 1.18)          # area / 1.0 km nadir cell
+    assert row.pixel_km2 == pytest.approx(1.43 * 1.18)
+
+
+def test_a_real_viirs_export_harmonizes_to_pinned_values():
+    """The first real S-NPP row, harmonized by hand as the expectation.
+
+    Two VIIRS facts are load-bearing here and pinned at once: the letter confidence
+    (`nominal`) maps to 60 through `CONF_MAP`, and the 375 m nadir cell (0.140625 km²)
+    sets the ESFP scale -- the platform column, `N` for Suomi NPP, is *not* the sensor.
+    """
+    d = main.harmonize(main.read_firms_csv(REAL_FIRMS_SNPP_CSV))
+    row = d.iloc[0]
+    assert row.time == pd.Timestamp("2026-10-04 00:01:00")   # acq_time "0001" = 1 minute
+    assert row.conf == 60.0                                  # "nominal" -> CONF_MAP
+    assert row.sensor == "VIIRS" and row.sat == "N"
+    assert row.bt == pytest.approx(299.44) and row.frp == pytest.approx(0.68)
+    assert row.pixel_km2 == pytest.approx(0.5 * 0.49)
+    assert row.esfp == pytest.approx(0.5 * 0.49 / main.NADIR_KM2["VIIRS"])
+
+
+def test_a_firms_schema_drift_fails_loudly_not_silently():
+    """A renamed FIRMS column must raise, naming what it lost.
+
+    This is what a future FIRMS change does to a quiet pipeline: rows arrive missing
+    `acq_date`/`acq_time` and every one would be dropped with `lat`/`time` = NaT -- a
+    wall of zeros, nobody wiser. `harmonize` refuses the frame instead.
+    """
+    drifted = REAL_FIRMS_MODIS_CSV.replace(b"acq_date", b"date").replace(b"acq_time", b"time")
+    with pytest.raises(ValueError) as e:
+        main.harmonize(main.read_firms_csv(drifted))
+    assert "missing required columns" in str(e.value)
+    assert "acq_date" in str(e.value) and "acq_time" in str(e.value)
+
+
+def test_a_real_export_ingests_through_upload():
+    """The real bytes go through the same `/upload` path the console drives.
+
+    The store counts exactly the three MODIS rows, all one sensor, and the response's
+    provenance block (`sensors`) says so -- the whole pipeline from bytes to calendar
+    input, unchanged.
+    """
+    before_meta = client.get("/meta").json()
+    before_n, before_sensors = before_meta["n"], before_meta["sensors"]
+    csv = ("files", ("fire_nrt_M-C61_real.csv", io.BytesIO(REAL_FIRMS_MODIS_CSV), "text/csv"))
+    r = client.post("/upload", files=[csv])
+    assert r.status_code == 200, r.text
+    assert r.json()["sensors"]["MODIS"] == before_sensors["MODIS"] + 3
+    assert client.get("/meta").json()["n"] == before_n + 3
 
 
 @pytest.fixture
@@ -644,3 +781,358 @@ def test_console_mount_follows_the_build():
     built = (Path(main.__file__).resolve().parent.parent / "frontend" / "dist" / "index.html").is_file()
     mounted = any(getattr(route, "name", "") == "console" for route in app.routes)
     assert mounted == built
+
+
+# --------------------------------------------------------- the LightGBM forecaster
+# `train_forecast.py` fits a global Tweedie booster on a 2-degree cell x day panel and
+# `lgbm_forecast.py` serves it.  The archive is not in the repository, so these build a
+# tiny panel in memory and push it through the *real* feature / fit / save / load path.
+
+def _tiny_panel(seed=0):
+    """A (dates x cells) harmonized-count panel with a learnable annual season."""
+    import forecast_model as fm
+
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("2021-01-01", "2023-12-31")
+    cells = np.array([fm.cell_bins([18.5], [99.5])[0], fm.cell_bins([-33.0], [147.0])[0]],
+                     dtype="int64")
+    doy = idx.dayofyear.to_numpy()
+    base = 5.0 + 8.0 * np.exp(-((doy - 75) / 25) ** 2)
+    vals = np.stack([base * (1.0 + 0.3 * rng.standard_normal(len(idx))) for _ in cells], axis=1)
+    return pd.DataFrame(np.clip(vals, 0, None), index=idx, columns=cells)
+
+
+def _tiny_detections(index, cells):
+    """One harmonize-shaped detection per cell per day, so `main.DF` drives the endpoint."""
+    import lgbm_forecast as lg
+
+    la, lo = lg.cell_center(np.asarray(cells, dtype="int64"))
+    rows = [{"lat": float(a), "lon": float(b), "time": d, "date": d.normalize(),
+             "sensor": "VIIRS", "sat": "N20", "conf": 80.0, "frp": 10.0, "bt": 330.0,
+             "scan": 0.5, "track": 0.5, "daynight": "N", "esfp": 0.444, "pixel_km2": 0.25}
+            for d in index for a, b in zip(la, lo)]
+    return pd.DataFrame(rows)
+
+
+def test_a_record_shorter_than_the_longest_lag_says_so(tmp_path):
+    """Seven days of real detections is the shape a bare FIRMS pull arrives in, and `lag_28`
+    is undefined for the panel's first 28 days -- so that record has no training row at all.
+    The failure has to name the archive, because the alternative is an internal
+    "fit_model: no training rows" traceback that says nothing about what is wrong."""
+    import train_forecast as tf
+
+    header = "latitude,longitude,acq_date,acq_time,confidence,frp,brightness,satellite,instrument"
+    rows = [header] + [f"18.5,99.5,2024-01-{day:02d},1015,80,9.5,320,NOAA-20,VIIRS"
+                       for day in range(1, 8)]
+    (tmp_path / "fire_nrt_M-C61_700001.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exit_info:
+        tf.run(data_dir=tmp_path, out=tmp_path / "mdl", use_backtest=False,
+               use_conformal=False, use_panel_cache=False, log=lambda *a: None)
+    message = str(exit_info.value)
+    assert "7 day(s)" in message and "28-day lag" in message and "fetch_archive.py" in message
+
+
+def test_sensor_factors_are_the_one_harmonizer():
+    """`harmonized_daily` and the cell-day panel must share exactly one rescale.
+
+    The panel applies `main.sensor_factors()` per cell; if that ever drifted from the
+    ratio `harmonized_daily` measures, the model would be fit on a different quantity
+    from the one `/forecast` serves.
+    """
+    piv = pd.DataFrame({"MODIS": [10, 20, 30, 0, 5], "VIIRS": [40, 80, 120, 0, 20]},
+                       index=pd.date_range("2020-01-01", periods=5))
+    factors = main.sensor_factors(piv)
+    adj = piv.astype(float).mul(pd.Series(factors), axis="columns").sum(axis=1)
+    out = main.harmonized_daily(piv, pd.Series(0.0, index=piv.index))
+    assert np.allclose(adj.values, out["count"].values)
+    assert set(factors) == {"MODIS", "VIIRS"} and factors["MODIS"] == 1.0
+    # one sensor is its own reference: no scaling, factor 1.0
+    assert main.sensor_factors(piv[["MODIS"]]) == {"MODIS": 1.0}
+
+
+def test_lgbm_features_use_only_past_and_training_years():
+    """Lags come from before the origin and the climatology from training years only."""
+    import lgbm_forecast as lg
+
+    Y = _tiny_panel()
+    T, C = Y.shape
+    climo = lg.climo_table(Y, np.ones(T, dtype=bool))
+    X, y, ok = lg.build_features(Y, climo)
+    assert X.shape == (T * C, len(lg.FEATURES)) and len(y) == T * C
+    # the longest lag defines the first row with every feature defined
+    assert ok.sum() == (T - max(lg.LAGS)) * C
+    i = lg.FEATURES.index("lag_1")
+    assert np.isclose(X[100 * C, i], np.log1p(Y.iloc[99, 0]))   # yesterday, never today
+    # drop a season from the climatology and its value at a DOY must move
+    climo_wo = lg.climo_table(Y, Y.index.year.to_numpy() != 2023)
+    assert not np.allclose(climo.to_numpy()[74], climo_wo.to_numpy()[74])
+
+
+def test_lgbm_checkpoint_round_trip(tmp_path):
+    """Fit, save, load, predict; the gate reads the stored backtest, not a live score."""
+    import lgbm_forecast as lg
+    import train_forecast as tf
+
+    Y = _tiny_panel()
+    climo = lg.climo_table(Y, None)
+    booster, best, n = tf.fit_model(Y, climo, np.ones(len(Y), dtype=bool), rounds=40)
+    assert best > 0 and n > 0
+    meta = lg.save(booster, Y.columns.to_numpy(), climo, {"panel": {"seasons": [2021, 2022, 2023]}},
+                   explicit=tmp_path)
+    assert meta["schema"] == lg.SCHEMA and list(meta["features"]) == list(lg.FEATURES)
+    lg.clear_cache()
+    ck = lg.load(tmp_path)
+    assert ck is not None and ck["metrics"]["schema"] == lg.SCHEMA
+    assert list(ck["climo"].columns) == list(Y.columns)
+    dates, totals = lg.predict_path(Y, ck["climo"], ck["booster"], 5)
+    assert len(dates) == len(totals) == 5 and all(v >= 0 for v in totals)
+    # the serving gate: strictly better MASE wins, a tie or a loss keeps the prior
+    win = {"backtest": {"by_horizon": {"30": {"lgbm_mase": 0.5, "prior_mase": 0.9}}}}
+    lose = {"backtest": {"by_horizon": {"30": {"lgbm_mase": 1.5, "prior_mase": 0.9}}}}
+    tie = {"backtest": {"by_horizon": {"30": {"lgbm_mase": 0.9, "prior_mase": 0.9}}}}
+    use, why = lg.gate(win, 30)
+    assert use is True and "MASE" in why
+    assert lg.gate(lose, 30)[0] is False and lg.gate(tie, 30)[0] is False
+    assert lg.gate(win, 7)[0] is False            # an unscored horizon keeps the prior
+    assert lg.gate(None, 30)[0] is False          # no checkpoint, no model
+    lg.clear_cache()
+
+
+def test_lgbm_broken_checkpoints_fall_back(tmp_path, monkeypatch):
+    """Missing, truncated and foreign-schema checkpoints are no checkpoint, not a 500."""
+    import json
+    import lgbm_forecast as lg
+    import train_forecast as tf
+
+    assert lg.load(tmp_path) is None              # missing
+    Y = _tiny_panel()
+    climo = lg.climo_table(Y, None)
+    booster, _, _ = tf.fit_model(Y, climo, np.ones(len(Y), dtype=bool), rounds=20)
+    lg.save(booster, Y.columns.to_numpy(), climo, {}, explicit=tmp_path)
+    bpath, _, mpath = lg.paths(tmp_path)
+    good = bpath.read_text(encoding="utf-8")
+    bpath.write_text(good[: max(1, len(good) // 2)], encoding="utf-8")   # truncated booster
+    lg.clear_cache()
+    assert lg.load(tmp_path) is None
+    bpath.write_text(good, encoding="utf-8")
+    mpath.write_text(json.dumps({"schema": 99, "features": list(lg.FEATURES)}), encoding="utf-8")
+    lg.clear_cache()
+    assert lg.load(tmp_path) is None              # foreign schema
+    mpath.write_text(json.dumps({"schema": lg.SCHEMA, "features": ["doy_sin"]}), encoding="utf-8")
+    lg.clear_cache()
+    assert lg.load(tmp_path) is None              # our schema, a different feature set
+    # and the endpoint still answers with the seasonal prior, whatever the checkpoint said
+    monkeypatch.setattr(main.lgbm_forecast, "load", lambda *a, **k: None)
+    main._invalidate()
+    fc = client.get("/forecast").json()
+    assert fc["method"] == "prior" and fc["forecast"] and fc["model"].startswith("Seasonal climatology")
+
+
+def test_lgbm_validation_never_splits_randomly():
+    """The validation code holds out whole seasons and blocks of ground, in order."""
+    import train_forecast as tf
+
+    src = Path(main.__file__).resolve().parent / "train_forecast.py"
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+    banned = {"train_test_split", "shuffle", "random_state", "ShuffleSplit", "KFold", "sample"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            assert ast.unparse(node.func).split(".")[-1] not in banned, ast.unparse(node.func)
+        if isinstance(node, ast.keyword):
+            assert node.arg not in {"shuffle", "random_state"}, node.arg
+    Y = _tiny_panel()
+    seen = np.zeros(len(Y), dtype=int)
+    folds = tf.time_folds(Y)
+    assert len(folds) == 3
+    for _, tr, te in folds:
+        tr, te = np.asarray(tr), np.asarray(te)
+        assert not (tr & te).any() and tr.any() and te.any()
+        seen += te.astype(int)
+    assert (seen == 1).all()                      # every day held out exactly once
+    blocks, kind = tf.spatial_folds(Y)
+    assert kind in ("curated regions", "coarse tiles")
+    for _, tr, te in blocks:
+        assert not (np.asarray(tr) & np.asarray(te)).any()
+
+
+def test_lightgbm_is_imported_lazily():
+    """Neither the server nor the trainer may import lightgbm at module scope.
+
+    Start-up is ~2 s and the model is only needed once a forecast is actually fitted from
+    the checkpoint.  A module-scope import would tax every launch and every test.
+    """
+    backend = Path(main.__file__).resolve().parent
+    for name in ("main.py", "lgbm_forecast.py", "train_forecast.py"):
+        tree = ast.parse((backend / name).read_text(encoding="utf-8"))
+        for node in tree.body:                    # module scope only
+            if isinstance(node, ast.Import):
+                assert all(a.name.split(".")[0] != "lightgbm" for a in node.names), name
+            if isinstance(node, ast.ImportFrom):
+                assert (node.module or "").split(".")[0] != "lightgbm", name
+    out = subprocess.run([sys.executable, "-c",
+                          "import sys,os;sys.path.insert(0,os.getcwd());import main;"
+                          "print('lightgbm' in sys.modules)"],
+                         cwd=backend, capture_output=True, text=True)
+    assert out.stdout.strip() == "False", out.stderr
+
+
+def test_forecast_contract_is_backward_compatible():
+    """`/forecast` still answers {model, forecast[]}; the new keys are additive only."""
+    main._invalidate()
+    r = client.get("/forecast")
+    assert r.status_code == 200
+    fc = r.json()
+    assert {"model", "forecast"} <= set(fc)
+    assert len(fc["forecast"]) == 30
+    for row in fc["forecast"]:
+        assert set(row) >= {"date", "count"} and row["count"] >= 0
+    assert fc["method"] in ("lgbm", "prior")     # additive field, never a removal
+
+
+def test_lgbm_is_served_when_it_earns_the_horizon(monkeypatch):
+    """When the stored backtest says LightGBM wins a horizon and the AOI holds cells it
+    trained on, `/forecast` serves it -- the gate is not decoration."""
+    import lgbm_forecast as lg
+    import train_forecast as tf
+
+    Y = _tiny_panel()
+    climo = lg.climo_table(Y, None)
+    booster, _, _ = tf.fit_model(Y, climo, np.ones(len(Y), dtype=bool), rounds=30)
+    ck = {"booster": booster, "climo": climo,
+          "metrics": {"generated": "test", "panel": {"seasons": [2021, 2022, 2023]},
+                      "backtest": {"by_horizon": {"30": {"lgbm_mase": 0.1, "prior_mase": 0.9}}}}}
+    monkeypatch.setattr(main.lgbm_forecast, "load", lambda *a, **k: ck)
+    saved = main.DF
+    try:
+        main.DF = _tiny_detections(Y.index, Y.columns)
+        main._invalidate()
+        fc = client.get("/forecast", params={"horizon": 30}).json()
+        assert fc["method"] == "lgbm" and "LightGBM" in fc["model"]
+        assert len(fc["forecast"]) == 30 and all(f["count"] >= 0 for f in fc["forecast"])
+        assert fc["checkpoint"]["matched_cells"] >= 1
+    finally:
+        main.DF = saved
+        main._invalidate()
+
+
+def test_lgbm_falls_back_when_the_frame_has_no_trained_cells(monkeypatch):
+    """A global model has nothing to say about ground it never saw: fall back, don't guess."""
+    import forecast_model as fm
+    import lgbm_forecast as lg
+
+    Y = _tiny_panel()
+    climo = lg.climo_table(Y, None)
+    ck = {"booster": object(), "climo": climo,
+          "metrics": {"backtest": {"by_horizon": {"30": {"lgbm_mase": 0.1, "prior_mase": 0.9}}}}}
+    monkeypatch.setattr(main.lgbm_forecast, "load", lambda *a, **k: ck)
+    saved = main.DF
+    try:
+        far = np.array([fm.cell_bins([-9.5], [-58.5])[0]], dtype="int64")   # the Amazon
+        main.DF = _tiny_detections(Y.index, far)
+        main._invalidate()
+        fc = client.get("/forecast", params={"horizon": 30}).json()
+        assert fc["method"] == "prior" and "LightGBM" not in (fc["model"] or "")
+    finally:
+        main.DF = saved
+        main._invalidate()
+
+
+def _tiny_uncertainty_panel(seed=0, days=600):
+    """A contiguous daily panel long enough for a train / calibration / test cut."""
+    import forecast_model as fm
+
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("2022-01-01", periods=days)
+    cells = np.array([fm.cell_bins([18.5], [99.5])[0], fm.cell_bins([-33.0], [147.0])[0]],
+                     dtype="int64")
+    doy = idx.dayofyear.to_numpy()
+    base = 6.0 + 9.0 * np.exp(-((doy - 75) / 25) ** 2)
+    vals = np.stack([base * (1.0 + 0.4 * rng.standard_normal(len(idx))) for _ in cells], axis=1)
+    return pd.DataFrame(np.clip(vals, 0, None), index=idx, columns=cells)
+
+
+def test_conformal_band_is_bounded_and_reuses_the_widest_width():
+    """The band is relative (log1p), never negative, contains the point, and does not invent
+    a width for a horizon it was never calibrated at."""
+    import lgbm_forecast as lg
+    import train_forecast as tf
+
+    cf = {"nominal": 0.9, "quantiles": {"1": 0.2, "7": 0.5}}
+    totals = [0.0, 10.0, 100.0]
+    lo, hi = lg.band(totals, cf, 3)
+    assert lo is not None and len(lo) == len(hi) == 3
+    assert all(a >= 0 for a in lo)
+    assert all(a <= c <= b for a, c, b in zip(lo, totals, hi))
+    # past the calibrated window the widest width is reused rather than extrapolated
+    assert lg.half_widths(cf, 3)[2] == cf["quantiles"]["7"]
+    assert lg.band(totals, None, 3) == (None, None)          # no calibration, no band
+    # the split-conformal quantile is the rank-corrected order statistic, not numpy's quantile
+    assert tf._split_conformal_quantile([1, 2, 3, 4], 0.25) == 4.0
+    # and the coverage verdict flags a band more than a few points off nominal
+    ok = lg.coverage({"nominal": 0.9, "coverage": {"empirical": {"1": 0.88, "30": 0.92}}})
+    bad = lg.coverage({"nominal": 0.9, "coverage": {"empirical": {"1": 0.9, "30": 0.74}}})
+    assert ok["within_tolerance"] is True and bad["within_tolerance"] is False
+    assert lg.coverage(None) is None
+
+
+def test_conformal_calibrates_on_a_later_block_than_training():
+    """Train / calibration / test are consecutive, ordered blocks -- the band is calibrated on
+    a block strictly later than training and scored on one strictly later than calibration."""
+    import train_forecast as tf
+
+    Y = _tiny_uncertainty_panel()
+    cf = tf.conformal_calibration(Y, alpha=0.1, horizon_max=7, cal_days=90, test_days=90,
+                                  origin_step=5, rounds=40, log=lambda *a: None)
+    assert cf["applicable"] is True and cf["nominal"] == 0.9
+    tr, cal, te = cf["blocks"]["train"], cf["blocks"]["calibration"], cf["blocks"]["test"]
+    assert tr[1] < cal[0] and cal[1] < te[0]                 # no overlap, no random split
+    assert set(cf["quantiles"]) == {str(h) for h in range(1, 8)}
+    assert all(q >= 0 for q in cf["quantiles"].values())
+    assert all(0.0 <= v <= 1.0 for v in cf["coverage"]["empirical"].values())
+    assert isinstance(cf["within_tolerance"], bool)
+    assert "in-repo" in cf["method"]                        # no MAPIE dependency
+
+
+def test_conformal_is_not_applicable_on_a_short_record():
+    """A record too short for three consecutive blocks says so instead of scoring a fold."""
+    import train_forecast as tf
+
+    cf = tf.conformal_calibration(_tiny_uncertainty_panel(days=200), rounds=20,
+                                  log=lambda *a: None)
+    assert cf["applicable"] is False and "note" in cf and cf["note"]
+
+
+def test_forecast_rows_carry_a_band_only_when_calibrated(monkeypatch):
+    """The band is additive and honest: absent without a calibration, present and containing
+    the point forecast when the checkpoint was calibrated."""
+    import lgbm_forecast as lg
+    import train_forecast as tf
+
+    Y = _tiny_panel()
+    climo = lg.climo_table(Y, None)
+    booster, _, _ = tf.fit_model(Y, climo, np.ones(len(Y), dtype=bool), rounds=30)
+    base_metrics = {"backtest": {"by_horizon": {"30": {"lgbm_mase": 0.1, "prior_mase": 0.9}}}}
+    saved = main.DF
+    try:
+        main.DF = _tiny_detections(Y.index, Y.columns)
+        monkeypatch.setattr(main.lgbm_forecast, "load",
+                            lambda *a, **k: {"booster": booster, "climo": climo, "metrics": base_metrics})
+        main._invalidate()
+        fc = client.get("/forecast", params={"horizon": 30}).json()
+        assert fc["method"] == "lgbm"
+        assert "lower" not in fc["forecast"][0] and "coverage" not in fc
+
+        metrics = dict(base_metrics, conformal={
+            "nominal": 0.9, "quantiles": {"1": 0.3, "30": 0.9},
+            "coverage": {"empirical": {"1": 0.9, "30": 0.88}}})
+        monkeypatch.setattr(main.lgbm_forecast, "load",
+                            lambda *a, **k: {"booster": booster, "climo": climo, "metrics": metrics})
+        main._invalidate()
+        fc = client.get("/forecast", params={"horizon": 30}).json()
+        assert fc["coverage"]["nominal"] == 0.9 and fc["coverage"]["within_tolerance"] is True
+        for row in fc["forecast"]:
+            assert row["lower"] >= 0 and row["lower"] <= row["count"] <= row["upper"]
+    finally:
+        main.DF = saved
+        main._invalidate()

@@ -140,7 +140,11 @@ def write_sidecars(out_path: Path, manifest: dict) -> None:
     manifest = {**manifest, "file": out_path.name, "rows": stats.num_rows,
                 "bytes": out_path.stat().st_size, "row_groups": stats.num_row_groups,
                 "built_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-    (DST / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    # Explicit UTF-8 on both, because the card is not ASCII: it carries an arrow, and Windows'
+    # default text encoding is cp1252, where an arrow does not exist -- so an unqualified
+    # `write_text` here was a hard UnicodeEncodeError on the one platform this app ships on,
+    # not a cosmetic mojibake. (The em dash survives cp1252; the arrow is what crashed.)
+    (DST / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     rows, sensors = manifest["rows"], ", ".join(manifest["sensors"])
     (DST / "README.md").write_text(
         f"""# FIRMS harmonized year {DATE_FROM} → {DATE_TO}
@@ -157,11 +161,13 @@ MODIS C6.1 + VIIRS (S-NPP, NOAA-20, NOAA-21 — all versions) detections for
 - **Rules:** the console's own `harmonize()` — confidence ≥ 30 for all sensors, required
   columns enforced, lat/lon bounds checked — then deduped on `(lat, lon, time, sensor)`.
 
-This bucket is the database: the console pulls it on demand
-(`hf sync hf://buckets/hriishiibanerjee/FIRMS_DATA`) when no local archive answers.
+This bucket is the database: when no local archive answers, the console lists it and pulls it
+on demand through the `huggingface_hub` client (the `hf` command is only the fallback for a
+machine without the library), and `FIRECAL_HF_BUCKET` names a different bucket without a code
+change.
 
 Rebuild: `firecal/backend/.venv/bin/python firecal/backend/hf_export.py`
-""")
+""", encoding="utf-8")
 
 
 def build(args: argparse.Namespace) -> int:

@@ -23,6 +23,7 @@ Two rules this module exists to keep:
     archives are git-ignored and gigabytes), so every function here answers "nothing found"
     rather than raising. The console has an upload path and a live feed without it.
 """
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -42,10 +43,12 @@ SENSORS = {
     "ALL": "MODIS+VIIRS",         # the merged year export (hf_export.py), every sensor
 }
 
-# The bucket this console also reads from. `hf sync` runs both ways; here the bucket is the
-# source and `<root>/hf` the destination, so a machine with no `.data/` (every fresh clone,
-# every CI run with network) still has the harmonized year to open -- the database case.
+# The bucket this console also reads from. The bucket is the source and `<root>/hf` the
+# destination, so a machine with no `.data/` (every fresh clone, every CI run with network)
+# still has the harmonized year to open -- the database case.
 HF_BUCKET = "hf://buckets/hriishiibanerjee/FIRMS_DATA"
+HF_BUCKET_PREFIX = "hf://buckets/"    # the spelling both the CLI and the client accept
+HF_BUCKET_ENV = "FIRECAL_HF_BUCKET"   # point at another bucket without editing this file
 HF_CACHE = "hf"                       # cache dir name under a root; inventoried like the rest
 HF_SYNC_TIMEOUT = 600                 # first pull is a few hundred MB; later ones are no-ops
 
@@ -389,32 +392,96 @@ def read_slice(path: Path, limit: int, chunk: int = CHUNK_ROWS,
             "estimate": max(estimate, rows)}
 
 
+def bucket_id() -> str:
+    """The bucket to read as `namespace/name`: `FIRECAL_HF_BUCKET` when set, else `HF_BUCKET`.
+
+    Read per call rather than at import, because the server loads its `.env` on start-up and a
+    bucket that arrives with it should win over the constant above. Both spellings are
+    accepted -- `ns/name` and the `hf://buckets/ns/name` form -- since both are what gets
+    pasted, and a private bucket is addressed the same way.
+    """
+    raw = (os.environ.get(HF_BUCKET_ENV) or HF_BUCKET).strip()
+    if raw.startswith(HF_BUCKET_PREFIX):
+        raw = raw[len(HF_BUCKET_PREFIX):]
+    return raw.strip("/")
+
+
+def hub_client():
+    """`huggingface_hub`, or None when it is not installed -- an optional dependency.
+
+    Imported here rather than at module scope, the same discipline the model libraries get:
+    the bucket read is the one thing that wants it, and paying for that import on every
+    request (and every test) to serve a cold path is not a trade this module makes.
+    """
+    try:
+        import huggingface_hub
+    except ImportError:
+        return None
+    return huggingface_hub
+
+
+def _pull_with_client(hub, bucket: str, dest: Path) -> tuple[bool, str]:
+    """The CLI-free read: list the bucket, name what it holds, then sync it into `dest`.
+
+    Listing first is what makes the answer specific. A bucket that exists and is empty is a
+    different state from one that cannot be read, and the console should be able to say which
+    one it hit -- an empty bucket is this project's actual state today, and "synced nothing"
+    would hide it.
+    """
+    try:
+        files = [item for item in hub.list_bucket_tree(bucket, recursive=True)
+                 if getattr(item, "type", "file") == "file"]
+    except Exception as e:                      # unknown id, private bucket, no network
+        return False, f"{bucket}: {type(e).__name__}: {str(e)[:300]}"
+    if not files:
+        return False, f"{bucket} is empty (0 files)"
+    n = len(files)
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        hub.sync_bucket(f"{HF_BUCKET_PREFIX}{bucket}", str(dest))
+    except Exception as e:
+        return False, f"{bucket} ({n} files): {type(e).__name__}: {str(e)[:300]}"
+    return True, f"synced {n} file{'s' if n != 1 else ''} from {HF_BUCKET_PREFIX}{bucket} -> {dest}"
+
+
 def hf_pull(root: Path, timeout: int = HF_SYNC_TIMEOUT) -> tuple[bool, str]:
     """Pull the Hugging Face bucket into `<root>/hf`; answer (ok, message), never raise.
 
     This is the "database" half: `.data/` is a download folder on *this* machine, the bucket
     is the shared record, and when the inventory comes up empty (fresh clone, container,
     another laptop) this is how the console gets something to open. Every failure mode -- no
-    `hf` CLI, no network, no auth, a timeout -- is a reason string, because a machine that
-    cannot reach the database is in the same state as one that has no archives: nothing found.
+    client, no network, no auth, a timeout, an empty bucket -- is a reason string, because a
+    machine that cannot reach the database is in the same state as one that has no archives:
+    nothing found. The reason says *which* of those it was, so the next person to read it does
+    not have to re-derive it.
+
+    The Python client does the work when it is importable: a bucket read needs no second
+    install beside the app, and `hf` is only the fallback for a machine that has the CLI and
+    not the library. `timeout` bounds the CLI subprocess; the client brings its own HTTP
+    timeouts.
     """
     dest = root / HF_CACHE
+    bucket = bucket_id()
+    hub = hub_client()
+    if hub is not None:
+        return _pull_with_client(hub, bucket, dest)
     # Resolve once, here. CreateProcess on Windows appends only `.exe` to a bare name, so a
     # `hf` that PATH lookup can see (a .bat shim, an alias) would still fail to spawn; `which`
     # applies PATHEXT and hands subprocess a name it can always run, on every OS.
     hf = shutil.which("hf")
     if hf is None:
-        return False, "hf CLI not installed"
+        return False, (f"no Hugging Face client for {bucket}: pip install huggingface_hub, "
+                       "or install the hf CLI")
     try:
         dest.mkdir(parents=True, exist_ok=True)
-        proc = subprocess.run([hf, "sync", HF_BUCKET, str(dest)], capture_output=True,
-                              text=True, timeout=timeout)
+        proc = subprocess.run([hf, "sync", f"{HF_BUCKET_PREFIX}{bucket}", str(dest)],
+                              capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
-        return False, f"{type(e).__name__}: {e}"
+        return False, f"{bucket}: {type(e).__name__}: {str(e)[:300]}"
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
         return False, detail[-400:]
-    return True, f"synced {HF_BUCKET} -> {dest}"
+    return True, f"synced {HF_BUCKET_PREFIX}{bucket} -> {dest}"
 
 
 def allocate(items: list[dict], limit: int) -> list[tuple[dict, int]]:

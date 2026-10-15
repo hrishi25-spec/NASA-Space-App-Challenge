@@ -153,9 +153,14 @@ The Vite dev server proxies `/api` → `:8000` automatically (`firecal/frontend/
    (see [Local archives](#local-archives)).
 1. Otherwise download archive CSVs from <https://firms.modaps.eosdis.nasa.gov/download/> — pick
    **MODIS C6.1** and/or **VIIRS SNPP / NOAA-20 / NOAA-21**, same country/region so the
-   sensors overlap.
+   sensors overlap. To skip the manual download, `python firecal/backend/fetch_archive.py` does it for you (needs a free
+`FIRMS_MAP_KEY` — see below — and walks the area API over 5-day windows).
 2. Click **Upload FIRMS CSVs** in the app (multiple files at once are fine).
-3. The **forecast** needs at least ~120 days; **anomalies**, z-score streaks and the
+3. The **forecast** needs at least ~120 days (and fails with a plain explanation rather than
+   an internal error if the record is shorter than the model's 28-day lag — the open 24 h and
+   7 d feeds are far too short to train on; `bash scripts/fetch_firms_feeds.sh` pulls them
+   anyway, which is useful for seeing real exports in the console and not much else);
+   **anomalies**, z-score streaks and the
    **illusion diagnostic** need **more than one year** (the diagnostic needs the pre-2012
    MODIS era and the 2012–2015 overlap specifically).
 
@@ -233,10 +238,52 @@ seasonal shape per 2° cell plus the harmonized daily series — 1.8 MB out of 1
 reference run, written to `firecal/backend/model/`. Nothing is read into memory whole and
 nothing is committed: the archive is 10 GB of local NASA area exports, the checkpoint is
 derived from it, and both are in `.gitignore`. Delete `model/` and the API behaves exactly
-as it did before. Add `torch` to `requirements.txt` and the same run also fits the LSTM
-that `/forecast` warm-starts from.
+as it did before.
 
-The forecast panel names which one answered. With a checkpoint (`Seasonal climatology +
+The **LightGBM forecaster** is a second, optional pass that replaces the old per-request
+LSTM. It is a single global model fitted offline over every cell and season, not a neural
+fit per click:
+
+```bash
+cd firecal/backend
+python train_forecast.py               # scan the archive, fit, backtest, write model/lgbm_*
+python train_forecast.py --inventory   # list what would be read, and stop
+python train_forecast.py --no-backtest # fit and write the checkpoint, skip the backtest
+```
+
+It reduces the archive to a 2°-cell × day panel whose target is the *harmonized* daily
+activity — the same quantity `/forecast` serves, built through the server's own
+`harmonize(geometry=False)` and the one sensor rescale — with features sin/cos day-of-year,
+1/7/14/28-day lags, 7/28-day rolling means, the cell's training-years day-of-year
+climatology and its latitude/longitude. It is validated by leave-one-fire-season-out in
+time plus a spatial hold-out by curated region (30° tiles as a fallback; never a random
+split), and scored with MASE against
+the seasonal prior and a seasonal-naive forecast at horizons 1/7/14/30. The result goes to
+`model/lgbm_forecast.txt`, `model/lgbm_climo.npz` and `model/lgbm_metrics.json`.
+
+**`/forecast` serves LightGBM only where it earned the horizon.** The gate compares the
+stored backtest MASE against the prior's and keeps the prior otherwise — so if the model
+does not win, nothing changes and the metrics record the loss. The `model` field names which
+ran and why. There is no FIRMS archive on this machine, so the only published backtest is on
+the repository's synthetic fixture, and there the prior won at every horizon; run
+`train_forecast.py` against `.data/` to get a real score. A missing, truncated or
+foreign-schema checkpoint also falls back to the prior — and because LightGBM's parser
+aborts the process on a truncated model file, the loader verifies the checkpoint's SHA-256
+before LightGBM ever sees it.
+
+**The forecast carries a calibrated interval, and it says when it is not calibrated.** The
+trainer holds out a time block strictly later than the training block, measures the model's
+*relative* error on it in log1p space, and stores a per-horizon [split-conformal](https://en.wikipedia.org/wiki/Conformal_prediction)
+half-width (a small in-repo implementation — one order statistic — rather than a MAPIE
+dependency; see [ADR 0004](docs/decisions/0004-conformal-intervals.md)). `/forecast` turns
+that into a `lower`/`upper` band per day and a `coverage` block, and the forecast chart draws
+and labels it. The band is only drawn when the checkpoint was actually calibrated, and
+the coverage it reports is *measured*, not assumed: on the synthetic fixture the nominal 90 %
+band came out at 79–87 % empirical coverage, so `coverage.within_tolerance` is `false` and
+the chart labels the band as indicative rather than quietly implying it is exact. A real
+archive run is what would say whether that gap closes.
+
+The forecast panel names which one answered. With the prior (`Seasonal climatology +
 archive prior`) the archive's shape is blended into the frame's own season — in log space,
 fading out as the frame covers more years itself — because a record of a single fire season
 is one sample per day and cannot know its own shape. The reference run read 126 million
@@ -289,8 +336,12 @@ July.
   (GIS-IDEAS 2024).
 - **Anomalies** — z-score of each day against the climatology of the same ±7-day window
   in *other* years; critical months = monthly mean above mean + 1σ.
-- **Forecast** — 30-day LSTM (PyTorch, optional) with seasonal sin/cos day-of-year
-  features; without `torch` it falls back to scaled seasonal climatology.
+- **Forecast** — a 30-day horizon from a global LightGBM model (Tweedie) fitted offline on
+the archive's 2°-cell × day panel, served only where its stored backtest MASE beats the
+seasonal prior; otherwise the prior answers (day-of-year climatology scaled to the frame's
+recent level, blended with the archive's per-cell shape). A split-conformal band (log1p
+relative error, per horizon) is drawn when the checkpoint was calibrated, labelled with its
+*nominal* coverage and, when the two disagree, its measured coverage too. `torch` is not used.
 
 ## API reference
 
@@ -300,8 +351,8 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
 | Method & path | Parameters | Description |
 |---|---|---|
 | `POST /upload` | multipart `files[]`, `demo_transition` (bool) | Add FIRMS CSVs (200 MB/file, 400 MB/request, ≤20 files). Returns `meta` plus an `upload` report naming every file — `files[]` with `rows`, `status` (accepted/rejected) and `reason`, plus `accepted`/`rejected` counts — so a file that harmonizes to nothing is never dropped in silence. HTTP 400 whose detail names each file and its reason when nothing is accepted, HTTP 413 if the request declares more than 400 MB. `demo_transition=true` replaces the dataset with the 2002–2024 demo — the poster dataset is loaded by this flag, **not** by naming a file `demo_transition.csv`. |
-| `POST /datasets/load` | `id`, `all` (bool), `limit` (1,000–2,000,000; default 750,000, or 2,000,000 when `all=true`), `spread` (bool, default true) | Open a local archive — or, with `all=true`, **every** archive merged into one record: all sensors, all years. Rows are *read*, so the reader stops and a 1.87 GB file costs about what a 50 MB one does; with `all=true` the budget is split across the files by size. An id the local inventory does not hold is resolved against the Hugging Face bucket first (`hf sync hf://buckets/hriishiibanerjee/FIRMS_DATA` into the cache, then re-listed), so the shared record opens on a machine with no `.data/` at all. Parquet files (the bucket's format) open like CSVs — already-harmonized frames are passed through instead of re-harmonized. HTTP 404 for an id the inventory does not hold (400 when `all=true` and nothing exists locally or remotely), 429 while another archive is opening, 400 when a CSV is not a FIRMS export or holds no usable rows. Returns `meta` plus a **`load`** block — for one file `file/sensor/kind/mb/capped`, for a merge `merged/archives/sensors/files[]/skipped[]` naming each export's rows — plus `rows_read`, `rows_kept`, `rows_estimate`, `spread`, `limit`. The console labels the slice from it, because the record on screen and the file it came from are not the same span. |
-| `GET /datasets` | — | The FIRMS archives found on this machine, smallest first: `{id, name, sensor, kind, label, bytes, mb}` each. `id` is relative to the archive root and is the only handle the load endpoint accepts — no absolute path is published, not even the roots that were walked. When nothing is local (fresh clone, container, CI), the Hugging Face bucket is pulled into the cache first and listed; `{"items": []}` means both the folder and the bucket came up empty (or unreachable). |
+| `POST /datasets/load` | `id`, `all` (bool), `limit` (1,000–2,000,000; default 750,000, or 2,000,000 when `all=true`), `spread` (bool, default true) | Open a local archive — or, with `all=true`, **every** archive merged into one record: all sensors, all years. Rows are *read*, so the reader stops and a 1.87 GB file costs about what a 50 MB one does; with `all=true` the budget is split across the files by size. An id the local inventory does not hold is resolved against the Hugging Face bucket first (`archives.hf_pull` into the cache, then re-listed), so the shared record opens on a machine with no `.data/` at all. That read needs no `hf` CLI: `huggingface_hub` does it, and the `hf` command is only the fallback, with `FIRECAL_HF_BUCKET` naming a different bucket. Parquet files (the bucket's format) open like CSVs — already-harmonized frames are passed through instead of re-harmonized. HTTP 404 for an id the inventory does not hold (400 when `all=true` and nothing exists locally or remotely) — both detailing the bucket's own state (empty, unreadable, no client installed) — 429 while another archive is opening, 400 when a CSV is not a FIRMS export or holds no usable rows. Returns `meta` plus a **`load`** block — for one file `file/sensor/kind/mb/capped`, for a merge `merged/archives/sensors/files[]/skipped[]` naming each export's rows — plus `rows_read`, `rows_kept`, `rows_estimate`, `spread`, `limit`. The console labels the slice from it, because the record on screen and the file it came from are not the same span. |
+| `GET /datasets` | — | The FIRMS archives found on this machine, smallest first: `{id, name, sensor, kind, label, bytes, mb}` each. `id` is relative to the archive root and is the only handle the load endpoint accepts — no absolute path is published, not even the roots that were walked. When nothing is local (fresh clone, container, CI), the Hugging Face bucket is pulled into the cache first and listed; `{"items": []}` means both the folder and the bucket came up empty (or unreachable), and the reason is not invented — `archives.hf_pull` names it (a bucket that is empty says so; so does a machine with no client at all). |
 | `POST /demo` | `mode=standard\|transition`, `region` | **Fixture, not a console feature** — the console has no demo button. Replace data with the synthetic 2020–2024 set, or the 2002–2024 transition set. `region` scopes the generated record (and its own seed) to a preset AOI; HTTP 400 for an unknown key. It is what the test suite loads, and the only data source a checkout without `.data/` has. |
 | `POST /archive` | `region`, `bbox`, `source`, `days` (1–5), `date`, `append` | Load a **real** FIRMS window through the area API and merge it into the record (like an upload). Needs `FIRMS_MAP_KEY`: HTTP 400 with the link and the `.env` locations when it is missing, 400 for an unknown source/region/bad date, 502 when FIRMS is unreachable. Rows outside the requested AOI are dropped, and the response is `meta` plus `{source, region, days}`. |
 | `DELETE /data` | — | Clear all loaded data. |
@@ -315,7 +366,7 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
 | `GET /points` | `bbox`, `start`, `end`, `limit` (1–20000) | Map points (`{lat, lon, frp, sensor}`), randomly sampled if over the limit. |
 | `GET /clusters` | `bbox`, `start`, `end`, `eps` (10–5000), `min_pts` (1–100), `hours` (0.5–720) | DBSCAN clusters, top 300 by size, each with a convex `hull`. Only those 300 are hulled (hulling every cluster made one uncached call cost 33 s on a 23-year record); above 60k detections the input is stride-sampled across the whole period rather than truncated to the oldest rows. |
 | `GET /anomalies` | `bbox`, `z` (0.5–10) | `{anomalies[], critical[], monthly[]}`; needs >1 year of data. |
-| `GET /forecast` | `bbox`, `horizon` (1–90), `epochs` (1–200) | `{model, forecast[]}`; needs ≥120 days. |
+| `GET /forecast` | `bbox`, `horizon` (1–90), `epochs` (1–200) | `{model, forecast[]}`; needs ≥120 days. Additive fields name the path: `method` (`lgbm` | `prior`), `model_reason`, a `checkpoint` provenance block when the LightGBM model serves, `lower`/`upper` on each forecast row and a `coverage` block (`nominal`, `empirical`, `within_tolerance`) when the checkpoint was conformally calibrated. The original keys are unchanged. |
 
 `bbox` format: `minlat,minlon,maxlat,maxlon` (e.g. `bbox=17,98,20,101`).
 
@@ -328,7 +379,7 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
 ├── SECURITY.md                     ← how to report a vulnerability
 ├── CHANGELOG.md                    ← user-facing changes, newest first
 ├── .editorconfig                   ← cross-editor basics: charset, indentation, newlines
-├── .env.example                    ← optional FIRMS_MAP_KEY + ALLOW_ORIGINS (copy to .env)
+├── .env.example                    ← optional FIRMS_MAP_KEY + ALLOW_ORIGINS + bucket (copy to .env)
 ├── run.py                          ← the one-command launcher (any OS, stdlib only)
 ├── start.sh / start.bat            ← thin wrappers around run.py
 ├── Dockerfile                      ← console build + API in one image (see decisions/0002)
@@ -354,10 +405,12 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
     │   ├── archives.py             ← the local archive inventory + the bounded, spread slice reader
     │   ├── train.py                ← trains the model from the FIRMS archive (writes model/)
     │   ├── forecast_model.py       ← the trained prior: 2° cell × day-of-year, checkpoint IO
+    │   ├── train_forecast.py       ← fits the global LightGBM forecaster on the archive (writes model/lgbm_*)
+    │   ├── lgbm_forecast.py        ← LightGBM features, hash-verified checkpoint IO, the prior-vs-model gate
     │   ├── train_data.py           ← headless run of every model over your own CSVs + a Markdown report
-    │   ├── model/                  ← trained checkpoint (gitignored; rebuilt by train.py)     │   ├── test_smoke.py           ← 44-test API smoke suite (encodings, gzip, cache, presets, archive, training, /api prefix)
+    │   ├── model/                  ← trained checkpoint (gitignored; rebuilt by train.py)     │   ├── test_smoke.py           ← 68-test API smoke suite (encodings, gzip, cache, presets, archive, real-FIRMS schema guard, training, LightGBM forecast + its conformal band, /api prefix)
     │   ├── test_security.py        ← 34-test hardening suite (URL allowlist, upload caps, CORS, CSP hosts)
-    │   ├── test_archives.py        ← 28-test suite for the local-archive picker (inventory, slice, merge, ids, gate, HF bucket)
+    │   ├── test_archives.py        ← 35-test suite for the local-archive picker (inventory, slice, merge, ids, gate, HF bucket)
     │   ├── requirements.txt        ← runtime deps (with security floors)
     │   └── requirements-dev.txt    ← + pytest, httpx (for tests)
     └── frontend/
@@ -386,7 +439,7 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
 
 | Layer | Choices |
 |---|---|
-| Backend | FastAPI, pandas, NumPy, scikit-learn (DBSCAN, K-means), SciPy (convex hull), requests (live FIRMS), optional PyTorch (LSTM warm-started from the trained checkpoint) |
+| Backend | FastAPI, pandas, NumPy, scikit-learn (DBSCAN, K-means), SciPy (convex hull), requests (live FIRMS), LightGBM (the archive forecast model, lazily imported) |
 | Frontend | React 18, Vite 5, MapLibre GL 6 (one camera morphing a 3D globe into a flat map), hand-rolled SVG charts |
 | Tooling | Four zero-dep `prebuild` guards: `check-lazy-exports.mjs`, `check-quality-policy.mjs`, `check-chart-fill.mjs`, `check-spin-policy.mjs` |
 | Data | NASA FIRMS archive CSVs (MODIS C6.1, VIIRS SNPP/NOAA-20) |
@@ -490,7 +543,7 @@ scripts/check.sh          # POSIX — or scripts\check.bat on Windows
 Both are thin wrappers around the commands below, which is also what CI runs:
 
 ```bash
-# 106 tests, ~2 min — starts the app in-process via TestClient
+# 137 tests, ~2 min — starts the app in-process via TestClient
 cd firecal/backend
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest -q
@@ -512,7 +565,7 @@ python scripts/test_check_doc_links.py
 
 `.github/workflows/ci.yml` runs all five on every push to `main` and on pull requests.
 
-**`test_smoke.py` (44)** covers every endpoint end-to-end — demo load, calendar with and
+**`test_smoke.py` (68) ** covers every endpoint end-to-end — demo load, calendar with and
 without bbox, points clamping, clusters, climatology envelope, illusion diagnostic on both
 demos, briefing JSON + Markdown, live feed (skipped offline when FIRMS is unreachable),
 anomalies, forecast — plus error paths (bad bbox → 400, missing-column CSV → 400, valid CSV
@@ -524,7 +577,7 @@ and region-specific, `.env` parsing handles comments/`export`/quotes, and `/arch
 validates the request *before* the key, explains a missing key, builds the area-API URL in
 west,south,east,north order, and merges rows while dropping anything outside the AOI.
 
-**`test_archives.py` (28)** covers the local-archive picker against a purpose-built fixture
+**`test_archives.py` (35)** covers the local-archive picker against a purpose-built fixture
 directory — three archives over two instruments, one of them an S-NPP export that names its
 platform: the inventory order (smallest first) and its labels, that no filesystem path reaches
 the response, that no archive at all is an empty list rather than an error, that a CSV which is
@@ -617,6 +670,7 @@ the suite goes red.
 |---|---|---|
 | `ALLOW_ORIGINS` | local origins | Comma-separated origins; set when deploying so only your frontend can call the API. The dev server proxies `/api`, so the browser is same-origin and needs no grant. |
 | `FIRMS_MAP_KEY` | unset | Optional, read from the environment only (never from a request); enables `POST /archive`. `.env` is loaded from `firecal/backend/`, `firecal/` or the repo root, and a real environment variable always wins. |
+| `FIRECAL_HF_BUCKET` | the shared bucket | Which Hugging Face bucket the dataset routes fall back to, as `namespace/name` (the `hf://buckets/` prefix is accepted too). Read per call, so a `.env` value wins over the built-in default — the bucket that holds the harmonized record moves without a code change. A private bucket also needs the client's own credentials (`hf auth login`). |
 | Archive window | 1–5 days per pull | FIRMS area-API limit; `days` is clamped, `source` is one of four mapped products, and `date` must be `YYYY-MM-DD`. |
 | Local archives | `.data/` | Searched recursively for `fire_*.csv` and git-ignored — so the list is simply empty in CI, in the image and on a fresh clone. |
 | Archive slice | 750,000 rows (1,000–2,000,000) | Rows **read**, not kept: the reader stops at the cap, so opening a 1.87 GB export costs about what a 50 MB one does. `spread=false` reads the head instead of the whole file. |
@@ -629,7 +683,7 @@ the suite goes red.
 | Region allowlist | 8 FIRMS regions | `region` is interpolated into the outbound URL, so anything off the list → HTTP 400 before any fetch. |
 | Row cap | 2,000,000 | Oldest rows are dropped beyond this (in-memory store, no database). |
 | Query params | clamped | `limit` ≤ 20000, `eps` ≤ 5000, `epochs` ≤ 200, `horizon` ≤ 90, etc. |
-| `torch` | optional | Install for the LSTM forecast; without it you get seasonal climatology. |
+| Forecast model | LightGBM (lazily imported) | Serves only where its stored backtest MASE beats the seasonal prior; otherwise the prior answers. A missing/broken checkpoint degrades to the prior, never an error. |
 
 ## Security notes
 
@@ -697,11 +751,12 @@ Known gaps, accepted for a prototype and worth closing before real deployment:
 - **Opening a big archive takes a few seconds** — it is reading up to 750,000 rows off disk and
   estimating the rest; only one archive opens at a time, and a second request answers 429, which
   the console reports rather than hanging on.
-- **Forecast says “install torch for LSTM”** — expected without PyTorch; numbers still
-  show, via the climatology fallback: `pip install torch`.
-- **Forecast says just “Seasonal climatology”** — there is no trained checkpoint yet. Run
-  `python firecal/backend/train.py` over a FIRMS archive to add the `archive prior`; the
-  endpoint needs no restart to pick it up on its next computation.
+- **Forecast says “Seasonal climatology” or “Seasonal climatology + archive prior”** — the
+  LightGBM model either has no checkpoint or its stored backtest did not beat the prior, so
+  the prior answered. The response's `model_reason` says which. Run
+  `python firecal/backend/train.py` for the prior and `python firecal/backend/train_forecast.py`
+  for the LightGBM model over a FIRMS archive; the endpoint picks up `model/` on its next
+  computation, no restart needed. `torch` is not involved.
 - **CORS errors after deploying** — set `ALLOW_ORIGINS` on the backend to your frontend's origin.
 - **“Real-window pull failed: FIRMS_MAP_KEY is not set”** — expected: the area API needs a
   free key. Copy `.env.example` to `.env` and paste it in, or export `FIRMS_MAP_KEY`, or keep

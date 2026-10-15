@@ -29,8 +29,8 @@ It runs exactly what CI runs (`.github/workflows/ci.yml`):
    own rules — slug construction, the case check, the link parser, and each of the four
    error classes — as assertions, so changing one has to be deliberate. 34 stdlib
    `unittest` tests, no pytest and no network, so the `docs` job still installs nothing.
-4. **Backend suite — 106 tests** (`cd firecal/backend && .venv/bin/pytest -q`):
-   44 smoke + 34 security + 28 local-archive, in-process via `TestClient`. No network,
+4. **Backend suite — 137 tests** (`cd firecal/backend && .venv/bin/pytest -q`):
+   68 smoke + 34 security + 35 local-archive, in-process via `TestClient`. No network,
    no `.data/` archive, no trained model required — fixtures are built inside the tests.
 5. **Frontend production build** (`cd firecal/frontend && npm run build`): the
    `prebuild` step runs four zero-dependency guards — `check-lazy-exports.mjs`,
@@ -56,7 +56,8 @@ seasonal climatology and the UI names the fallback.
 | Path | What it holds |
 |---|---|
 | `firecal/backend/main.py` | Every endpoint plus the cores: `harmonize`, `harmonized_daily`, `_zstats`, `_streaks`, `_threat`, `_biomes`, `_cluster_payload`, `_esfp`, `cached` |
-| `firecal/backend/archives.py` | Local-archive inventory under `.data/`, the bounded spread slice reader (byte offsets for CSV, row groups for parquet), `allocate()` (merge budget by file size), `read_merge()`, `hf_pull()` (the Hugging Face bucket pulled on demand) |
+| `firecal/backend/archives.py` | Local-archive inventory under `.data/`, the bounded spread slice reader (byte offsets for CSV, row groups for parquet), `allocate()` (merge budget by file size), `read_merge()`, `hf_pull()` (the Hugging Face bucket pulled on demand through `huggingface_hub`, the `hf` CLI being the fallback, with `bucket_id()` reading `FIRECAL_HF_BUCKET`) |
+| `firecal/backend/fetch_archive.py` | Pulls real FIRMS area exports into `.data/` over 5-day windows (needs `FIRMS_MAP_KEY`), reusing `main.firms_area_url` + `regions.region_box`; resumable, `--dry-run` plans without network |
 | `firecal/backend/hf_export.py` | Builds the harmonized year (2024-09-30 → 2025-09-29) parquet in `data/` for `hf sync ./data hf://buckets/hriishiibanerjee/FIRMS_DATA`; runs the server's own `harmonize()` |
 | `firecal/backend/regions.py` | The five curated AOI presets behind `GET /regions` |
 | `firecal/backend/demo.py` | Synthetic FIRMS generator — the test fixture; nothing in the UI calls it |
