@@ -12,6 +12,8 @@ anchors. Every rule in the guard is pinned here:
   ``readme.md`` on NTFS and macOS and 404s on GitHub;
 * **the link parser** — fences, reference definitions, ``<a href>``, schemes,
   percent-escapes, fragments;
+* **the ignore rule** — a git-ignored markdown file is local-only and is not scanned,
+  while a *tracked* file that merely matches an ignore rule still is;
 * **the four error classes** and the two deliberate exemptions, driven through
   ``main()`` against throwaway git repositories.
 
@@ -319,6 +321,38 @@ class GuardEndToEnd(unittest.TestCase):
         self.git(root, "commit", "-q", "-m", "seed")
         code, report = self.run_guard(root)
         self.assertEqual(code, 0, report)
+
+    @needs_git
+    def test_a_gitignored_folder_is_not_part_of_the_docs(self):
+        # A local-only scaffold (this repository's `github setup/`) is git-ignored,
+        # absent from a fresh clone, and not what a reader of this repository
+        # receives. Scanning it reported seven "not in git" failures for files
+        # nobody else can see, so it is not scanned at all.
+        root = self.repo({
+            ".gitignore": "scratch/\n",
+            "README.md": "# Firecal\n",
+            "scratch/skill.md": "[gone](missing.md)\n",
+        }, commit=("README.md", ".gitignore"))
+        code, report = self.run_guard(root)
+        self.assertEqual(code, 0, report)
+        self.assertIn("1 markdown file", report)
+
+    @needs_git
+    def test_a_tracked_file_that_also_matches_an_ignore_rule_is_still_scanned(self):
+        # Ignore rules do not apply to files already in the index, and the guard
+        # must not skip a document a reader does get — even a deliberately forced
+        # one — just because a line in .gitignore matches it.
+        root = self.repo({
+            ".gitignore": "notes.md\n",
+            "README.md": "[notes](notes.md)\n",
+            "notes.md": "# Notes\n\n## Real\n",
+        })
+        self.git(root, "add", "-f", "notes.md")
+        self.git(root, "add", ".gitignore", "README.md")
+        self.git(root, "commit", "-q", "-m", "seed")
+        code, report = self.run_guard(root)
+        self.assertEqual(code, 0, report)
+        self.assertIn("2 markdown file", report)
 
     @needs_git
     def test_a_directory_target_is_fine(self):

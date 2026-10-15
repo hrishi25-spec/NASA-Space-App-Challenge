@@ -138,12 +138,13 @@ def run_models(df, args) -> list[tuple[str, str, list[str]]]:
                      f"{len(an['critical'])} critical months"]))
 
     # --- forecast -------------------------------------------------------------
-    fc = main.forecast(bbox=None, horizon=args.horizon, epochs=args.epochs)
+    fc = main.forecast(bbox=None, horizon=args.horizon)
     if not fc.get("model"):
-        out.append(("Forecast (LSTM or seasonal fallback)", SKIPPED, ["needs >= 120 days of data"]))
+        out.append(("Forecast (LightGBM archive model or seasonal prior)", SKIPPED,
+                    ["needs >= 120 days of data"]))
     else:
         vals = [f["count"] for f in fc["forecast"]]
-        out.append(("Forecast (LSTM or seasonal fallback)", TRAINED,
+        out.append(("Forecast (LightGBM archive model or seasonal prior)", TRAINED,
                     [f"method: {fc['model']}, horizon {len(vals)} days",
                      f"first {fc['forecast'][0]['date']}: {vals[0]}, "
                      f"last {fc['forecast'][-1]['date']}: {vals[-1]}, mean {sum(vals) / len(vals):.1f} fires/day"]))
@@ -178,7 +179,8 @@ def render(args, inventory, meta, models, briefing_md, demo) -> str:
     days = (pd.Timestamp(meta["end"]) - pd.Timestamp(meta["start"])).days + 1
     L = [f"# Pyro-Harmony - training run on real FIRMS downloads", "",
          f"Run on {date.today().isoformat()} by `firecal/backend/train_data.py`.",
-         f"PyTorch present: {'yes' if importlib.util.find_spec('torch') else 'no (forecast uses the seasonal fallback)'}", "",
+         f"LightGBM checkpoint on this machine: "
+         f"{'yes' if importlib.util.find_spec('lightgbm') and main.lgbm_forecast.available() else 'no (forecast uses the seasonal fallback)'}", "",
          "## 1. Data", "",
          "| file | raw rows | harmonized | span | note |", "|---|---:|---:|---|---|"]
     for name, raw_n, kept, span, note in inventory:
@@ -215,7 +217,6 @@ def main_cli() -> int:
     ap.add_argument("--briefing-out", default=str(ROOT / "TRAINING_BRIEFING.md"),
                     help="where to write the Markdown briefing for this data")
     ap.add_argument("--horizon", type=int, default=30, help="forecast horizon in days (1-90)")
-    ap.add_argument("--epochs", type=int, default=40, help="LSTM epochs when torch is installed")
     ap.add_argument("--eps", type=float, default=550.0, help="DBSCAN eps in metres (10-5000)")
     ap.add_argument("--min-pts", type=int, default=3, help="DBSCAN minPts")
     ap.add_argument("--hours", type=float, default=12.0, help="DBSCAN time window in hours")

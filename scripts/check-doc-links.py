@@ -36,6 +36,14 @@ network is not a place to spend CI); anchors on non-markdown files, where the
 fragment is a line number or a class name rather than a slug; and directory
 targets, which have no index entry of their own.
 
+A markdown file git *ignores* is not one of this repository's documents — a local
+scaffold folder, a generated report, an agent's scratch notes — so it is not
+scanned at all. Those files are absent from a fresh clone, and checking their
+links reports failures nobody else can reproduce (this guard found seven dead
+links inside a git-ignored scaffold while the repository itself was clean). One
+rule, asked of git rather than guessed from a list of names, so every ignored
+path is treated the same way.
+
 Zero dependencies beyond the standard library and ``git`` itself: ``python
 scripts/check-doc-links.py`` runs anywhere python3 does. Without git (a source
 tarball, a zip download) the first three checks still run and the fourth isskipped with a note, rather than the guard failing for the wrong reason. Run next to
@@ -62,7 +70,8 @@ ROOT = Path(__file__).resolve().parents[1]
 # and the datasets/checkpoints that are gitignored anyway. Same list as the
 # doc-figure guard reads, so the two agree on what "the docs" means — including
 # `.pytest_cache`, whose README would otherwise make the file count depend on
-# whether anyone had run the tests.
+# whether anyone had run the tests. This is the cheap, git-free half of the
+# filter; `ignored_markdown` below is the exact one.
 SKIP = {".git", "node_modules", ".venv", "dist", "__pycache__", ".pytest_cache",
         ".data", "model"}
 
@@ -86,7 +95,54 @@ ERRORS: list[str] = []
 
 
 def markdown_files() -> list[Path]:
-    return [p for p in sorted(ROOT.rglob("*.md")) if not any(part in SKIP for part in p.parts)]
+    """Every markdown file that is part of this repository, minus git-ignored local files.
+
+    Local-only files git ignores are dropped: they are not in a fresh clone, so
+    their links are not this repository's links (see the module docstring).
+    """
+    found = [p for p in sorted(ROOT.rglob("*.md")) if not any(part in SKIP for part in p.parts)]
+    top = git_top()
+    if top is None:
+        return found                      # no git: nothing is known to be local-only
+    rel = {path: repo_relative(path, top) for path in found}
+    ignored = ignored_paths([r for r in rel.values() if r is not None], top)
+    if not ignored:
+        return found
+    return [p for p in found if rel[p] is None or rel[p] not in ignored]
+
+
+def repo_relative(path: Path, top: Path) -> str | None:
+    """`path` relative to the work tree `top`, slash-separated, or None if it is outside it.
+
+    Deliberately not `resolve()`d: the answer is about the file the walk found, and
+    a symlink that leaves the tree is not something to answer for.
+    """
+    try:
+        return path.relative_to(top).as_posix()
+    except ValueError:
+        return None
+
+
+def ignored_paths(rel: list[str], top: Path) -> set[str]:
+    """The work-tree-relative paths among `rel` that git ignores.
+
+    `git check-ignore` answers with the paths it matched and exits 1 when it
+    matched none — which is the ordinary answer, not a failure — so both exits
+    are read rather than only the success case. Without git, or with a git that
+    cannot answer, nothing is skipped: the three checks that need no git still
+    run, exactly as the tracked-file check degrades below.
+    """
+    if not rel:
+        return set()
+    try:
+        done = subprocess.run(["git", "-C", str(top), "check-ignore", "-z", "--stdin"],
+                              input="\0".join(rel).encode("utf-8"),
+                              capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if done.returncode not in (0, 1):
+        return set()
+    return {name for name in done.stdout.decode("utf-8", errors="replace").split("\0") if name}
 
 
 def git_top() -> Path | None:

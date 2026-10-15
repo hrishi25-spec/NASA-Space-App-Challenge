@@ -10,7 +10,7 @@ Satellites have tracked active fires for 20+ years, but the record is fragmented
 
 | Thing | State |
 |---|---|
-| Tests | 137 passing — 68 API smoke + 34 security + 35 local-archive, run in-process via `TestClient` |
+| Tests | 138 passing — 68 API smoke + 34 security + 36 local-archive, run in-process via `TestClient` |
 | Frontend build | Clean, including the prebuild lazy-export, adaptive-detail, chart-layout and orbital-drift guards |
 | Startup weight | Import ≈ 2.2 s, baseline RSS ≈ 104 MB (dev machine; re-measured ≈ 0.8 s / 103.5 MB on the Windows checkout after the LightGBM work). `lightgbm` is lazily imported and unloaded at start-up, so it adds nothing here |
 | Layout | Arranged per the repo standard; see [decisions/0001](decisions/0001-repository-layout.md) |
@@ -76,6 +76,7 @@ The console's opening move is the first of those: `GET /datasets` publishes the 
 | Caps | 2 M rows total, 200 MB/file, 400 MB/request, ≤ 20 files, 64 MB per outbound feed, 2 concurrent live ingests |
 | Local archive slice | 750,000 rows read (1,000–2,000,000) across ≤ 24 evenly spaced offsets; 1 concurrent open; `.data/` is gitignored so CI and the image see none |
 | Merged archives | `all=true` · 2,000,000 rows split by file bytes · per-file accounting + per-file skips |
+| Bucket pull | One at a time (the colliding caller is told so, not queued); a failed pull is answered from memory for 60 s; a success never is |
 | Sensor naming | instrument, not platform — `SNPP`/`NPP`/`N20`/`N21`/`NOAA-20`/`NOAA-21` → **VIIRS**, so the three VIIRS platforms are one sensor (they are the same instrument; `SENSOR_ALIASES` in `main.py`) |
 | Camera | globe ≤ 3.7 · flat ≥ 5.2 · start 1.65 · tiles ≤ 16 · axial tilt 23.44° while auto-rotating · `LOW_END` = ≤ 4 cores or ≤ 4 GB |
 
@@ -98,7 +99,7 @@ FIRMS_MAP_KEY=… in .env            # enables POST /archive (real 1–5 day win
 - **scipy and scikit-learn import lazily** inside clustering/briefing. Do not move them back to module scope — it costs ~2.5 s of startup.
 - **Never import chart code in the shell.** `charts.jsx` and `ForecastChart.jsx` are lazy for a reason; a new lazy target must resolve to a default export or the build guard fails.
 - **Derived values must degrade honestly.** Thin selections answer `200` with a `note`; every panel is required to show that note instead of spinning.
-- **`torch` is optional and no longer serves a forecast.** The LSTM serving path was replaced by the LightGBM model ([ADR 0003](decisions/0003-lightgbm-forecast.md)); `/forecast` imports neither. Without a LightGBM checkpoint it answers with the scaled seasonal climatology — archive-trained when a prior exists — and names the fallback in the UI.
+- **`torch` is gone from the forecast, serving and training alike.** The per-request LSTM was replaced by the LightGBM model ([ADR 0003](decisions/0003-lightgbm-forecast.md)), and `train.py`'s neural pass — which wrote a `model/lstm.pt` nothing read — was removed with it, so no code path imports `torch` any more and `requirements.txt` does not carry it. Without a LightGBM checkpoint `/forecast` answers with the scaled seasonal climatology — archive-trained when a prior exists — and names the fallback in the UI.
 - **`lightgbm` imports lazily**, inside `lgbm_forecast.load()`. Moving it to module scope costs start-up for a model only needed on the first served forecast; `test_smoke.py` asserts it with an AST scan.
 - **The forecast gate keeps the prior unless LightGBM earned the horizon.** `/forecast` serves the checkpoint only where its *stored* backtest MASE beats the prior's; a missing, truncated, foreign-schema or losing checkpoint degrades to the prior and names it.
 - **The forecast band is measured, not assumed.** `coverage.within_tolerance` is false when the empirical coverage on the held-out block is more than 5 points off nominal, and the panel is required to label the band *indicative* then. On the synthetic fixture it is false (79–87 % against a nominal 90 %) — that is the honest state, not a bug to tune away.
@@ -114,7 +115,7 @@ The follow-ups from the last review round, highest value first — two have land
 
 | Step | Why it is next |
 |---|---|
-| Run `train_forecast.py` against the real FIRMS archive | No archive is present on this checkout (and the HF bucket is empty), so the LightGBM backtest is only measured on the repository's synthetic fixture — where the prior wins and the conformal band under-covers. A real run is what decides whether the model replaces the prior and whether the band is actually calibrated |
+| Run `train_forecast.py` against the real FIRMS archive | The archive *is* on this checkout now (15 exports / 9.6 GB in `.data/`, ~126M rows — the `prior` checkpoint was trained over it: 3,390 cells, 1,089 days), but the **LightGBM** checkpoint has never been fitted here (`model/lgbm_metrics.json` absent), so the served forecast is the seasonal prior and the backtest is only measured on the repository's synthetic fixture — where the prior wins and the conformal band under-covers. A real run is what decides whether the model replaces the prior and whether the band is actually calibrated |
 | Launch the console live and verify calendar, forecast and the dataset picker end to end | This repo is developed on Windows, the one platform the docs admit was never exercised (PRD gap 5); the suite now passes here, so the running app is the remaining check |
 | Add a Windows job to the CI matrix | The suite is green on Windows since the `hf`-CLI resolution fix (`archives.py`); CI should keep it that way (NFR-5) |
 | ✅ Done — per-file upload outcomes in `/upload` | PRD gap 8 is closed: a file whose rows all fail harmonization used to be silently ignored when a dataset already exists (200, unchanged data); the response now carries an `upload` block naming each file's rows or refusal reason, a request where nothing is accepted is a 400 naming every file, and the console shows it in a neutral banner |

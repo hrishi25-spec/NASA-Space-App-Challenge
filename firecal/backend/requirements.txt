@@ -25,6 +25,5 @@ huggingface_hub
 # (the server's start-up budget is ~2 s), and optional at runtime: without it, or with no
 # checkpoint, `/forecast` falls back to the seasonal prior and names the fallback.
 lightgbm
-# optional, no longer used by `/forecast` (the LSTM serving path was retired in favour of
-# the LightGBM model above); `train.py`'s LSTM training pass remains available.
-# torch
+# No torch: the LSTM was retired in favour of the LightGBM model above, and its training
+# pass was removed with it (ADR 0003). Nothing in this project imports it.

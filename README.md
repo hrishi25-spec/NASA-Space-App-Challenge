@@ -352,7 +352,7 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
 |---|---|---|
 | `POST /upload` | multipart `files[]`, `demo_transition` (bool) | Add FIRMS CSVs (200 MB/file, 400 MB/request, ≤20 files). Returns `meta` plus an `upload` report naming every file — `files[]` with `rows`, `status` (accepted/rejected) and `reason`, plus `accepted`/`rejected` counts — so a file that harmonizes to nothing is never dropped in silence. HTTP 400 whose detail names each file and its reason when nothing is accepted, HTTP 413 if the request declares more than 400 MB. `demo_transition=true` replaces the dataset with the 2002–2024 demo — the poster dataset is loaded by this flag, **not** by naming a file `demo_transition.csv`. |
 | `POST /datasets/load` | `id`, `all` (bool), `limit` (1,000–2,000,000; default 750,000, or 2,000,000 when `all=true`), `spread` (bool, default true) | Open a local archive — or, with `all=true`, **every** archive merged into one record: all sensors, all years. Rows are *read*, so the reader stops and a 1.87 GB file costs about what a 50 MB one does; with `all=true` the budget is split across the files by size. An id the local inventory does not hold is resolved against the Hugging Face bucket first (`archives.hf_pull` into the cache, then re-listed), so the shared record opens on a machine with no `.data/` at all. That read needs no `hf` CLI: `huggingface_hub` does it, and the `hf` command is only the fallback, with `FIRECAL_HF_BUCKET` naming a different bucket. Parquet files (the bucket's format) open like CSVs — already-harmonized frames are passed through instead of re-harmonized. HTTP 404 for an id the inventory does not hold (400 when `all=true` and nothing exists locally or remotely) — both detailing the bucket's own state (empty, unreadable, no client installed) — 429 while another archive is opening, 400 when a CSV is not a FIRMS export or holds no usable rows. Returns `meta` plus a **`load`** block — for one file `file/sensor/kind/mb/capped`, for a merge `merged/archives/sensors/files[]/skipped[]` naming each export's rows — plus `rows_read`, `rows_kept`, `rows_estimate`, `spread`, `limit`. The console labels the slice from it, because the record on screen and the file it came from are not the same span. |
-| `GET /datasets` | — | The FIRMS archives found on this machine, smallest first: `{id, name, sensor, kind, label, bytes, mb}` each. `id` is relative to the archive root and is the only handle the load endpoint accepts — no absolute path is published, not even the roots that were walked. When nothing is local (fresh clone, container, CI), the Hugging Face bucket is pulled into the cache first and listed; `{"items": []}` means both the folder and the bucket came up empty (or unreachable), and the reason is not invented — `archives.hf_pull` names it (a bucket that is empty says so; so does a machine with no client at all). |
+| `GET /datasets` | — | The FIRMS archives found on this machine, smallest first: `{id, name, sensor, kind, label, bytes, mb}` each. `id` is relative to the archive root and is the only handle the load endpoint accepts — no absolute path is published, not even the roots that were walked. When nothing is local (fresh clone, container, CI), the Hugging Face bucket is pulled into the cache first and listed; `{"items": []}` means both the folder and the bucket came up empty (or unreachable), and the reason is not invented — `archives.hf_pull` names it (a bucket that is empty says so; so does a machine with no client at all). The pull itself is bounded: one runs at a time (the colliding request is told so), and a failed one is answered from memory for 60 s, because an empty `.data/` otherwise started a fresh outbound sync on every request. |
 | `POST /demo` | `mode=standard\|transition`, `region` | **Fixture, not a console feature** — the console has no demo button. Replace data with the synthetic 2020–2024 set, or the 2002–2024 transition set. `region` scopes the generated record (and its own seed) to a preset AOI; HTTP 400 for an unknown key. It is what the test suite loads, and the only data source a checkout without `.data/` has. |
 | `POST /archive` | `region`, `bbox`, `source`, `days` (1–5), `date`, `append` | Load a **real** FIRMS window through the area API and merge it into the record (like an upload). Needs `FIRMS_MAP_KEY`: HTTP 400 with the link and the `.env` locations when it is missing, 400 for an unknown source/region/bad date, 502 when FIRMS is unreachable. Rows outside the requested AOI are dropped, and the response is `meta` plus `{source, region, days}`. |
 | `DELETE /data` | — | Clear all loaded data. |
@@ -366,7 +366,7 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
 | `GET /points` | `bbox`, `start`, `end`, `limit` (1–20000) | Map points (`{lat, lon, frp, sensor}`), randomly sampled if over the limit. |
 | `GET /clusters` | `bbox`, `start`, `end`, `eps` (10–5000), `min_pts` (1–100), `hours` (0.5–720) | DBSCAN clusters, top 300 by size, each with a convex `hull`. Only those 300 are hulled (hulling every cluster made one uncached call cost 33 s on a 23-year record); above 60k detections the input is stride-sampled across the whole period rather than truncated to the oldest rows. |
 | `GET /anomalies` | `bbox`, `z` (0.5–10) | `{anomalies[], critical[], monthly[]}`; needs >1 year of data. |
-| `GET /forecast` | `bbox`, `horizon` (1–90), `epochs` (1–200) | `{model, forecast[]}`; needs ≥120 days. Additive fields name the path: `method` (`lgbm` | `prior`), `model_reason`, a `checkpoint` provenance block when the LightGBM model serves, `lower`/`upper` on each forecast row and a `coverage` block (`nominal`, `empirical`, `within_tolerance`) when the checkpoint was conformally calibrated. The original keys are unchanged. |
+| `GET /forecast` | `bbox`, `horizon` (1–90) | `{model, forecast[]}`; needs ≥120 days. Additive fields name the path: `method` (`lgbm` | `prior`), `model_reason`, a `checkpoint` provenance block when the LightGBM model serves, `lower`/`upper` on each forecast row and a `coverage` block (`nominal`, `empirical`, `within_tolerance`) when the checkpoint was conformally calibrated. The original keys are unchanged. |
 
 `bbox` format: `minlat,minlon,maxlat,maxlon` (e.g. `bbox=17,98,20,101`).
 
@@ -410,7 +410,7 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
     │   ├── train_data.py           ← headless run of every model over your own CSVs + a Markdown report
     │   ├── model/                  ← trained checkpoint (gitignored; rebuilt by train.py)     │   ├── test_smoke.py           ← 68-test API smoke suite (encodings, gzip, cache, presets, archive, real-FIRMS schema guard, training, LightGBM forecast + its conformal band, /api prefix)
     │   ├── test_security.py        ← 34-test hardening suite (URL allowlist, upload caps, CORS, CSP hosts)
-    │   ├── test_archives.py        ← 35-test suite for the local-archive picker (inventory, slice, merge, ids, gate, HF bucket)
+    │   ├── test_archives.py        ← 36-test suite for the local-archive picker (inventory, slice, merge, ids, gate, HF bucket)
     │   ├── requirements.txt        ← runtime deps (with security floors)
     │   └── requirements-dev.txt    ← + pytest, httpx (for tests)
     └── frontend/
@@ -543,7 +543,7 @@ scripts/check.sh          # POSIX — or scripts\check.bat on Windows
 Both are thin wrappers around the commands below, which is also what CI runs:
 
 ```bash
-# 137 tests, ~2 min — starts the app in-process via TestClient
+# 138 tests, ~2 min — starts the app in-process via TestClient
 cd firecal/backend
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest -q
@@ -577,7 +577,7 @@ and region-specific, `.env` parsing handles comments/`export`/quotes, and `/arch
 validates the request *before* the key, explains a missing key, builds the area-API URL in
 west,south,east,north order, and merges rows while dropping anything outside the AOI.
 
-**`test_archives.py` (35)** covers the local-archive picker against a purpose-built fixture
+**`test_archives.py` (36)** covers the local-archive picker against a purpose-built fixture
 directory — three archives over two instruments, one of them an S-NPP export that names its
 platform: the inventory order (smallest first) and its labels, that no filesystem path reaches
 the response, that no archive at all is an empty list rather than an error, that a CSV which is
@@ -644,7 +644,10 @@ file nobody has committed. A tracked file that also matches a `.gitignore` line 
 that combination is ordinary. The anchor check
 uses GitHub's own slug rules, so a table of contents has to name the heading in full:
 `## 5. How the Papers Fit Together (Workflow View)` is `#5-how-the-papers-fit-together-workflow-view`.
-Code blocks, external URLs and anchors on non-markdown files are left alone. It is what
+Code blocks, external URLs and anchors on non-markdown files are left alone, and so is
+markdown that git ignores: a local-only scaffold folder is not in a fresh clone, so its
+links are not this repository's links (scanning one turned up seven dead links nobody else
+could reproduce). It is what
 found the four dead anchors in `docs/modis-viirs-integrated-review.md` — links that had
 been quietly going nowhere. Stdlib plus `git` itself, with no network: where git is not
 available the first three checks still run and the tracked check is skipped rather than
@@ -652,12 +655,13 @@ failing the build for the wrong reason. Same `docs` CI job, second step of
 `scripts/check.sh`.
 
 **`scripts/test_check_doc_links.py`** is that guard's own test suite, because a guard
-that fails builds deserves to have its own rules checked. 34 stdlib `unittest` tests pin
+that fails builds deserves to have its own rules checked. 36 stdlib `unittest` tests pin
 the slug rules (lowercasing, punctuation dropped rather than hyphenated, `-1`/`-2` on
 repeated headings, and inline code keeping its contents — ``## The `x.py` guard`` is
 `#the-xpy-guard`, because GitHub strips the backticks and not what is between them), the
-case check, the link parser and all four error classes, each of those driven through
-`main()` against a throwaway git repository. It runs on stock python in the same CI job,
+case check, the link parser, the ignore rule (a git-ignored file is not scanned, while a
+tracked file that merely matches an ignore rule still is) and all four error classes, each
+of those driven through `main()` against a throwaway git repository. It runs on stock python in the same CI job,
 so the guard needs no dependencies to be trustworthy. It has already paid for itself:
 writing it turned up two real bugs — a `#fragment` discarded whenever a link also carried
 a query string, and headings inside a fenced block offered as anchors GitHub would never
@@ -682,7 +686,7 @@ the suite goes red.
 | Concurrent live ingests | 2 | Each call is 4 downloads + DBSCAN/K-means; extra callers get HTTP 429 instead of stacking. |
 | Region allowlist | 8 FIRMS regions | `region` is interpolated into the outbound URL, so anything off the list → HTTP 400 before any fetch. |
 | Row cap | 2,000,000 | Oldest rows are dropped beyond this (in-memory store, no database). |
-| Query params | clamped | `limit` ≤ 20000, `eps` ≤ 5000, `epochs` ≤ 200, `horizon` ≤ 90, etc. |
+| Query params | clamped | `limit` ≤ 20000, `eps` ≤ 5000, `horizon` ≤ 90, etc. |
 | Forecast model | LightGBM (lazily imported) | Serves only where its stored backtest MASE beats the seasonal prior; otherwise the prior answers. A missing/broken checkpoint degrades to the prior, never an error. |
 
 ## Security notes

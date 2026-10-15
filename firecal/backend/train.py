@@ -4,13 +4,17 @@
     python train.py                     # the whole archive (a 10 GB run takes minutes)
     python train.py --limit 200000      # first 200k rows of each file, for a smoke test
     python train.py --inventory         # list what would be read and stop
-    python train.py --no-lstm           # seasonal prior only, no neural pass
 
 What it produces
 ----------------
-`model/forecast.json`, `model/cells.npz` and -- when torch is installed -- `model/lstm.pt`,
-which `/forecast` picks up on its next start. Delete `model/` and the API goes back to
-climatology fitted per request; the checkpoint is an upgrade, never a dependency.
+`model/forecast.json` and `model/cells.npz`, which `/forecast` picks up on its next start.
+Delete `model/` and the API goes back to climatology fitted per request; the checkpoint is
+an upgrade, never a dependency.
+
+The neural pass this file used to carry is gone (ADR 0003): it wrote `model/lstm.pt`, torch
+was not installed by default, and nothing ever read its output. The archive's seasonal
+shape -- what this file actually computes -- is served by `/forecast` as the prior, and the
+LightGBM model `train_forecast.py` writes is the other served path.
 
 How it reads the archive
 ------------------------
@@ -23,7 +27,7 @@ harmonized series would be predicting a different quantity from the one served.
 Two reductions happen per chunk, and they are the reason a 10 GB scan is worth doing:
 
   * a (2-degree cell x day-of-year) count grid, which is what the seasonal prior is, and
-  * a (date x sensor) count table, which becomes the daily series the LSTM trains on.
+  * a (date x sensor) count table, which becomes the harmonized daily series.
 
 Pass `--limit` to read only the head of each file: fast, and the shape of the output is
 identical, which is what the tests use.
@@ -131,7 +135,6 @@ def build(scan_result, cfg):
         "trained_by": "firecal/backend/train.py",
         "grid_deg": fm.GRID_DEG,
         "min_cell_days": fm.MIN_CELL_DAYS,
-        "window": fm.WINDOW,
         "source": {"dir": str(cfg["data"]), "files": len(scan_result["files"]),
                    "bytes": scan_result["bytes"], "rows": scan_result["rows"],
                    "kept": scan_result["kept"], "start": scan_result["start"],
@@ -147,76 +150,8 @@ def build(scan_result, cfg):
     return manifest, cells, shape, level, series
 
 
-def train_lstm(series, epochs=60, window=fm.WINDOW, hidden=32, log=None):
-    """Fit the LSTM on the archive's daily series and return a state dict, or None.
-
-    torch is deliberately optional in `requirements.txt`, so its absence is a normal
-    outcome: the seasonal prior is still written and `/forecast` still improves. The last
-    90 days are held out so the run reports a number that was not fitted for.
-    """
-    log = log or (lambda *a: None)
-    try:
-        import torch
-        import torch.nn as nn
-    except ImportError:
-        log("  torch not installed — skipping the LSTM pass (the seasonal prior is unaffected)")
-        return None, {}
-    if len(series) < window + 120:
-        log(f"  only {len(series)} days of series — too few to fit a {window}-day window")
-        return None, {}
-
-    y = np.log1p(series["count"].values).astype("float32")
-    split = max(window + 1, len(y) - 90)
-    mu, sd = float(y[:split].mean()), float(y[:split].std() + 1e-6)
-    z = (y - mu) / sd
-    doy = np.c_[np.sin(2 * np.pi * series.index.dayofyear / 365.25),
-                np.cos(2 * np.pi * series.index.dayofyear / 365.25)].astype("float32")
-    feat = np.c_[z, doy]
-    X = np.stack([feat[i:i + window] for i in range(split - window)])
-    Y = z[window:split]
-
-    class Net(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.l = nn.LSTM(3, hidden, batch_first=True)
-            self.o = nn.Linear(hidden, 1)
-
-        def forward(self, x):
-            return self.o(self.l(x)[0][:, -1]).squeeze(-1)
-
-    net = Net()
-    opt = torch.optim.Adam(net.parameters(), 1e-2)
-    Xt, Yt = torch.tensor(X), torch.tensor(Y)
-    t0 = time.time()
-    for epoch in range(1, max(1, epochs) + 1):
-        opt.zero_grad()
-        loss = nn.functional.mse_loss(net(Xt), Yt)
-        loss.backward()
-        opt.step()
-        if epoch % 10 == 0 or epoch == epochs:
-            log(f"  epoch {epoch:>3}/{epochs}  train mse {loss.item():.4f}  ({time.time() - t0:.1f}s)")
-
-    # One-step-ahead on the held-out tail: the honest number, because every step of the
-    # recursive forecast would otherwise inherit its own error.
-    with torch.no_grad():
-        err = []
-        for i in range(split, len(z)):
-            pred = net(torch.tensor(feat[i - window:i][None]))[0].item()
-            err.append(abs(pred - z[i]))
-    meta = {"window": window, "hidden": hidden, "epochs": int(epochs),
-            "mu": mu, "sd": sd, "tail_days": len(err)}
-    if err:
-        mae_mw = float(np.mean(err)) * sd
-        meta["tail_mae"] = round(float(np.mean(err)), 5)
-        meta["tail_mae_detections"] = round(mae_mw, 2)
-        log(f"  held-out tail (last {len(err)} days): mae {mae_mw:.2f} detections/day "
-            f"({meta['tail_mae']:.4f} standardised)")
-    return net.state_dict(), meta
-
-
-def run(data_dir=None, out=fm.MODEL_DIR, chunk=CHUNK, limit=0, epochs=60,
-        use_lstm=True, log=print):
-    """The whole job: scan, reduce, fit, write. Returns the manifest it wrote."""
+def run(data_dir=None, out=fm.MODEL_DIR, chunk=CHUNK, limit=0, log=print):
+    """The whole job: scan, reduce, write. Returns the manifest it wrote."""
     root = fm.data_dir(data_dir)
     if root is None:
         raise SystemExit(f"no training directory found (looked for {', '.join(fm.DATA_DIRS)})")
@@ -228,15 +163,6 @@ def run(data_dir=None, out=fm.MODEL_DIR, chunk=CHUNK, limit=0, epochs=60,
     scanned = scan(paths, chunk=chunk, limit=limit, log=log)
     manifest, cells, shape, level, series = build(scanned, {
         "data": root, "limit": limit or None, "seconds": time.time() - t0})
-
-    if use_lstm and series is not None:
-        state, meta = train_lstm(series, epochs=epochs, log=log)
-        if state is not None:
-            import torch
-            out = Path(out)
-            out.mkdir(parents=True, exist_ok=True)
-            torch.save(state, out / fm.LSTM_WEIGHTS.name)
-            manifest["lstm"] = dict(meta, file=fm.LSTM_WEIGHTS.name)
     fm.save(manifest, cells, shape, level, path=Path(out) / fm.CHECKPOINT.name)
     return manifest
 
@@ -247,8 +173,6 @@ def cli(argv=None):
     ap.add_argument("--out", default=str(fm.MODEL_DIR), help="where the checkpoint is written")
     ap.add_argument("--chunk", type=int, default=CHUNK, help="rows per read (default 1,000,000)")
     ap.add_argument("--limit", type=int, default=0, help="rows per file; 0 reads each file whole")
-    ap.add_argument("--epochs", type=int, default=60, help="LSTM epochs (default 60)")
-    ap.add_argument("--no-lstm", action="store_true", help="write the seasonal prior only")
     ap.add_argument("--inventory", action="store_true", help="list the files that would be read, then stop")
     args = ap.parse_args(argv)
 
@@ -263,8 +187,7 @@ def cli(argv=None):
         print(f"  {len(paths)} file(s), {total / 1e9:.2f} GB in {root}")
         return 0
 
-    manifest = run(data_dir=args.data, out=args.out, chunk=args.chunk, limit=args.limit,
-                   epochs=args.epochs, use_lstm=not args.no_lstm)
+    manifest = run(data_dir=args.data, out=args.out, chunk=args.chunk, limit=args.limit)
     src, ser, cel = manifest["source"], manifest["series"], manifest["cells"]
     print(f"\nread {src['rows']:,} rows ({src['bytes'] / 1e9:.2f} GB) from {src['files']} file(s) "
           f"in {src['seconds']:.0f}s")
@@ -272,9 +195,6 @@ def cli(argv=None):
     print(f"sensors: " + ", ".join(f"{k} {v:,}" for k, v in sorted(manifest["sensors"].items())))
     print(f"prior: {cel['count']:,} cells at {manifest['grid_deg']} deg "
           f"(mean {cel['mean_level']} detections/day/cell)")
-    if "lstm" in manifest:
-        print(f"lstm: {manifest['lstm']['epochs']} epochs, held-out mae "
-              f"{manifest['lstm'].get('tail_mae_detections')} detections/day")
     print(f"wrote {Path(args.out) / fm.CHECKPOINT.name}, {Path(args.out) / fm.CELL_GRID.name}")
     return 0
 

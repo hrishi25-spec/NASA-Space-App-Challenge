@@ -9,7 +9,9 @@ Two things are checked:
    (the README's suite sizes and total, CONTRIBUTING's composition, PRD's status
    rows, brain's status snapshot, the agent rules) must match. A claim that
    disappears from the docs fails too: a figure may be updated, not quietly
-   dropped.
+   dropped. The doc-link guard's own suite is counted the same way (its
+   ``unittest`` classes included), so the three documents that quote it cannot
+   drift the way they did when it grew from 34 to 36 tests.
 
 2. **Prebuild-guard names.** Every ``check-*.mjs`` named in a markdown file must
    exist in ``firecal/frontend/scripts/``, every guard on disk must be named in
@@ -27,12 +29,18 @@ from __future__ import annotations
 import ast
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "firecal" / "backend"
 FRONTEND = ROOT / "firecal" / "frontend"
+SCRIPTS = ROOT / "scripts"
+
+# The doc-link guard's own stdlib suite. Counted here so the number three documents
+# quote is checked against the code rather than copied by hand.
+LINKS_SELF_TEST = SCRIPTS / "test_check_doc_links.py"
 
 # The three suites the docs name individually. A file added or removed under
 # firecal/backend/test_*.py that is not here means the docs' composition claims
@@ -82,15 +90,31 @@ def _function_cases(fn: ast.FunctionDef | ast.AsyncFunctionDef, where: str) -> i
     return cases
 
 
+def _is_test_class(node: ast.ClassDef) -> bool:
+    """A pytest-style ``Test*`` class, or any ``unittest.TestCase`` subclass.
+
+    Both conventions are collected, because the two suites use one each: the
+    backend is pytest functions and the doc-link guard is ``unittest`` classes
+    named for what they check (``SlugRules``, ``GuardEndToEnd``).
+    """
+    if node.name.startswith("Test"):
+        return True
+    for base in node.bases:
+        name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
+        if str(name).endswith("TestCase"):
+            return True
+    return False
+
+
 def count_collected(path: Path) -> int:
     """Tests pytest would collect from one file: top-level ``test_*`` functions
-    and ``test_*`` methods of ``Test*`` classes, parametrize expanded."""
+    and ``test_*`` methods of test classes, parametrize expanded."""
     tree = ast.parse(read(path), filename=str(path))
     total = 0
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
             total += _function_cases(node, path.name)
-        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+        elif isinstance(node, ast.ClassDef) and _is_test_class(node):
             for sub in node.body:
                 if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and sub.name.startswith("test_"):
                     total += _function_cases(sub, path.name)
@@ -122,11 +146,61 @@ def check_claims(relpath: str, pattern: str, expected: tuple[int, ...], note: st
 
 
 def markdown_files():
+    """Every markdown file that is part of this repository, minus git-ignored local files.
+
+    A git-ignored folder is local-only — not in a fresh clone — so its markdown is
+    not part of this repository's docs and is not scanned; the link guard skips the
+    same files, so the two agree on what "the docs" means.
+    """
     skip = {".git", "node_modules", ".venv", "dist", "__pycache__", ".pytest_cache",
             ".data", "model"}
-    for path in sorted(ROOT.rglob("*.md")):
-        if not any(part in skip for part in path.parts):
-            yield path
+    found = [p for p in sorted(ROOT.rglob("*.md")) if not any(part in skip for part in p.parts)]
+    top = git_top()
+    if top is None:
+        return found
+    rel = {p: _repo_relative(p, top) for p in found}
+    ignored = ignored_paths([r for r in rel.values() if r is not None], top)
+    if not ignored:
+        return found
+    return [p for p in found if rel[p] is None or rel[p] not in ignored]
+
+
+def git_top() -> Path | None:
+    """The work tree root, or None when this is not a git checkout."""
+    try:
+        done = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--show-toplevel"],
+                              capture_output=True, check=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return Path(done.stdout.decode("utf-8", errors="replace").strip())
+
+
+def _repo_relative(path: Path, top: Path) -> str | None:
+    """`path` relative to the work tree, slash-separated, or None when it is outside it."""
+    try:
+        return path.relative_to(top).as_posix()
+    except ValueError:
+        return None
+
+
+def ignored_paths(rel: list[str], top: Path) -> set[str]:
+    """The work-tree-relative paths among `rel` that git ignores.
+
+    `git check-ignore` exits 1 when it matched nothing — the ordinary answer, not a
+    failure — so both exits are read. Without git, or with a git that cannot answer,
+    nothing is skipped.
+    """
+    if not rel:
+        return set()
+    try:
+        done = subprocess.run(["git", "-C", str(top), "check-ignore", "-z", "--stdin"],
+                              input="\0".join(rel).encode("utf-8"),
+                              capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if done.returncode not in (0, 1):
+        return set()
+    return {name for name in done.stdout.decode("utf-8", errors="replace").split("\0") if name}
 
 
 def check_guard_names(disk: set[str]) -> None:
@@ -213,6 +287,12 @@ def main() -> int:
     check_claims("docs/PRD.md", r"plus (\d+) regression tests", (security,), "the security regression-test count")
     check_claims("docs/PRD.md", r"(\d+) tests cover the picker", (archives,), "the archive-suite count")
     check_claims("docs/AGENTS.md", r"Backend suite — (\d+) tests", (total,), "the backend-suite total in the agent rules")
+    self_test = count_collected(LINKS_SELF_TEST) if LINKS_SELF_TEST.is_file() else 0
+    if not self_test:
+        ERRORS.append("scripts/test_check_doc_links.py: no tests collected — did it move?")
+    for relpath in ("README.md", "docs/AGENTS.md", "CONTRIBUTING.md"):
+        check_claims(relpath, r"(\d+) stdlib", (self_test,),
+                     "the doc-link self-test's own test count")
     check_claims(
         "docs/AGENTS.md",
         r"(\d+) smoke \+ (\d+) security \+ (\d+) local-archive",
@@ -234,14 +314,15 @@ def main() -> int:
         print(
             f"\nWhat the code says: {total} tests "
             f"({smoke} smoke + {security} security + {archives} archive), "
-            f"{len(disk_guards)} prebuild guards.",
+            f"{self_test} doc-link self-tests, {len(disk_guards)} prebuild guards.",
             file=sys.stderr,
         )
         return 1
 
     print(
         f"doc figures ok — {total} tests ({smoke} smoke + {security} security + {archives} archive), "
-        f"{len(disk_guards)} prebuild guards, all quoted consistently"
+        f"{self_test} doc-link self-tests, {len(disk_guards)} prebuild guards, "
+        "all quoted consistently"
     )
     return 0
 

@@ -26,6 +26,8 @@ Two rules this module exists to keep:
 import os
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -51,6 +53,19 @@ HF_BUCKET_PREFIX = "hf://buckets/"    # the spelling both the CLI and the client
 HF_BUCKET_ENV = "FIRECAL_HF_BUCKET"   # point at another bucket without editing this file
 HF_CACHE = "hf"                       # cache dir name under a root; inventoried like the rest
 HF_SYNC_TIMEOUT = 600                 # first pull is a few hundred MB; later ones are no-ops
+
+# One bucket pull at a time, and a *failed* one is remembered for a moment.
+#
+# A pull is a network sync (or an `hf` subprocess that gets `HF_SYNC_TIMEOUT`) started by an
+# unauthenticated `GET /datasets` / `POST /datasets/load` whenever the local inventory is
+# empty: uncached, N requests meant N outbound syncs, and two at once raced each other into
+# the same cache directory. The lock answers the racers with a reason instead of starting a
+# second sync; the memo answers the loopers. A *successful* pull is deliberately not
+# remembered -- a bucket filled a second later has to be discoverable on the next request.
+PULL_FAILURE_TTL = 60.0
+PULL_FAILURES_MAX = 8                 # bounded: one entry per (destination, bucket)
+_PULL_LOCK = threading.Lock()
+_PULL_FAILURES: dict[tuple[str, str], tuple[float, tuple[bool, str]]] = {}
 
 # What a frame must carry to be trusted as this API's record: either a raw FIRMS export or
 # the harmonized shape `harmonize()` produces (what the bucket stores).
@@ -444,6 +459,11 @@ def _pull_with_client(hub, bucket: str, dest: Path) -> tuple[bool, str]:
     return True, f"synced {n} file{'s' if n != 1 else ''} from {HF_BUCKET_PREFIX}{bucket} -> {dest}"
 
 
+def forget_bucket_attempts():
+    """Forget what the last pulls answered. The suite calls this between fake buckets."""
+    _PULL_FAILURES.clear()
+
+
 def hf_pull(root: Path, timeout: int = HF_SYNC_TIMEOUT) -> tuple[bool, str]:
     """Pull the Hugging Face bucket into `<root>/hf`; answer (ok, message), never raise.
 
@@ -459,9 +479,33 @@ def hf_pull(root: Path, timeout: int = HF_SYNC_TIMEOUT) -> tuple[bool, str]:
     install beside the app, and `hf` is only the fallback for a machine that has the CLI and
     not the library. `timeout` bounds the CLI subprocess; the client brings its own HTTP
     timeouts.
+
+    A pull is the most expensive thing an unauthenticated request can start, so one runs at
+    a time and a failure is remembered for `PULL_FAILURE_TTL` seconds (see the constants
+    above) -- the answer stays "nothing found" either way, without the outbound traffic.
     """
     dest = root / HF_CACHE
     bucket = bucket_id()
+    key = (str(dest), bucket)
+    remembered = _PULL_FAILURES.get(key)
+    if remembered and time.monotonic() - remembered[0] < PULL_FAILURE_TTL:
+        return remembered[1]
+    if not _PULL_LOCK.acquire(blocking=False):
+        return False, f"a bucket pull for {bucket} is already running; retry in a moment"
+    try:
+        result = _pull_once(bucket, dest, timeout)
+    finally:
+        _PULL_LOCK.release()
+    if not result[0]:
+        _PULL_FAILURES[key] = (time.monotonic(), result)
+        while len(_PULL_FAILURES) > PULL_FAILURES_MAX:
+            oldest = min(_PULL_FAILURES, key=lambda k: _PULL_FAILURES[k][0])
+            _PULL_FAILURES.pop(oldest, None)
+    return result
+
+
+def _pull_once(bucket: str, dest: Path, timeout: int) -> tuple[bool, str]:
+    """One pull by whichever client this machine has. Assumes the caller holds the lock."""
     hub = hub_client()
     if hub is not None:
         return _pull_with_client(hub, bucket, dest)

@@ -435,6 +435,20 @@ class _BucketEntry:
         self.path, self.size = path, size
 
 
+class _CountingHub:
+    """A client that records every listing, so a test can see whether it was asked again."""
+
+    def __init__(self, inner, calls):
+        self.inner, self.calls = inner, calls
+
+    def list_bucket_tree(self, bucket, recursive=False):
+        self.calls.append(bucket)
+        return self.inner.list_bucket_tree(bucket, recursive=recursive)
+
+    def sync_bucket(self, source, dest):
+        return self.inner.sync_bucket(source, dest)
+
+
 class _FakeHub:
     """A `huggingface_hub` shaped exactly like the part of it `hf_pull` uses.
 
@@ -530,6 +544,40 @@ def test_an_empty_bucket_says_it_is_empty(tmp_path, monkeypatch):
     ok, message = archives.hf_pull(tmp_path / ".data")
     assert ok is False and "empty" in message and "0 files" in message
     assert hub.synced == []
+
+
+def test_a_failed_pull_is_remembered_and_a_running_one_is_not_stacked(tmp_path, monkeypatch):
+    """An empty local folder makes /datasets start a bucket pull on *every* request, and each
+    one is a network listing (or an `hf` subprocess with a 600 s timeout) behind an
+    unauthenticated GET. So: one pull at a time, and a failure is answered from memory for a
+    minute instead of dialled out again. A *success* is never remembered -- a bucket filled a
+    second later has to be found on the next request.
+    """
+    calls = []
+    hub = _FakeHub("someone/FIRMS_DATA", error=PermissionError("401 Client Error"))
+    monkeypatch.setenv(archives.HF_BUCKET_ENV, "someone/FIRMS_DATA")
+    monkeypatch.setattr(archives, "hub_client", lambda: _CountingHub(hub, calls))
+    monkeypatch.setattr(archives, "hf_pull", _REAL_HF_PULL)     # undo the no-network stub
+    archives.forget_bucket_attempts()
+    root = tmp_path / ".data"
+
+    first = archives.hf_pull(root)
+    second = archives.hf_pull(root)
+    assert first == second and first[0] is False and "PermissionError" in first[1]
+    assert calls == ["someone/FIRMS_DATA"], "a remembered failure must not dial out again"
+
+    # A pull already in flight answers the colliding caller instead of starting a second sync.
+    assert archives._PULL_LOCK.acquire(blocking=False)
+    try:
+        busy = archives.hf_pull(tmp_path / "elsewhere" / ".data")
+    finally:
+        archives._PULL_LOCK.release()
+    assert busy[0] is False and "already running" in busy[1]
+
+    # The memo is what makes that cheap, and forgetting it is how the next real attempt runs.
+    archives.forget_bucket_attempts()
+    archives.hf_pull(root)
+    assert len(calls) == 2
 
 
 def test_a_bucket_that_cannot_be_read_reports_why(tmp_path, monkeypatch):

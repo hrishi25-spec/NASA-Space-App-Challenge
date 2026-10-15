@@ -37,9 +37,15 @@ per-request neural fit or a single global climatology.
   than the seasonal prior's, and the response's `model` field names which one ran and why. A
   negative result is a valid result: if the model does not win, the checkpoint is still
   written and the metrics record the loss, and the prior serves.
-- **`torch` stays optional and the LSTM serving path is gone.** `/forecast` no longer
-  imports `torch` at all; `train.py`'s optional LSTM training pass remains but nothing reads
-  its `lstm.pt` output. `torch` is neither required nor used to serve a forecast.
+- **`torch` is out of the project entirely: the LSTM serving path is gone, and so is the
+  training pass (amended 2026-10-15).** `/forecast` no longer imports `torch` at all, and
+  `train.py`'s optional LSTM fit — which wrote a `model/lstm.pt` nothing in this repository
+  ever read, behind a wheel that was never installed by default — was removed in the review
+  that followed this decision. The one part of the neural pass that was ever used is the
+  archive's seasonal shape, which `train.py` still computes and `/forecast` still serves as
+  the prior; a trainer whose only output has no consumer is a claim the project cannot back.
+  `torch` is now neither a dependency, a requirement nor a code path, and `requirements.txt`
+  carries the commented-out line no longer.
 - **`lightgbm` is imported lazily**, inside the functions that use it, like `scipy` and
   `scikit-learn` — the app's start-up budget is ~2 s and the booster is only needed the
   first time a checkpoint is actually read.

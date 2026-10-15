@@ -23,15 +23,20 @@ It runs exactly what CI runs (`.github/workflows/ci.yml`):
    markdown file must resolve — the target exists, spelled with the same case (the remote
    is case-sensitive even where a checkout is not), and any `#fragment` names a real
    heading under GitHub's slug rules; and the target is in git, because a generated
-   report or a local dataset renders on this machine and 404s for everyone else. Stdlib
-   plus `git`, no network — without git the tracked check is skipped, not failed.
+   report or a local dataset renders on this machine and 404s for everyone else. Markdown
+   git *ignores* is not scanned at all: a local-only scaffold is not part of the repository
+   a reader receives, and its links are not ours to answer for. Stdlib plus `git`, no
+   network — without git the tracked check is skipped, not failed.
 3. **Doc-link self-test** (`python scripts/test_check_doc_links.py`): the link guard's
    own rules — slug construction, the case check, the link parser, and each of the four
-   error classes — as assertions, so changing one has to be deliberate. 34 stdlib
-   `unittest` tests, no pytest and no network, so the `docs` job still installs nothing.
-4. **Backend suite — 137 tests** (`cd firecal/backend && .venv/bin/pytest -q`):
-   68 smoke + 34 security + 35 local-archive, in-process via `TestClient`. No network,
-   no `.data/` archive, no trained model required — fixtures are built inside the tests.
+   error classes, and the ignore rule — as assertions, so changing one has to be
+   deliberate. 36 stdlib `unittest` tests, no pytest and no network, so the `docs` job
+   still installs nothing.
+4. **Backend suite — 138 tests** (`cd firecal/backend && .venv/bin/pytest -q`):
+   68 smoke + 34 security + 36 local-archive, in-process via `TestClient`. No `.data/`
+   archive and no trained model required — fixtures are built inside the tests. Exactly one
+   test dials out (`test_live`, the public FIRMS 24 h feeds; it skips when they are
+   unreachable) and it is the slowest in the suite; every other test is stubbed or offline.
 5. **Frontend production build** (`cd firecal/frontend && npm run build`): the
    `prebuild` step runs four zero-dependency guards — `check-lazy-exports.mjs`,
    `check-quality-policy.mjs`, `check-chart-fill.mjs`, `check-spin-policy.mjs` — then
@@ -56,7 +61,7 @@ seasonal climatology and the UI names the fallback.
 | Path | What it holds |
 |---|---|
 | `firecal/backend/main.py` | Every endpoint plus the cores: `harmonize`, `harmonized_daily`, `_zstats`, `_streaks`, `_threat`, `_biomes`, `_cluster_payload`, `_esfp`, `cached` |
-| `firecal/backend/archives.py` | Local-archive inventory under `.data/`, the bounded spread slice reader (byte offsets for CSV, row groups for parquet), `allocate()` (merge budget by file size), `read_merge()`, `hf_pull()` (the Hugging Face bucket pulled on demand through `huggingface_hub`, the `hf` CLI being the fallback, with `bucket_id()` reading `FIRECAL_HF_BUCKET`) |
+| `firecal/backend/archives.py` | Local-archive inventory under `.data/`, the bounded spread slice reader (byte offsets for CSV, row groups for parquet), `allocate()` (merge budget by file size), `read_merge()`, `hf_pull()` (the Hugging Face bucket pulled on demand through `huggingface_hub`, the `hf` CLI being the fallback, with `bucket_id()` reading `FIRECAL_HF_BUCKET`; one pull at a time, and a failed one is remembered for 60 s so a repeated request cannot stack outbound syncs) |
 | `firecal/backend/fetch_archive.py` | Pulls real FIRMS area exports into `.data/` over 5-day windows (needs `FIRMS_MAP_KEY`), reusing `main.firms_area_url` + `regions.region_box`; resumable, `--dry-run` plans without network |
 | `firecal/backend/hf_export.py` | Builds the harmonized year (2024-09-30 → 2025-09-29) parquet in `data/` for `hf sync ./data hf://buckets/hriishiibanerjee/FIRMS_DATA`; runs the server's own `harmonize()` |
 | `firecal/backend/regions.py` | The five curated AOI presets behind `GET /regions` |

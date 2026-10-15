@@ -402,7 +402,7 @@ def trained(tmp_path, monkeypatch):
     (archive / "fire_nrt_J1V-C2_2.csv").write_text(head + "\n".join(rows[1::2]) + "\n", encoding="utf-8")
 
     out = tmp_path / "model"
-    manifest = train.run(data_dir=archive, out=out, use_lstm=False, log=lambda *a: None)
+    manifest = train.run(data_dir=archive, out=out, log=lambda *a: None)
     monkeypatch.setattr(fm, "CHECKPOINT", out / fm.CHECKPOINT.name)
     monkeypatch.setattr(fm, "CELL_GRID", out / fm.CELL_GRID.name)
     fm.clear_cache()

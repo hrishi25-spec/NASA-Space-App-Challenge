@@ -21,9 +21,11 @@ Levels are the one thing the two datasets need not agree on -- a 2-degree cell a
 hand-drawn AOI never hold the same number of detections -- so the prior is stored
 mean-normalized and only its shape is ever used.
 
-With torch installed the same checkpoint warm-starts the LSTM, so the weights begin at the
-archive's shape instead of at noise.  torch stays optional (`requirements.txt`), which is
-why nothing in this module imports it at the top level.
+The prior is one of two served paths. `train_forecast.py` fits a global LightGBM model on
+the same archive and `lgbm_forecast.py` serves it where its backtest beat this prior
+(../../docs/decisions/0003-lightgbm-forecast.md); this module holds the fallback that
+answers when there is no checkpoint, and the prior the fallback is blended with when there
+is one. Nothing here needs `torch`: the checkpoint is numpy arrays and JSON.
 """
 import json
 from datetime import datetime, timezone
@@ -48,9 +50,6 @@ DOY_BINS = 366
 # is better off with no prior at all than with a noisy one.
 MIN_CELL_DAYS = 25
 
-# Sequence length the LSTM sees; the endpoint builds the same window when it fine-tunes.
-WINDOW = 30
-
 # Where the archive normally lives. Searched relative to the repository root, this file's
 # directory, and the working directory.
 DATA_DIRS = (".data",)
@@ -60,7 +59,6 @@ ROOT = HERE.parent.parent
 MODEL_DIR = HERE / "model"
 CHECKPOINT = MODEL_DIR / "forecast.json"
 CELL_GRID = MODEL_DIR / "cells.npz"
-LSTM_WEIGHTS = MODEL_DIR / "lstm.pt"
 
 
 def data_dir(explicit=None):

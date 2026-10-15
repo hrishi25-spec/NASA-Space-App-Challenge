@@ -20,7 +20,6 @@ import time
 import zlib
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -181,11 +180,17 @@ def _sensor_family(label, default: str) -> str:
 
 # Live NASA FIRMS open NRT feeds (public, no key needed) — poster pillar 3.
 FIRMS_24H = ("https://firms.modaps.eosdis.nasa.gov/data/active_fire/")
+# Each product's own directory, as FIRMS publishes it: one folder per platform, with the
+# platform's file inside it (J1 is NOAA-20, J2 is NOAA-21). NOAA-21's file is also mirrored
+# under the NOAA-20 folder, which is where this used to point -- the mirror answers today, but
+# it is the wrong name for the product and it is not what the area API or the product pages
+# call it (VIIRS_NOAA21_C2). Verified against the live endpoints while reviewing: both paths
+# answer 200 with the same N21 rows.
 LIVE_FEEDS = {
     "MODIS_C6.1": FIRMS_24H + "modis-c6.1/csv/MODIS_C6_1_{region}_24h.csv",
-    "VIIRS_S-NPP": FIRMS_24H + "suomi-viirs-c2/csv/SUOMI_VIIRS_C2_{region}_24h.csv",
+    "VIIRS_S-NPP": FIRMS_24H + "suomi-npp-viirs-c2/csv/SUOMI_VIIRS_C2_{region}_24h.csv",
     "VIIRS_NOAA-20": FIRMS_24H + "noaa-20-viirs-c2/csv/J1_VIIRS_C2_{region}_24h.csv",
-    "VIIRS_NOAA-21": FIRMS_24H + "noaa-20-viirs-c2/csv/J2_VIIRS_C2_{region}_24h.csv",
+    "VIIRS_NOAA-21": FIRMS_24H + "noaa-21-viirs-c2/csv/J2_VIIRS_C2_{region}_24h.csv",
 }
 LIVE_REGIONS = ["Global", "South_East_Asia", "South_America", "North_and_Central_America",
                 "Africa", "Europe", "Northern_and_Central_Australia", "South_Asia"]
@@ -1524,8 +1529,8 @@ def _lgbm_forecast(bbox, horizon):
 
 @app.get("/forecast")
 @cached
-def forecast(bbox: str = None, horizon: int = 30, epochs: int = 40):
-    horizon = min(max(horizon, 1), 90); epochs = min(max(epochs, 1), 200)
+def forecast(bbox: str = None, horizon: int = 30):
+    horizon = min(max(horizon, 1), 90)
     s = daily(subset(bbox))["count"]
     if len(s) < 120: return {"model": None, "forecast": []}
     idx = pd.date_range(s.index[-1] + pd.Timedelta(days=1), periods=horizon)
