@@ -58,6 +58,23 @@ export const tickValues = (top, step) =>
 export const tickCount = (span, target, max) =>
   Math.max(2, Math.min(max, Math.round(span / target)));
 
+/**
+ * The monthly anomaly profile as exactly twelve calendar rows, Jan → Dec.
+ *
+ * The endpoint sends one row per calendar month, grouped in whatever order pandas produced;
+ * the chart needs a fixed twelve-slot axis so a month with no entry cannot shift the others,
+ * and every row carries the critical-month threshold the line series draws across the plot
+ * (null when the response has none, which draws no line rather than a line at zero).
+ */
+export function monthRows(monthly, threshold) {
+  const by = new Map((monthly || []).map(m => [Number(m.month), Number(m.avg) || 0]));
+  return Array.from({ length: 12 }, (_, i) => ({
+    month: i + 1,
+    avg: by.get(i + 1) ?? 0,
+    threshold: typeof threshold === "number" && Number.isFinite(threshold) ? threshold : null,
+  }));
+}
+
 /** Row indices to label: the first and last are always labelled, so the axis spans the data. */
 export function xTickIndices(n, count) {
   if (n <= 0) return [];

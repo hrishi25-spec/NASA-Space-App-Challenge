@@ -12,6 +12,7 @@ here do not leak into it.
 import io
 import json
 import os
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -602,6 +603,51 @@ def test_a_missing_archive_says_why_the_bucket_did_not_answer(tmp_path, monkeypa
     r = client.post("/datasets/load", params={"id": "hf/nothing_here.parquet"})
     assert r.status_code == 404
     assert "someone/FIRMS_DATA is empty (0 files)" in r.json()["detail"]
+
+
+def test_a_fetch_range_tiles_a_season_with_no_gap_and_no_overlap(tmp_path, monkeypatch):
+    """A fire season is 30 September to 29 September, so `--years` cannot express the
+    extension this archive needs: tiling 2022 stops at 31 December, leaving January to
+    September 2023 empty, and the panel fills an empty day with zeros -- a year of false
+    quiet that the model would learn as real. `--from/--to` tiles the season exactly and
+    abuts the archive's first day (2023-09-30) with neither a doubled row nor a missing one,
+    and `world` supplies a box for a global panel that has no curated preset behind it."""
+    import fetch_archive as fa
+
+    asked = []
+
+    def fake_area_rows(session, key, source, box, start, span, timeout=240):
+        asked.append((str(start), tuple(box)))
+        return ["18.5,99.5,2022-10-01,1015,80,9.5,320,NOAA-20,VIIRS"], ""
+
+    monkeypatch.setattr(fa, "area_rows", fake_area_rows)
+    monkeypatch.setenv("FIRMS_MAP_KEY", "a-test-key")
+    out = tmp_path / ".data"
+    argv = ["--regions", "world", "--from", "2022-09-30", "--to", "2023-09-29",
+            "--sources", "MODIS_C6.1", "--out", str(out), "--max-windows", "2"]
+
+    assert fa.main_cli(argv) == 0
+    path = (out / "DL_FIRE_M-C61_world_20220930_20230929"
+            / "fire_archive_M-C61_world20220930_20230929.csv")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0].startswith("latitude,") and len(lines) == 3   # a header, two windows
+    assert asked == [("2022-09-30", (-90.0, -180.0, 90.0, 180.0)),
+                     ("2022-10-05", (-90.0, -180.0, 90.0, 180.0))]
+
+    # the span is the season, not a calendar year: 73 five-day windows that stop one day
+    # before the archive begins, so the extension neither overlaps nor skips a day
+    ws = fa.windows_between(date(2022, 9, 30), date(2023, 9, 29))
+    assert len(ws) == 73
+    assert ws[-1][0] + timedelta(days=ws[-1][1]) == date(2023, 9, 30)
+
+    # the file still reads back as a MODIS archive, so the sensor label does not depend on
+    # the tag being a year
+    [entry] = archives.scan(out)
+    assert entry["sensor"] == "MODIS C6.1" and entry["kind"] == "archive"
+
+    assert fa.main_cli(["--from", "2022-09-30", "--out", str(out)]) == 2      # half a range
+    assert fa.main_cli(["--regions", "nowhere", "--from", "2022-09-30",
+                        "--to", "2023-09-29", "--out", str(out)]) == 2      # unknown box
 
 
 def test_the_firms_puller_resumes_instead_of_refetching(tmp_path, monkeypatch):

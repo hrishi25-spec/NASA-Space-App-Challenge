@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { api, doyLabel, fmt } from "./lib";
 import { Chart } from "./plot";
+import { monthRows } from "./chartGeometry";
 
 /**
  * Chart panels live in their own module on purpose: opening a chart tab downloads this
@@ -151,6 +152,61 @@ export function DiagnosticPanel({ bbox, refreshKey, embedded }) {
   };
   if (embedded) return body();
   return <div className="panel wide"><h3>Sensor Transition Illusion</h3>{body()}</div>;
+}
+
+/* ------------- 3. Monthly anomaly profile ------------- */
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/**
+ * The `monthly[]` series `/anomalies` has always returned, drawn for the first time: one bar per
+ * calendar month, pooled across every year in the record, with the critical-month threshold
+ * (`mean + 1σ`) as a line. The old panel showed only the day list and the names of the critical
+ * months; the shape behind those names was invisible.
+ *
+ * It is a seasonal profile, not a month-by-month time series — the API groups by month number,
+ * so every January is one bar — and the caption says so rather than letting "monthly" imply a
+ * timeline. The threshold comes from the response, so the line and the `critical[]` list can
+ * never disagree about where the cut is.
+ */
+export function AnomalyPanel({ bbox, refreshKey, embedded }) {
+  const { data: a, failed } = useEndpoint("/anomalies", bbox, refreshKey);
+
+  const body = () => {
+    if (failed) return <span className="hint">Anomaly profile unavailable for this selection.</span>;
+    if (!a) return <span className="hint">Analyzing…</span>;
+    // A thin selection answers 200 with a note instead of a series; surface it rather than
+    // drawing twelve empty bars as though the record had no season.
+    if (!Array.isArray(a.monthly) || !a.monthly.length)
+      return <span className="hint">{a.note || "Not enough data to build a monthly profile."}</span>;
+    const rows = monthRows(a.monthly, a.threshold);
+    const peak = rows.reduce((best, r) => (r.avg > best.avg ? r : best), rows[0]);
+    const critical = (a.critical || []).map(c => MONTHS[c.month - 1] ?? c.month);
+    const dec = v => (Math.round(v * 10) / 10).toLocaleString();
+    return <div className="chartStack">
+      <Chart rows={rows} xKey="month" xFmt={m => MONTHS[m - 1]} height={310}
+        yLabel="Mean detections / day"
+        description="Mean daily detections by calendar month, with the critical-month threshold"
+        ariaLabel="Mean daily detections in each calendar month against the critical-month threshold"
+        series={[
+          { key: "avg", type: "bar", name: "Monthly mean", color: C.amber, fmt: dec },
+          { key: "threshold", type: "line", name: "Critical threshold (mean + 1σ)",
+            color: C.teal, dash: true, width: 2, fmt: dec },
+        ]} />
+      <div className="chartStats">
+        <Stat k="Peak month" v={MONTHS[peak.month - 1]} tone="acc"
+          note={`${dec(peak.avg)} detections/day on average`} />
+        <Stat k="Critical months" v={critical.length ? critical.join(" · ") : "None"}
+          note="monthly means above mean + 1σ" />
+        <Stat k="Threshold" v={a.threshold ?? "—"} note="mean + 1σ of the twelve monthly means" />
+      </div>
+      <div className="hint">
+        Each bar pools that calendar month across every year in the record — a seasonal profile,
+        not a month-by-month time series. Months above the dashed line are the critical months.
+      </div>
+    </div>;
+  };
+  if (embedded) return body();
+  return <div className="panel wide"><h3>Monthly anomaly profile</h3>{body()}</div>;
 }
 
 function Stat({ k, v, bad, note, tone }) {

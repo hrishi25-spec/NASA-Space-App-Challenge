@@ -24,7 +24,12 @@ export default function ForecastChart({ series, model, coverage }) {
     return <span className="hint">No calendar data yet — open a local archive or upload FIRMS CSVs to fit a forecast.</span>;
 
   const observed = series.filter(d => d.actual != null).length;
-  const lookahead = series.filter(d => d.forecast != null).length;
+  const lookahead = series.filter(d => d.forecast != null || d.prior != null).length;
+  // The archive model serves only the days its stored backtest earned; the rest is the
+  // seasonal prior. The two are drawn as separate series so the switch is visible rather
+  // than one dashed line implying a single method drew the whole window.
+  const hasModel = series.some(d => d.forecast != null);
+  const hasPrior = series.some(d => d.prior != null);
   const rows = zoom ? series.slice(zoom[0], zoom[1] + 1) : series;
 
   /* The interval is only drawn when the payload actually carries it. The archive model emits
@@ -58,7 +63,12 @@ export default function ForecastChart({ series, model, coverage }) {
         ...(hasBand ? [{ key: "upper", keyLow: "lower", keyHigh: "upper", type: "band",
                          name: bandName, color: TEAL, opacity: 0.3 }] : []),
         { key: "actual", type: "line", name: "Observed", color: AMBER },
-        { key: "forecast", type: "line", name: "Forecast", color: TEAL, dash: true },
+        ...(hasModel ? [{ key: "forecast", type: "line",
+                          name: hasPrior ? "Forecast — archive model" : "Forecast",
+                          color: TEAL, dash: true }] : []),
+        ...(hasPrior ? [{ key: "prior", type: "line",
+                          name: hasModel ? "Forecast — seasonal prior" : "Forecast",
+                          color: TEAL, dash: true, width: 1.5 }] : []),
       ]} />
     <div className="chartControls end">
       <span className="hint">Window</span>
@@ -73,6 +83,10 @@ export default function ForecastChart({ series, model, coverage }) {
       The nominal {pct(nominal)} band measured {pct(Math.min(...emp))}–{pct(Math.max(...emp))} coverage on the
       held-out block it was scored against — more than a few points off, so read it as indicative
       rather than exactly calibrated.
+    </div>}
+    {hasModel && hasPrior && <div className="hint" style={{ marginTop: 6 }}>
+      The archive model drew only the days its own backtest beat the seasonal prior at; the rest
+      is the prior. Hover a day to see which series it came from.
     </div>}
     {lookahead === 0 && <div className="hint" style={{ marginTop: 6 }}>
       No forecast window available for this record — the model needs a longer daily series.

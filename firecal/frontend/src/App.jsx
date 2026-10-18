@@ -17,6 +17,7 @@ const MERGE_ALL = "__merge_all__";
 // which throws inside <Suspense> and (without a boundary) blanks the whole console.
 const ClimatologyPanel = lazy(() => import("./charts").then(m => ({ default: m.ClimatologyPanel })));
 const DiagnosticPanel = lazy(() => import("./charts").then(m => ({ default: m.DiagnosticPanel })));
+const AnomalyPanel = lazy(() => import("./charts").then(m => ({ default: m.AnomalyPanel })));
 const ForecastChart = lazy(() => import("./ForecastChart"));
 
 /**
@@ -113,6 +114,7 @@ const DRAWER_TABS = [
   { id: "forecast", label: "Forecast", prefetch: () => import("./ForecastChart") },
   { id: "climatology", label: "Climatology", prefetch: () => import("./charts") },
   { id: "diagnostic", label: "Illusion diagnostic", prefetch: () => import("./charts") },
+  { id: "anomalies", label: "Anomalies", prefetch: () => import("./charts") },
   { id: "briefing", label: "Briefing detail" },
 ];
 
@@ -233,7 +235,13 @@ export default function App() {
   }
   // The forecast rows carry a calibrated `lower`/`upper` when the archive model served and was
   // calibrated; the prior path has none, so the band is whatever the payload actually holds.
-  const series = useMemo(() => cal.slice(-365).map(d => ({ date: d.date, actual: d.count })).concat((fc?.forecast || []).map(d => ({ date: d.date, forecast: d.count, lower: d.lower, upper: d.upper }))), [cal, fc]);
+  // Each row also names the method that drew it, and the two are kept as separate keys so the
+  // chart can show where the archive model's run ends and the seasonal prior takes over.
+  const series = useMemo(() => cal.slice(-365).map(d => ({ date: d.date, actual: d.count })).concat((fc?.forecast || []).map(d => ({
+    date: d.date,
+    ...(d.method === "prior" ? { prior: d.count } : { forecast: d.count }),
+    lower: d.lower, upper: d.upper,
+  }))), [cal, fc]);
   const center = meta.bounds ? [(meta.bounds[0] + meta.bounds[2]) / 2, (meta.bounds[1] + meta.bounds[3]) / 2] : [0, 0];
 
   return <>
@@ -417,6 +425,10 @@ export default function App() {
                 {/* The API reports months as 1-12; spell them or the line reads "3" instead of "Mar". */}
                 Critical months (avg + 1σ): {an.critical.map(c => MONTHS[c.month - 1] ?? c.month).join(", ") || "none"}
               </div>
+              {/* The list is the day detail; the shape behind those critical months is a chart,
+                  and chart code stays out of the shell -- so this opens the tab that owns it. */}
+              {an.monthly?.length > 0 && <button className="btn sm" style={{ marginTop: 6 }}
+                onClick={() => setTab("anomalies")}>Monthly chart</button>}
             </>}
           </div>
         </div>
@@ -446,6 +458,9 @@ export default function App() {
           </Suspense></PanelBoundary>}
           {tab === "diagnostic" && <PanelBoundary name="diagnostic" resetKey={tab}><Suspense fallback={<span className="hint">Loading chart…</span>}>
             <DiagnosticPanel bbox={bb} refreshKey={diagKey} embedded />
+          </Suspense></PanelBoundary>}
+          {tab === "anomalies" && <PanelBoundary name="anomalies" resetKey={tab}><Suspense fallback={<span className="hint">Loading chart…</span>}>
+            <AnomalyPanel bbox={bb} refreshKey={diagKey} embedded />
           </Suspense></PanelBoundary>}
           {tab === "briefing" && <BriefingPanel bbox={bb} onPickDay={setDay} refreshKey={diagKey} detail />}
         </div>

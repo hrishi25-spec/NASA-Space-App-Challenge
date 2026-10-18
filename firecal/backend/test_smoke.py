@@ -180,9 +180,21 @@ def test_briefing_json_and_markdown():
 
 
 def test_anomalies():
+    import statistics
+
     an = client.get("/anomalies").json()
     assert an["anomalies"] and an["monthly"]
     assert all("date" in a and "z" in a for a in an["anomalies"])
+    # The monthly profile the Anomalies chart draws: twelve calendar slots, in order, with a
+    # critical-month threshold the chart's line can use without re-deriving mean + 1σ.
+    monthly = an["monthly"]
+    assert [m["month"] for m in monthly] == list(range(1, 13))
+    assert all(m["avg"] >= 0 for m in monthly)
+    avgs = [m["avg"] for m in monthly]
+    assert abs(an["threshold"] - (statistics.mean(avgs) + statistics.stdev(avgs))) <= 0.2
+    critical = {c["month"] for c in an["critical"]}
+    assert critical <= {m["month"] for m in monthly if m["avg"] >= an["threshold"] - 0.1}
+    assert {m["month"] for m in monthly if m["avg"] >= an["threshold"] + 0.1} <= critical
 
 
 def test_forecast():
@@ -431,11 +443,14 @@ def test_forecast_blends_the_archive_prior(trained):
 
     Three years of the frame's own record match the archive's evidence, so a long frame
     keeps its own season; the demo covers five, which is why the assertion here is about
-    the blend being wired up rather than about a number moving.
+    the blend being wired up rather than about a number moving. With a LightGBM checkpoint
+    in `model/` the answer is that blend *plus* whatever days the model earned, so the name
+    is asserted by what must be in it -- the archive prior -- not by where it starts.
     """
     main._invalidate()
     fc = client.get("/forecast", params={"bbox": "17.0,98.0,20.0,101.0"}).json()
-    assert fc["model"].startswith("Seasonal climatology + archive prior")
+    assert "archive prior" in fc["model"]
+    assert all(r["method"] in ("lgbm", "prior") for r in fc["forecast"])
     assert len(fc["forecast"]) == 30 and all(f["count"] >= 0 for f in fc["forecast"])
 
     # One season of frame data is one sample per day: there the prior is most of the curve.
@@ -464,7 +479,11 @@ def test_broken_checkpoint_falls_back(tmp_path, monkeypatch):
     newer.write_text('{"schema": 99}', encoding="utf-8")
     fm.clear_cache()
     assert fm.load(newer) == {}
-    # ...and with no checkpoint the endpoint answers exactly as it did before training existed
+    # ...and with no checkpoint the endpoint answers exactly as it did before training existed.
+    # The LightGBM model is a second forecast source, and on a machine that has trained it the
+    # endpoint would answer with the days it earned -- so this test silences that loader too and
+    # asserts the archive-prior path it is actually about (a CI checkout has neither checkpoint).
+    monkeypatch.setattr(main.lgbm_forecast, "load", lambda *a, **k: None)
     main._invalidate()
     fc = client.get("/forecast").json()
     assert fc["model"].startswith("Seasonal climatology")
@@ -888,14 +907,33 @@ def test_lgbm_checkpoint_round_trip(tmp_path):
     dates, totals = lg.predict_path(Y, ck["climo"], ck["booster"], 5)
     assert len(dates) == len(totals) == 5 and all(v >= 0 for v in totals)
     # the serving gate: strictly better MASE wins, a tie or a loss keeps the prior
-    win = {"backtest": {"by_horizon": {"30": {"lgbm_mase": 0.5, "prior_mase": 0.9}}}}
-    lose = {"backtest": {"by_horizon": {"30": {"lgbm_mase": 1.5, "prior_mase": 0.9}}}}
-    tie = {"backtest": {"by_horizon": {"30": {"lgbm_mase": 0.9, "prior_mase": 0.9}}}}
+    win = {"backtest": {"by_horizon": {"30": {"lgbm": 0.5, "prior": 0.9}}}}
+    lose = {"backtest": {"by_horizon": {"30": {"lgbm": 1.5, "prior": 0.9}}}}
+    tie = {"backtest": {"by_horizon": {"30": {"lgbm": 0.9, "prior": 0.9}}}}
     use, why = lg.gate(win, 30)
     assert use is True and "MASE" in why
     assert lg.gate(lose, 30)[0] is False and lg.gate(tie, 30)[0] is False
     assert lg.gate(win, 7)[0] is False            # an unscored horizon keeps the prior
     assert lg.gate(None, 30)[0] is False          # no checkpoint, no model
+    # the gate must read what `backtest()` actually writes, not a second spelling of it;
+    # a trainer-shaped row that won must be served (this is the round-trip that was broken)
+    bt = tf.backtest(Y, horizons=(30,), origin_step=60, rounds=10, log=lambda *a: None)
+    row = bt["by_horizon"]["30"]
+    assert {"lgbm", "prior", "naive"} <= set(row)
+    use, why = lg.gate({"backtest": bt}, 30)
+    assert "incomplete" not in why
+    assert use is (row["lgbm"] < row["prior"])
+    # ...and the verdict is per day: a day is judged by the nearest measured horizon at least
+    # as long as it, so a request can be part model and part prior rather than all of one.
+    four = {"backtest": {"by_horizon": {
+        "1": {"lgbm": 2.0, "prior": 1.0}, "7": {"lgbm": 0.5, "prior": 0.9},
+        "14": {"lgbm": 0.6, "prior": 0.9}, "30": {"lgbm": 3.0, "prior": 1.0}}}}
+    assert lg.earned_days(four, 30) == [False] + [True] * 13 + [False] * 16
+    assert lg.earned_days(four, 5) == [False] + [True] * 4      # judged by the h=7 score
+    assert lg.earned_days(four, 40) == lg.earned_days(four, 30) + [False] * 10   # no evidence past 30
+    inside = {"backtest": {"by_horizon": {"7": {"lgbm": 0.5, "prior": 0.9}}}}
+    assert lg.earned_days(inside, 10) == [True] * 7 + [False] * 3
+    assert lg.earned_days(None, 3) == [False] * 3               # no checkpoint, no days
     lg.clear_cache()
 
 
@@ -987,12 +1025,16 @@ def test_forecast_contract_is_backward_compatible():
     assert len(fc["forecast"]) == 30
     for row in fc["forecast"]:
         assert set(row) >= {"date", "count"} and row["count"] >= 0
-    assert fc["method"] in ("lgbm", "prior")     # additive field, never a removal
+    # `blend` is the additive third value: some days earned by the model, the rest the prior
+    assert fc["method"] in ("lgbm", "prior", "blend")
+    assert all(r.get("method") in ("lgbm", "prior") for r in fc["forecast"])
 
 
 def test_lgbm_is_served_when_it_earns_the_horizon(monkeypatch):
     """When the stored backtest says LightGBM wins a horizon and the AOI holds cells it
-    trained on, `/forecast` serves it -- the gate is not decoration."""
+    trained on, `/forecast` serves it -- the gate is not decoration. And when it wins only
+    some horizons, the response is part model, part prior: the earned days are served and
+    the rest fall back, so one verdict never decides the whole request."""
     import lgbm_forecast as lg
     import train_forecast as tf
 
@@ -1001,7 +1043,7 @@ def test_lgbm_is_served_when_it_earns_the_horizon(monkeypatch):
     booster, _, _ = tf.fit_model(Y, climo, np.ones(len(Y), dtype=bool), rounds=30)
     ck = {"booster": booster, "climo": climo,
           "metrics": {"generated": "test", "panel": {"seasons": [2021, 2022, 2023]},
-                      "backtest": {"by_horizon": {"30": {"lgbm_mase": 0.1, "prior_mase": 0.9}}}}}
+                      "backtest": {"by_horizon": {"30": {"lgbm": 0.1, "prior": 0.9}}}}}
     monkeypatch.setattr(main.lgbm_forecast, "load", lambda *a, **k: ck)
     saved = main.DF
     try:
@@ -1011,6 +1053,24 @@ def test_lgbm_is_served_when_it_earns_the_horizon(monkeypatch):
         assert fc["method"] == "lgbm" and "LightGBM" in fc["model"]
         assert len(fc["forecast"]) == 30 and all(f["count"] >= 0 for f in fc["forecast"])
         assert fc["checkpoint"]["matched_cells"] >= 1
+        assert fc["checkpoint"]["days"] == list(range(1, 31))   # every day earned
+
+        # The mixed case: wins at 7 and 14, loses at 1 and 30 -- days 2-14 are the model's,
+        # day 1 and 15-30 are the prior's, and every row says which one drew it.
+        ck["metrics"] = {"generated": "test", "panel": {"seasons": [2021, 2022, 2023]},
+                         "backtest": {"by_horizon": {
+                             "1": {"lgbm": 2.0, "prior": 1.0},
+                             "7": {"lgbm": 0.5, "prior": 0.9},
+                             "14": {"lgbm": 0.6, "prior": 0.9},
+                             "30": {"lgbm": 3.0, "prior": 1.0}}}}
+        main._invalidate()
+        fc = client.get("/forecast", params={"horizon": 30}).json()
+        assert fc["method"] == "blend" and "LightGBM" in fc["model"] and "prior" in fc["model"].lower()
+        assert len(fc["forecast"]) == 30
+        kinds = [r["method"] for r in fc["forecast"]]
+        assert kinds == ["prior"] + ["lgbm"] * 13 + ["prior"] * 16
+        assert fc["checkpoint"]["days"] == list(range(2, 15))
+        assert [r["date"] for r in fc["forecast"]] == sorted(r["date"] for r in fc["forecast"])
     finally:
         main.DF = saved
         main._invalidate()
@@ -1024,7 +1084,7 @@ def test_lgbm_falls_back_when_the_frame_has_no_trained_cells(monkeypatch):
     Y = _tiny_panel()
     climo = lg.climo_table(Y, None)
     ck = {"booster": object(), "climo": climo,
-          "metrics": {"backtest": {"by_horizon": {"30": {"lgbm_mase": 0.1, "prior_mase": 0.9}}}}}
+          "metrics": {"backtest": {"by_horizon": {"30": {"lgbm": 0.1, "prior": 0.9}}}}}
     monkeypatch.setattr(main.lgbm_forecast, "load", lambda *a, **k: ck)
     saved = main.DF
     try:
@@ -1112,7 +1172,7 @@ def test_forecast_rows_carry_a_band_only_when_calibrated(monkeypatch):
     Y = _tiny_panel()
     climo = lg.climo_table(Y, None)
     booster, _, _ = tf.fit_model(Y, climo, np.ones(len(Y), dtype=bool), rounds=30)
-    base_metrics = {"backtest": {"by_horizon": {"30": {"lgbm_mase": 0.1, "prior_mase": 0.9}}}}
+    base_metrics = {"backtest": {"by_horizon": {"30": {"lgbm": 0.1, "prior": 0.9}}}}
     saved = main.DF
     try:
         main.DF = _tiny_detections(Y.index, Y.columns)

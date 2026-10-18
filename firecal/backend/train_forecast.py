@@ -651,10 +651,10 @@ def run(data_dir=None, out=lg.model_dir(), chunk=CHUNK, limit=0, rounds=600,
     if use_backtest:
         bt = backtest(Y, origin_step=origin_step, log=log, rounds=rounds)
         metrics["backtest"] = bt
+        # Ask the gate itself rather than repeating its comparison: a second transcription
+        # of the rule is how this block came to disagree with the scores it reports on.
         metrics["serving"] = {"beats_prior_at": {
-            str(h): bool((bt["by_horizon"].get(str(h)) or {}).get("lgbm_mase", 1e9)
-                         < (bt["by_horizon"].get(str(h)) or {}).get("prior_mase", 1e9))
-            for h in HORIZONS}}
+            str(h): lg.gate(metrics, h)[0] for h in HORIZONS}}
     if use_conformal:
         metrics["conformal"] = conformal_calibration(
             Y, alpha=alpha, horizon_max=max(HORIZONS), rounds=rounds, log=log)

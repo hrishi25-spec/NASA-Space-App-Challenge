@@ -154,7 +154,10 @@ The Vite dev server proxies `/api` → `:8000` automatically (`firecal/frontend/
 1. Otherwise download archive CSVs from <https://firms.modaps.eosdis.nasa.gov/download/> — pick
    **MODIS C6.1** and/or **VIIRS SNPP / NOAA-20 / NOAA-21**, same country/region so the
    sensors overlap. To skip the manual download, `python firecal/backend/fetch_archive.py` does it for you (needs a free
-`FIRMS_MAP_KEY` — see below — and walks the area API over 5-day windows).
+`FIRMS_MAP_KEY` — see below — and walks the area API over 5-day windows). A fire season is not a
+calendar year, so the span is explicit: `--regions world --from 2022-09-30 --to 2023-09-29`
+fetches one whole season for every sensor, tiled in 5-day windows that stop exactly where an
+existing archive begins — no doubled rows, no zero-filled gap.
 2. Click **Upload FIRMS CSVs** in the app (multiple files at once are fine).
 3. The **forecast** needs at least ~120 days (and fails with a plain explanation rather than
    an internal error if the record is shorter than the model's 28-day lag — the open 24 h and
@@ -261,15 +264,20 @@ split), and scored with MASE against
 the seasonal prior and a seasonal-naive forecast at horizons 1/7/14/30. The result goes to
 `model/lgbm_forecast.txt`, `model/lgbm_climo.npz` and `model/lgbm_metrics.json`.
 
-**`/forecast` serves LightGBM only where it earned the horizon.** The gate compares the
-stored backtest MASE against the prior's and keeps the prior otherwise — so if the model
-does not win, nothing changes and the metrics record the loss. The `model` field names which
-ran and why. There is no FIRMS archive on this machine, so the only published backtest is on
-the repository's synthetic fixture, and there the prior won at every horizon; run
-`train_forecast.py` against `.data/` to get a real score. A missing, truncated or
-foreign-schema checkpoint also falls back to the prior — and because LightGBM's parser
-aborts the process on a truncated model file, the loader verifies the checkpoint's SHA-256
-before LightGBM ever sees it.
+**`/forecast` serves LightGBM only on the days it earned.** Scoring is discrete (1/7/14/30
+days), so each forecast day is judged by the nearest measured horizon *at least as long* as
+it: winning at 7 days is evidence for day 3, losing at 1 day is not evidence for day 3, and a
+day past the last measured horizon has no evidence behind it and keeps the prior. The earned
+days are served from the archive model and the rest of the window from the seasonal prior —
+`method` says `lgbm`, `prior` or `blend`, every forecast row carries its own `method`, and
+the chart draws the two as separate series — so one horizon's verdict never decides the whole
+request. The reference run over this machine's archive (15 exports, 10.3 GB, 126.2 M rows;
+1,089 days × 3,928 cells) is exactly that case: the held-out MASE at h=1/7/14/30 is LightGBM
+2.590 / 2.308 / 2.433 / 3.630 against the prior's 1.824 / 2.409 / 2.589 / 2.853, so a 30-day
+request answers day 1 and days 15–30 from the prior and days 2–14 from the model. A missing,
+truncated or foreign-schema checkpoint also falls back to the prior — and because LightGBM's
+parser aborts the process on a truncated model file, the loader verifies the checkpoint's
+SHA-256 before LightGBM ever sees it.
 
 **The forecast carries a calibrated interval, and it says when it is not calibrated.** The
 trainer holds out a time block strictly later than the training block, measures the model's
@@ -280,8 +288,10 @@ that into a `lower`/`upper` band per day and a `coverage` block, and the forecas
 and labels it. The band is only drawn when the checkpoint was actually calibrated, and
 the coverage it reports is *measured*, not assumed: on the synthetic fixture the nominal 90 %
 band came out at 79–87 % empirical coverage, so `coverage.within_tolerance` is `false` and
-the chart labels the band as indicative rather than quietly implying it is exact. A real
-archive run is what would say whether that gap closes.
+the chart labels the band as indicative rather than quietly implying it is exact. On the real
+archive the shipped 365-day blocks do not fit at all — 1,089 days is six short of the 1,095
+the cut needs — so that checkpoint ships no band; a supplementary 300-day cut measured
+56–76 % coverage against 90 % nominal, so the gap does not close on real data either.
 
 The forecast panel names which one answered. With the prior (`Seasonal climatology +
 archive prior`) the archive's shape is blended into the frame's own season — in log space,
@@ -300,7 +310,7 @@ July.
 | **Burning calendar** | GitHub-style heatmap: one row per year, one cell per day, color = harmonized daily detections. A **Year** selector narrows it to a single-year calendar. Click any day to inspect it. |
 | **Region presets** | The *Fly to…* picker in the command bar (California, Amazon & Pantanal, Southeastern Australia, Punjab & Haryana, Mediterranean basin) sets the AOI filter, flies the camera to a regional zoom, and fills the **Selection** panel with the region's fuel type, peak season and notable fire years. Every panel then recomputes for that AOI; when an AOI holds no detections the Selection panel says so and offers *Clear area*, because the open archive may simply not cover that box. |
 | **Map** | One camera that morphs a **3D Earth globe** into a flat map as you zoom (the badge tracks `3D GLOBE → TRANSITION → 2D MAP`); scroll in past the transition for the flat view, or press **Globe view** to fly back. **Fly to AOI** fits the drawn box, **Reset orbit** returns to the default global attitude, and **Auto-rotate** turns the globe about **Earth's real axis**: the camera tilts to the planet's 23.44° obliquity while the drift runs, so the globe turns the way Earth turns and the north pole traces the small circle it traces from orbit, instead of spinning like a top about a vertical line. The rate is real too — 6°/s, or 3°/s on a weak machine, the same speed whatever the frame rate and never teleporting when a frame runs long (opt-in, any gesture stops it, and a camera you tilted by hand is levelled only if the drift is what tilted it). Detections for the selected day (±1/3/7/14 d span) — **MODIS coral, VIIRS amber, live points pale gold** — plus soft-sand DBSCAN cluster polygons, on one of three basemaps: **Satellite** imagery, the colour **Terrain** map, or **Vector** tiles (CARTO Dark Matter) whose coastlines and place names stay crisp however far you zoom, since vector geometry is redrawn rather than upscaled. All three toggles sit with the other view controls, in the bottom-left row under the readout, and a slow connection opens on **Vector** because it is the lightest of the three. The bottom-left column is readout first (`day · hotspots · clusters · MW`), controls beneath it, and it sits on the map's own edge; it steps up only while an *expanded* attribution notice would reach under it, so no control is ever covered and no space is left empty under the row. Dragging, rotating and zooming stay light on every basemap: the canvas render ratio is capped, MSAA and tile fade are off, and expired tiles are not re-fetched mid-gesture. Live-feed points/polygons overlay when pulled. Use **Select area** and click two corners to draw a bounding box; every panel then filters to it. |
-| **Anomalies & critical periods** | A click-through list of anomalous days (z-score vs the same ±7-day window in other years) and the months running above mean + 1σ flagged as *critical*. |
+| **Anomalies & critical periods** | A click-through list of anomalous days (z-score vs the same ±7-day window in other years) and the months running above mean + 1σ flagged as *critical*. **Monthly chart** opens the Anomalies tab: twelve bars of mean daily detections per calendar month (pooled across the record) with the critical threshold as a dashed line, plus peak month, critical months and the threshold as cards. |
 | **Incident Commander briefing** | Threat level (Low/Watch/Elevated/Critical) with its score, record mean and last-30-days readout, then the full report split across **four sub-tabs** — Situation, Critical streaks, Fuel types, Actions — each with a count badge so you can see what is inside before opening it. Streak rows jump the map to that window; **Copy MD** exports the whole briefing. The right-rail card keeps the compact headline version. |
 | **Last year + 30-day forecast** | Full-width line chart of the trailing 365 days with the forecast appended, its method named (`Seasonal climatology + archive prior` once the model has been trained — see below), an Observed/Forecast legend — and zoom: drag across the plot to select a window, or take the last 90/180/365 days from the **Window** selector and **Reset zoom**. |
 | **Seasonal climatology** | Full-width day-of-year percentile envelope (10/50/90/95) with **Peak day**, **Fire season** (onset → cessation), the record span and the median day as cards beneath it. |
@@ -365,8 +375,8 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
 | `GET /calendar` | `bbox`, `start`, `end` | Daily rows: `{date, count, raw, frp}`. |
 | `GET /points` | `bbox`, `start`, `end`, `limit` (1–20000) | Map points (`{lat, lon, frp, sensor}`), randomly sampled if over the limit. |
 | `GET /clusters` | `bbox`, `start`, `end`, `eps` (10–5000), `min_pts` (1–100), `hours` (0.5–720) | DBSCAN clusters, top 300 by size, each with a convex `hull`. Only those 300 are hulled (hulling every cluster made one uncached call cost 33 s on a 23-year record); above 60k detections the input is stride-sampled across the whole period rather than truncated to the oldest rows. |
-| `GET /anomalies` | `bbox`, `z` (0.5–10) | `{anomalies[], critical[], monthly[]}`; needs >1 year of data. |
-| `GET /forecast` | `bbox`, `horizon` (1–90) | `{model, forecast[]}`; needs ≥120 days. Additive fields name the path: `method` (`lgbm` | `prior`), `model_reason`, a `checkpoint` provenance block when the LightGBM model serves, `lower`/`upper` on each forecast row and a `coverage` block (`nominal`, `empirical`, `within_tolerance`) when the checkpoint was conformally calibrated. The original keys are unchanged. |
+| `GET /anomalies` | `bbox`, `z` (0.5–10) | `{anomalies[], critical[], threshold, monthly[]}`; needs >1 year of data. `threshold` is mean + 1σ of the twelve monthly means, which is what `critical[]` flags against and what the chart's line is drawn at. |
+| `GET /forecast` | `bbox`, `horizon` (1–90) | `{model, forecast[]}`; needs ≥120 days. Additive fields name the path: `method` (`lgbm` | `prior` | `blend`), `model_reason`, a per-row `method` naming the model that drew that day, a `checkpoint` provenance block (with the day offsets the model served) when the LightGBM model serves any of the window, `lower`/`upper` on the model's rows and a `coverage` block (`nominal`, `empirical`, `within_tolerance`) when the checkpoint was conformally calibrated. The original keys are unchanged. |
 
 `bbox` format: `minlat,minlon,maxlat,maxlon` (e.g. `bbox=17,98,20,101`).
 
@@ -410,7 +420,7 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
     │   ├── train_data.py           ← headless run of every model over your own CSVs + a Markdown report
     │   ├── model/                  ← trained checkpoint (gitignored; rebuilt by train.py)     │   ├── test_smoke.py           ← 68-test API smoke suite (encodings, gzip, cache, presets, archive, real-FIRMS schema guard, training, LightGBM forecast + its conformal band, /api prefix)
     │   ├── test_security.py        ← 34-test hardening suite (URL allowlist, upload caps, CORS, CSP hosts)
-    │   ├── test_archives.py        ← 36-test suite for the local-archive picker (inventory, slice, merge, ids, gate, HF bucket)
+    │   ├── test_archives.py        ← 37-test suite for the local-archive picker (inventory, slice, merge, ids, gate, HF bucket)
     │   ├── requirements.txt        ← runtime deps (with security floors)
     │   └── requirements-dev.txt    ← + pytest, httpx (for tests)
     └── frontend/
@@ -543,7 +553,7 @@ scripts/check.sh          # POSIX — or scripts\check.bat on Windows
 Both are thin wrappers around the commands below, which is also what CI runs:
 
 ```bash
-# 138 tests, ~2 min — starts the app in-process via TestClient
+# 139 tests, ~2 min — starts the app in-process via TestClient
 cd firecal/backend
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest -q
@@ -577,7 +587,7 @@ and region-specific, `.env` parsing handles comments/`export`/quotes, and `/arch
 validates the request *before* the key, explains a missing key, builds the area-API URL in
 west,south,east,north order, and merges rows while dropping anything outside the AOI.
 
-**`test_archives.py` (36)** covers the local-archive picker against a purpose-built fixture
+**`test_archives.py` (37)** covers the local-archive picker against a purpose-built fixture
 directory — three archives over two instruments, one of them an S-NPP export that names its
 platform: the inventory order (smallest first) and its labels, that no filesystem path reaches
 the response, that no archive at all is an empty list rather than an error, that a CSV which is
@@ -687,7 +697,7 @@ the suite goes red.
 | Region allowlist | 8 FIRMS regions | `region` is interpolated into the outbound URL, so anything off the list → HTTP 400 before any fetch. |
 | Row cap | 2,000,000 | Oldest rows are dropped beyond this (in-memory store, no database). |
 | Query params | clamped | `limit` ≤ 20000, `eps` ≤ 5000, `horizon` ≤ 90, etc. |
-| Forecast model | LightGBM (lazily imported) | Serves only where its stored backtest MASE beats the seasonal prior; otherwise the prior answers. A missing/broken checkpoint degrades to the prior, never an error. |
+| Forecast model | LightGBM (lazily imported) | Serves each forecast day only where the nearest *measured* backtest horizon beat the seasonal prior; the rest of the window is the prior, and the response names which drew which day. A missing/broken checkpoint degrades to the prior, never an error. |
 
 ## Security notes
 

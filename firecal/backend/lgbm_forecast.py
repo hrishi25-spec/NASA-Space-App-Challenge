@@ -395,9 +395,35 @@ def gate(metrics, horizon):
     row = scores.get(str(int(horizon)))
     if not row:
         return False, f"no backtest score for horizon {int(horizon)}"
-    lm, pm = row.get("lgbm_mase"), row.get("prior_mase")
+    # `backtest()` writes these under the same names the three forecasts are scored by;
+    # a row that does not carry them cannot be judged and must keep the prior.
+    lm, pm = row.get("lgbm"), row.get("prior")
     if lm is None or pm is None:
         return False, "backtest score incomplete"
     if lm < pm:
         return True, f"backtest MASE {lm:.3f} beats seasonal prior {pm:.3f}"
     return False, f"seasonal prior {pm:.3f} <= LightGBM {lm:.3f}"
+
+
+def earned_days(metrics, horizon):
+    """Which of a `horizon`-day request the stored backtest earned, one day at a time.
+
+    Scoring is discrete (h=1/7/14/30), so each day is judged by the nearest measured horizon
+    *at least as long* as it: winning at 7 days is evidence for day 3, losing at 1 day is not
+    evidence for day 3, and losing at 30 days withdraws every day from 15 on. A day past the
+    last measured horizon has no evidence behind it and keeps the prior rather than borrowing
+    the longest score's verdict.
+
+    This is what lets one checkpoint serve part of a request: a model that won 7 and 14 but
+    lost 1 and 30 answers days 2-14 and the prior answers the rest, instead of one horizon's
+    verdict deciding the whole response. Returns a list of booleans, day 1 first.
+    """
+    scores = sorted(int(k) for k in ((metrics or {}).get("backtest") or {}).get("by_horizon") or {})
+    if not scores:
+        return [False] * max(0, int(horizon))
+    verdict = {h: gate(metrics, h)[0] for h in scores}
+    out = []
+    for day in range(1, int(horizon) + 1):
+        nxt = next((h for h in scores if h >= day), None)
+        out.append(bool(verdict[nxt]) if nxt is not None else False)
+    return out

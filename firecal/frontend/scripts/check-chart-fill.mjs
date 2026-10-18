@@ -14,7 +14,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  FALLBACK_W, PAD, TIP_W, axisScale, nearestIndex, peak, plotHeight, plotWidth, runs,
+  FALLBACK_W, PAD, TIP_W, axisScale, monthRows, nearestIndex, peak, plotHeight, plotWidth, runs,
   tickCount, tickValues, tooltipLeft, xAt, xTickIndices, yAt,
 } from "../src/chartGeometry.js";
 
@@ -128,7 +128,21 @@ check("nulls split a series into runs", runs(7, i => i !== 2 && i !== 3), [[0, 1
 check("a fully drawn series is one run", runs(3, () => true), [[0, 1, 2]]);
 check("a fully missing series draws nothing", runs(3, () => false), []);
 
-// 10. Source-level guard: the plot must measure its container and must not go back to a scaled,
+// 10. The monthly anomaly profile is twelve fixed calendar slots in order, whatever order the
+//     API grouped its months in, with the threshold carried on every row so the line spans the
+//     plot — a missing month is a zero bar, not a shifted axis.
+{
+  const rows = monthRows([{ month: 3, avg: 5.4 }, { month: 1, avg: 2 }], 9);
+  check("the monthly profile is always Jan to Dec", rows.map(r => r.month),
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  check("months keep their own value", [rows[0].avg, rows[2].avg], [2, 5.4]);
+  check("a missing month is a zero, not a shift", rows[1].avg, 0);
+  check("every row carries the threshold line", rows.every(r => r.threshold === 9), true);
+  check("no threshold draws no line", monthRows([], null).every(r => r.threshold === null), true);
+  check("a NaN threshold is no line either", monthRows([{ month: 1, avg: 1 }], NaN)[0].threshold, null);
+}
+
+// 11. Source-level guard: the plot must measure its container and must not go back to a scaled,
 //    letterboxing viewBox; and the CSS card must be exactly the width the clamp assumes.
 {
   const plot = read("plot.jsx");

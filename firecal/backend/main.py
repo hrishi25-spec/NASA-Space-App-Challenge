@@ -1444,6 +1444,9 @@ def anomalies(bbox: str = None, z: float = 2.0):
     mo = s.groupby(s.index.month).mean(); thr = mo.mean() + mo.std()
     return {"anomalies": [{"date": str(i.date()), "count": round(r.v, 1), "expected": round(r.mu, 1), "z": round(r.z, 1)} for i, r in an.iterrows()],
             "critical": [{"month": int(m), "avg": round(v, 1)} for m, v in mo.items() if v >= thr],
+            # The chart draws the critical-month line at this value; sending it means the client
+            # never re-derives mean + 1σ and cannot disagree with `critical` about where it is.
+            "threshold": round(float(thr), 1),
             "monthly": [{"month": int(m), "avg": round(v, 1)} for m, v in mo.items()]}
 
 
@@ -1474,24 +1477,39 @@ def _seasonal_climatology(s, bbox):
     return pd.Series(np.expm1(mixed), index=grid), prior
 
 
-def _lgbm_forecast(bbox, horizon):
-    """One LightGBM forecast for the AOI, or None to keep the seasonal prior.
+def _day_spans(days):
+    """`[1, 2, 5]` -> `"1–2 · 5"`, so a reason string can be checked against the numbers."""
+    spans = []
+    for d in days:
+        if spans and d == spans[-1][1] + 1:
+            spans[-1][1] = d
+        else:
+            spans.append([d, d])
+    return " · ".join(str(a) if a == b else f"{a}–{b}" for a, b in spans)
 
-    The gate is the honest one the model had to earn: `lgbm_forecast.gate()` serves the
-    checkpoint only at a horizon whose *stored* backtest MASE beat the prior's. On top of
-    that the AOI has to hold cells the archive actually trained on -- a global model has
-    nothing to say about ground it never saw, and a frame that covers none of its cells
-    must fall back rather than extrapolate. Every failure mode (no lightgbm, a truncated
-    or foreign checkpoint, an empty match, a predict error) returns None; nothing here
-    raises, because a forecast is an upgrade to the console, never a dependency of it.
+
+def _lgbm_forecast(bbox, horizon):
+    """The LightGBM path for the days its stored backtest earned, or None for none of them.
+
+    Per day, not per request: `lgbm_forecast.earned_days()` compares each day against the
+    nearest backtest horizon *at least as long* as it, so a checkpoint that won at 7 and 14
+    days but lost at 1 and 30 serves days 2-14 and hands the rest to the seasonal prior,
+    instead of letting one horizon's verdict decide the whole response. The AOI still has to
+    hold cells the archive actually trained on -- a global model has nothing to say about
+    ground it never saw, and a frame that covers none of its cells must fall back rather
+    than extrapolate. Every failure mode (no lightgbm, a truncated or foreign checkpoint,
+    an empty match, a predict error) returns None; nothing here raises, because a forecast
+    is an upgrade to the console, never a dependency of it.
     """
     try:
         ck = lgbm_forecast.load()
         if not ck:
             return None
-        use, why = lgbm_forecast.gate(ck["metrics"], horizon)
-        if not use:
+        keep = lgbm_forecast.earned_days(ck["metrics"], horizon)
+        earned = [d for d, ok in enumerate(keep, 1) if ok]
+        if not earned:
             return None
+        reach = earned[-1]
         known = {int(c) for c in ck["climo"].columns}
         series = lgbm_forecast.frame_cell_series(subset(bbox), cells_keep=known)
         if series.empty or len(series) < max(lgbm_forecast.LAGS) + 1:
@@ -1499,28 +1517,32 @@ def _lgbm_forecast(bbox, horizon):
         if series.shape[1] > lgbm_forecast.MAX_CELLS:
             top = series.sum(axis=0).sort_values(ascending=False).head(lgbm_forecast.MAX_CELLS).index
             series = series[top]
-        dates, totals = lgbm_forecast.predict_path(series, ck["climo"], ck["booster"], horizon)
+        dates, totals = lgbm_forecast.predict_path(series, ck["climo"], ck["booster"], reach)
     except Exception:
         return None
     meta = ck["metrics"]
-    rows = [{"date": str(d.date()), "count": round(float(v), 1)} for d, v in zip(dates, totals)]
+    reason = f"stored backtest earns day(s) {_day_spans(earned)}"
+    rows = [{"date": str(dates[d - 1].date()), "count": round(float(totals[d - 1]), 1),
+             "method": "lgbm"} for d in earned]
     payload = {
-        "model": f"LightGBM (global archive model) — {why}",
+        "model": f"LightGBM (global archive model) — {reason}",
         "method": "lgbm",
-        "model_reason": why,
+        "model_reason": reason,
         "forecast": rows,
         "checkpoint": {"trained": meta.get("generated"),
                        "cells": int(ck["climo"].shape[1]),
                        "matched_cells": int(series.shape[1]),
-                       "seasons": (meta.get("panel") or {}).get("seasons")},
+                       "seasons": (meta.get("panel") or {}).get("seasons"),
+                       "days": earned},
     }
     # Conformal intervals are additive: present only when the checkpoint was calibrated, so
-    # the panel never draws a band that was not measured for this model.
-    lo, hi = lgbm_forecast.band(totals, meta.get("conformal"), horizon)
+    # the panel never draws a band that was not measured for this model -- and only on the
+    # days the model drew, since the prior's days carry no measured wide for them.
+    lo, hi = lgbm_forecast.band(totals, meta.get("conformal"), reach)
     if lo is not None:
-        for row, a, b in zip(rows, lo, hi):
-            row["lower"] = round(float(a), 1)
-            row["upper"] = round(float(b), 1)
+        for d, row in zip(earned, rows):
+            row["lower"] = round(float(lo[d - 1]), 1)
+            row["upper"] = round(float(hi[d - 1]), 1)
         cov = lgbm_forecast.coverage(meta.get("conformal"))
         if cov:
             payload["coverage"] = cov
@@ -1536,9 +1558,11 @@ def forecast(bbox: str = None, horizon: int = 30):
     idx = pd.date_range(s.index[-1] + pd.Timedelta(days=1), periods=horizon)
     # No bbox means the whole frame, so "everywhere" is the box the prior should come from.
     box = parse_bbox(bbox) or (-90.0, -180.0, 90.0, 180.0)
-    # The archive-trained LightGBM model is the forecast when its own backtest earned it.
+    # The archive-trained LightGBM model draws the days its own backtest earned. A full
+    # house answers on its own; otherwise the seasonal path below fills the rest, so one
+    # horizon's verdict never decides the whole response.
     hit = _lgbm_forecast(bbox, horizon)
-    if hit is not None:
+    if hit is not None and len(hit["forecast"]) == horizon:
         return hit
     # Seasonal fallback: same-day climatology scaled to the frame's recent level, blended
     # with the archive prior when the training checkpoint covers the AOI. torch is not
@@ -1553,11 +1577,34 @@ def forecast(bbox: str = None, horizon: int = 30):
     clim = clim.rolling(15, center=True, min_periods=1).mean()
     scale = (s[-30:].mean() + 1) / (clim.reindex(s[-30:].index.dayofyear).mean() + 1)
     vals = clim.reindex(idx.dayofyear).values * scale
-    reason = "LightGBM checkpoint absent" if not lgbm_forecast.available() else "LightGBM not better than the prior"
-    payload = {"model": ("Seasonal climatology + archive prior" if prior else "Seasonal climatology"),
-               "method": "prior", "model_reason": reason,
-               "forecast": [{"date": str(i.date()), "count": round(float(v), 1)} for i, v in zip(idx, vals)]}
-    if prior:   # provenance, so the panel can be checked against the checkpoint on disk
+    prior_name = "Seasonal climatology + archive prior" if prior else "Seasonal climatology"
+    prior_rows = [{"date": str(i.date()), "count": round(float(v), 1), "method": "prior"}
+                  for i, v in zip(idx, vals)]
+    if hit is None:
+        reason = "LightGBM checkpoint absent" if not lgbm_forecast.available() else "LightGBM not better than the prior"
+        payload = {"model": prior_name, "method": "prior", "model_reason": reason,
+                   "forecast": prior_rows}
+        if prior:   # provenance, so the panel can be checked against the checkpoint on disk
+            payload["prior"] = {"cells": prior["cells"], "trained": prior["generated"],
+                                "days": prior["source_days"],
+                                "level": None if prior["level"] is None else round(prior["level"], 2)}
+        return payload
+    # Mixed response: keep the model's days, fill the gaps with the prior, and say which is
+    # which per row so the chart can draw the seam instead of implying one model drew it all.
+    model_rows = {r["date"]: r for r in hit["forecast"]}
+    days = hit["checkpoint"].get("days") or []
+    span = _day_spans(days)
+    payload = {
+        "model": f"LightGBM (global archive model) day(s) {span} · {prior_name} beyond",
+        "method": "blend",
+        "model_reason": f"stored backtest earns day(s) {span} of {horizon}; "
+                        f"the rest keeps the seasonal prior",
+        "forecast": [model_rows.get(r["date"], r) for r in prior_rows],
+        "checkpoint": hit["checkpoint"],
+    }
+    if "coverage" in hit:
+        payload["coverage"] = hit["coverage"]
+    if prior:
         payload["prior"] = {"cells": prior["cells"], "trained": prior["generated"],
                             "days": prior["source_days"],
                             "level": None if prior["level"] is None else round(prior["level"], 2)}

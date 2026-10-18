@@ -12,7 +12,7 @@ One screen, five zones, all fed by the same single dataset:
 | Left rail | Hero telemetry (HFII, ESFP, hotspots, record span), Dataset (file, sensor, slice), Selection (AOI, cursor day, span, region facts), Clustering (counts, DBSCAN params, live feed state) |
 | Centre stage | MapLibre: one camera that morphs a 3D globe into a flat map, with cluster extents, detection points and the readout chip |
 | Right rail | Incident Commander briefing (headline version) and the anomalies list |
-| Analytics drawer | Five tabs — Burning calendar, Forecast, Climatology, Illusion diagnostic, Briefing detail |
+| Analytics drawer | Six tabs — Burning calendar, Forecast, Climatology, Illusion diagnostic, Anomalies, Briefing detail |
 
 ## Module map
 
@@ -24,8 +24,8 @@ One screen, five zones, all fed by the same single dataset:
 | `autoRotate.js` | The globe drift's policy: the rate (6°/s, 3°/s on a low-end probe), the clamped per-frame step, `AXIAL_TILT_DEG` (Earth's 23.44° obliquity, the pitch the drift holds the camera at so the globe turns about the real axis), and the rule that the drift yields whenever a gesture or an animated camera move owns the map. Pure numbers, so the prebuild guard can simulate frame cadences. |
 | `basemapStyles.js` | The basemap style documents — the Esri raster pair as one style, the mission layers, and `mergeOverlays()` for grafting them onto the fetched vector style. Pure data and pure functions: no React, no DOM, no MapLibre, so the styles can be built and validated from Node. |
 | `panels.jsx` | Chart-free pillars: `HeroStats`, `LivePanel` (24 h NIR feeds + real-window pull), `BriefingPanel` (rail headline and the four-report sub-tabs). |
-| `charts.jsx` | `ClimatologyPanel` and `DiagnosticPanel` — named exports, deliberately in a lazy module so no charting code is in the first paint. Shares `useEndpoint` (stale-reply guard) and the `C` colour map. |
-| `ForecastChart.jsx` | The forecast line chart; default export, lazy. |
+| `charts.jsx` | `ClimatologyPanel`, `DiagnosticPanel` and `AnomalyPanel` — named exports, deliberately in a lazy module so no charting code is in the first paint. Shares `useEndpoint` (stale-reply guard) and the `C` colour map. `AnomalyPanel` draws the `monthly[]` profile the rail's **Monthly chart** button opens. |
+| `ForecastChart.jsx` | The forecast line chart; default export, lazy. The archive model's days and the seasonal prior's are drawn as two separate series (the API's per-row `method` decides which), so the seam where the model stopped earning is visible rather than implied away. |
 | `plot.jsx` | The hand-rolled SVG chart kit — `<Chart>` renders bands, bars, lines, a caption-and-keys legend, the crosshair with its hover card, and the optional drag-to-zoom brush. No charting dependency exists. |
 | `chartGeometry.js` | The chart kit's pure arithmetic: gutters, row positions with a bar inset, axis step and top, tick selection, hover snapping, tooltip clamping, and the run-splitting that breaks a line at a gap. No React, no DOM — so the prebuild guard can drive every coordinate from Node. |
 | `lib.js` | The API client (`api`, `errMsg`, `invalidateApiCache`), the heat ramp, `fmt`, `doyLabel`. |
