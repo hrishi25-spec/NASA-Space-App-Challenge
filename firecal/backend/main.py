@@ -36,7 +36,7 @@ import archives
 import forecast_model
 import lgbm_forecast
 from demo import BOX, make_demo, make_transition_demo
-from regions import REGIONS, region_box, region_keys
+from regions import REGIONS, region_box, region_for_box, region_keys
 
 
 # ------------------------------------------------------------ local configuration
@@ -612,12 +612,20 @@ def list_datasets():
     folder is the normal answer on a fresh clone and in the container image, where the archives
     (10 GB, git-ignored) simply are not there -- in that case the Hugging Face bucket is pulled
     first (archives.hf_pull), because the shared record is the database of last resort.
+
+    Every entry also carries a `coverage` block: per calendar year, the latitude/longitude box,
+    the 2° cells and the row counts that year actually holds, and across the inventory a
+    `thin_years` flag for a window that covers a fraction of the ground its neighbours do. The
+    picker used to describe a state-sized NRT download and a global year identically -- same
+    sensor, same "archive", different planet -- and the difference only showed up later, in a
+    merge's climatology. It is sampled (24k rows from 12 seeks per file) and cached beside the
+    archives, so the listing stays quick; a file that cannot be sampled says why in place.
     """
     items = archives.scan_all(ARCHIVE_ROOTS)
     if not items and ARCHIVE_ROOTS:
         archives.hf_pull(ARCHIVE_ROOTS[0])       # nothing local: fetch the bucket, rescan
         items = archives.scan_all(ARCHIVE_ROOTS)
-    return {"items": [archives.public(item) for item in items]}
+    return {"items": [archives.public(item) for item in archives.attach_coverage(items)]}
 
 
 @app.post("/datasets/load")
@@ -1432,22 +1440,113 @@ def briefing(bbox: str = None, z: float = 2.0, min_days: int = 2, format: str = 
     return result
 
 
+# A day or a month below this is not meaningfully above or below anything: the spread of a
+# near-zero baseline is near zero too, so a z-score from it is arithmetic rather than evidence.
+# The day list and the monthly verdict both use this floor.
+MIN_ANOMALY_LEVEL = 5.0
+
+
+def _days_in_month(year, month):
+    """Days in a calendar month. Spelled with pandas because this module's `/calendar`
+    endpoint already owns the name `calendar`, so the stdlib module cannot be imported here."""
+    return pd.Period(year=int(year), month=int(month), freq="M").days_in_month
+
+
+def _season_anomaly(s):
+    """Every year's twelve months, each judged against the same month in the *other* years.
+
+    `monthly[]` pools all years into one seasonal profile: a record with one huge August and
+    six ordinary ones draws a tall August bar and cannot say whether *this* year's August was
+    unusual. This block keeps the years apart -- the month's mean daily count for that year,
+    and the band it should be judged against: the mean and +-1 sd of that same calendar month
+    in the other years. `ddof=1`, so the band is an estimate of spread, not a description of
+    the sample.
+
+    Leaving the year out of its own normal is the point of the view. A record year inside its
+    own band drags the band toward itself, which is exactly how an exceptional season hides;
+    the leave-one-year-out band is what makes the anomaly visible.
+
+    Only a fully covered month is scored. A download that starts on 30 September holds one
+    day of September, and a one-day mean dressed as a month would read as an anomaly of its
+    own; those months carry `avg: None` and the `days` they do cover. A band needs two other
+    years -- one other year has a value but no spread, so `normal`/`low`/`high` stay None --
+    and a z-score needs the month or its normal to reach `MIN_ANOMALY_LEVEL`: a quiet month
+    whose other years all average under a detection a day has a near-zero band, and dividing
+    by it turns a tenth of a detection into a large z that means nothing.
+    """
+    if not len(s):
+        return []
+    frame = pd.DataFrame({"v": s.to_numpy(dtype=float), "y": s.index.year.to_numpy(),
+                          "m": s.index.month.to_numpy()})
+    g = frame.groupby(["y", "m"])["v"]
+    mean, days = g.mean(), g.size()
+    years = sorted(int(y) for y in frame["y"].unique())
+    covers = {(int(y), int(m)): int(days[(y, m)]) == _days_in_month(y, m)
+              for y, m in days.index}
+    out = []
+    for y in years:
+        months = []
+        for m in range(1, 13):
+            have = int(days.get((y, m), 0))
+            full = covers.get((y, m), False)
+            others = [float(mean[(o, m)]) for o in years
+                      if o != y and (o, m) in mean.index and covers.get((o, m), False)]
+            normal = low = high = normal_mad = low_mad = high_mad = zs = None
+            if len(others) >= 2:
+                normal = float(np.mean(others))
+                sd = float(np.std(others, ddof=1))
+                low, high = max(0.0, normal - sd), normal + sd
+                if (full and sd > 0
+                        and max(float(mean[(y, m)]), normal) >= MIN_ANOMALY_LEVEL):
+                    zs = (float(mean[(y, m)]) - normal) / sd
+                # Robust alternative: median and MAD (Median Absolute Deviation)
+                # Useful when std is unstable (e.g., only one other year)
+                median_others = float(np.median(others))
+                mad = float(np.median(np.abs(others - median_others)))
+                mad_sigma = 1.4826 * mad  # MAD to sigma conversion for normal dist
+                low_mad = max(0.0, median_others - mad_sigma)
+                high_mad = median_others + mad_sigma
+            elif len(others) == 1:
+                # Single other year: MAD is 0 so band collapses to a point.
+                # Keep normal=None so callers that check `normal is not None` are not broken,
+                # but carry the robust MAD-based band in normal_mad/low_mad/high_mad.
+                normal_mad = float(others[0])
+                low_mad = high_mad = float(others[0])
+            months.append({"month": m,
+                           "avg": round(float(mean[(y, m)]), 1) if full else None,
+                           "days": have,
+                           "normal": None if normal is None else round(normal, 1),
+                           "low": None if low is None else round(low, 1),
+                           "high": None if high is None else round(high, 1),
+                           "normal_mad": None if normal_mad is None else round(normal_mad, 1),
+                           "low_mad": None if low_mad is None else round(low_mad, 1),
+                           "high_mad": None if high_mad is None else round(high_mad, 1),
+                           "z": None if zs is None else round(zs, 2),
+                           "n": len(others)})
+        out.append({"year": y, "months": months})
+    return out
+
+
 # ---------------------------------------------------------------- legacy panels
 @app.get("/anomalies")
 @cached
 def anomalies(bbox: str = None, z: float = 2.0):
     z = min(max(z, 0.5), 10)
     s = daily(subset(bbox))["count"]
-    if len(s) < 400: return {"anomalies": [], "critical": [], "note": "Need >1 year of data"}
+    if len(s) < 400: return {"anomalies": [], "critical": [], "seasons": [],
+                             "note": "Need >1 year of data"}
     df = _zstats(s)
-    an = df[(df.z > z) & (df.v >= 5)].sort_values("z", ascending=False).head(50)
+    an = df[(df.z > z) & (df.v >= MIN_ANOMALY_LEVEL)].sort_values("z", ascending=False).head(50)
     mo = s.groupby(s.index.month).mean(); thr = mo.mean() + mo.std()
     return {"anomalies": [{"date": str(i.date()), "count": round(r.v, 1), "expected": round(r.mu, 1), "z": round(r.z, 1)} for i, r in an.iterrows()],
             "critical": [{"month": int(m), "avg": round(v, 1)} for m, v in mo.items() if v >= thr],
             # The chart draws the critical-month line at this value; sending it means the client
             # never re-derives mean + 1σ and cannot disagree with `critical` about where it is.
             "threshold": round(float(thr), 1),
-            "monthly": [{"month": int(m), "avg": round(v, 1)} for m, v in mo.items()]}
+            "monthly": [{"month": int(m), "avg": round(v, 1)} for m, v in mo.items()],
+            # Per-year months, each against the band its own year was left out of. The pooled
+            # `monthly[]` above stays as the seasonal profile; this is what shows a season.
+            "seasons": _season_anomaly(s)}
 
 
 def _seasonal_climatology(s, bbox):
@@ -1500,12 +1599,20 @@ def _lgbm_forecast(bbox, horizon):
     than extrapolate. Every failure mode (no lightgbm, a truncated or foreign checkpoint,
     an empty match, a predict error) returns None; nothing here raises, because a forecast
     is an upgrade to the console, never a dependency of it.
+
+    Which backtest judges the request depends on where the AOI is: a box lying entirely
+    inside a curated preset is scored by that preset's own row, because the pooled panel is
+    dominated by whichever regime burns most and can win while the AOI's regime loses. A
+    drawn box that crosses two presets, or the whole frame, has no one regime to speak for
+    it and is judged on the global scores.
     """
+    box = parse_bbox(bbox)
+    region = region_for_box(box) if box else None
     try:
         ck = lgbm_forecast.load()
         if not ck:
             return None
-        keep = lgbm_forecast.earned_days(ck["metrics"], horizon)
+        keep = lgbm_forecast.earned_days(ck["metrics"], horizon, region=region)
         earned = [d for d, ok in enumerate(keep, 1) if ok]
         if not earned:
             return None
@@ -1521,7 +1628,8 @@ def _lgbm_forecast(bbox, horizon):
     except Exception:
         return None
     meta = ck["metrics"]
-    reason = f"stored backtest earns day(s) {_day_spans(earned)}"
+    scope = REGIONS[region]["name"] if region in REGIONS else "global"
+    reason = f"stored backtest earns day(s) {_day_spans(earned)} on {scope} scores"
     rows = [{"date": str(dates[d - 1].date()), "count": round(float(totals[d - 1]), 1),
              "method": "lgbm"} for d in earned]
     payload = {
@@ -1533,7 +1641,8 @@ def _lgbm_forecast(bbox, horizon):
                        "cells": int(ck["climo"].shape[1]),
                        "matched_cells": int(series.shape[1]),
                        "seasons": (meta.get("panel") or {}).get("seasons"),
-                       "days": earned},
+                       "days": earned,
+                       "scored_on": scope},
     }
     # Conformal intervals are additive: present only when the checkpoint was calibrated, so
     # the panel never draws a band that was not measured for this model -- and only on the
@@ -1594,10 +1703,11 @@ def forecast(bbox: str = None, horizon: int = 30):
     model_rows = {r["date"]: r for r in hit["forecast"]}
     days = hit["checkpoint"].get("days") or []
     span = _day_spans(days)
+    scope = hit["checkpoint"].get("scored_on") or "global"
     payload = {
         "model": f"LightGBM (global archive model) day(s) {span} · {prior_name} beyond",
         "method": "blend",
-        "model_reason": f"stored backtest earns day(s) {span} of {horizon}; "
+        "model_reason": f"stored backtest earns day(s) {span} of {horizon} on {scope} scores; "
                         f"the rest keeps the seasonal prior",
         "forecast": [model_rows.get(r["date"], r) for r in prior_rows],
         "checkpoint": hit["checkpoint"],

@@ -101,3 +101,26 @@ def region_box(key):
 
 def region_keys():
     return ", ".join(REGIONS)
+
+
+def region_for_box(box, tol=1e-6):
+    """The preset a box lies entirely inside, or None when no single one contains it.
+
+    `box` is [minlat, minlon, maxlat, maxlon], the same order as `bbox`, and a *full*
+    containment is required: an AOI straddling two regimes (or the whole planet) has no one
+    regional backtest that speaks for it, so None sends the forecast gate to the global
+    scores rather than letting a box that is 10 % California borrow California's verdict.
+
+    Presets do not overlap today; if two ever contain the same box the smaller one wins,
+    because it is the more specific claim about the ground inside the AOI.
+    """
+    if not box:
+        return None
+    a, b, c, e = [float(v) for v in box]
+    fits = [key for key, reg in REGIONS.items()
+            if a >= reg["bbox"][0] - tol and b >= reg["bbox"][1] - tol
+            and c <= reg["bbox"][2] + tol and e <= reg["bbox"][3] + tol]
+    if not fits:
+        return None
+    return min(fits, key=lambda k: ((REGIONS[k]["bbox"][2] - REGIONS[k]["bbox"][0])
+                                    * (REGIONS[k]["bbox"][3] - REGIONS[k]["bbox"][1])))

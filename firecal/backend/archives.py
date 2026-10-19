@@ -23,6 +23,7 @@ Two rules this module exists to keep:
     archives are git-ignored and gigabytes), so every function here answers "nothing found"
     rather than raising. The console has an upload path and a live feed without it.
 """
+import json
 import os
 import shutil
 import subprocess
@@ -30,6 +31,7 @@ import threading
 import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 # What the download folder's product code means. FIRMS names its exports
@@ -96,6 +98,24 @@ ROWS_PER_STEP_MIN = 20_000
 # tens of thousands of bytes-per-record measurements, so the estimate is stable.
 HEAD_BYTES = 1 << 20
 ENCODINGS = ("utf-8-sig", "latin-1")   # the local files are machine-written; latin-1 is the net
+
+# ---- geographic coverage ----------------------------------------------------------------
+# "Which ground does this window actually cover?" is a question the inventory could not
+# answer, and it costs real work to get wrong: this machine's `.data/` holds two global years
+# beside a 358-day near-real-time window over California, holding a thousandth of the rows.
+# Merged, the console showed one record and the trainer learned a coverage seam; nothing on
+# screen said one of those "years" was one state.
+#
+# The answer is sampled, not scanned: a bounded read from evenly spaced offsets is enough to
+# bound a window's box, and the cost is set by the sample rather than the 1.8 GB behind it.
+# Every number carries `rows_sampled` beside `rows_estimate` so a reader can see the basis.
+COVERAGE_ROWS = 24_000                 # rows per file, spread across it
+COVERAGE_STEPS = 12                    # separate seeks, so the sample spans the whole file
+COVERAGE_CACHE = ".coverage.json"      # beside the archives, under the (git-ignored) root
+COVERAGE_CACHE_VERSION = 1
+COVERAGE_THIN = 0.25                   # a year's box under a quarter of the inventory's area
+CELL_DEG = 2.0                         # the console's own grid (forecast_model.GRID_DEG)
+COVERAGE_LOCK = threading.Lock()
 
 
 def roots(base: Path) -> list[Path]:
@@ -588,3 +608,185 @@ def read_merge(items: list[dict], limit: int, chunk: int = CHUNK_ROWS,
         "files": files, "skipped": skipped,
         "spread": bool(files) and all(entry["spread"] for entry in files),
     }
+
+
+# ------------------------------------------------------------------ geographic coverage
+def _coverage_sample(path: Path) -> tuple[list[pd.DataFrame], int, int]:
+    """A bounded, spread sample of one file: (frames, rows sampled, rows estimated).
+
+    `read_slice` already knows how to sample a file without walking it, but its step count is
+    tuned for *opening* a dataset (two or three seeks for the default budget), which is too
+    coarse to bound a year's box.  Coverage asks for more, smaller steps, so a multi-year file
+    contributes samples from every part of it rather than from two corners.
+    """
+    if path.suffix.lower() == ".parquet":
+        sliced = read_slice(path, COVERAGE_ROWS * 4, spread=True)
+        return sliced["frames"], sliced["rows"], sliced["estimate"]
+    columns, width, size = _shape(path)
+    missing = REQUIRED_COLUMNS - set(columns)
+    if missing:
+        raise ValueError(f"missing required columns: {', '.join(sorted(missing))}")
+    estimate = int(size / width) if width else 0
+    if estimate and estimate <= COVERAGE_ROWS:            # already smaller than a sample
+        frames, rows, _ = _read_sequential(path, COVERAGE_ROWS, CHUNK_ROWS)
+        return frames, rows, max(estimate, rows)
+    per = max(1, COVERAGE_ROWS // COVERAGE_STEPS)
+    frames, rows = _read_spread(path, columns, per, COVERAGE_STEPS, size)
+    if not rows:                                          # a seek landed badly
+        frames, rows, _ = _read_sequential(path, COVERAGE_ROWS, CHUNK_ROWS)
+    return frames, rows, max(estimate, rows)
+
+
+def file_coverage(path: Path) -> dict:
+    """Where and when one export's detections are, from a bounded sample of it.
+
+    Answers per calendar year: how many rows (sampled and estimated for the whole file), the
+    latitude/longitude box the year's detections fall in, and how many 2° cells it touches --
+    the same grid the training panel and the seasonal prior use, so \"cells\" means the same
+    thing in the picker as it does in `lgbm_metrics.json`.  A year is *not* judged here; that
+    needs the rest of the inventory to compare against (`attach_coverage`).
+
+    Raises ValueError for a file that cannot be read as a FIRMS export; the caller turns that
+    into an entry that says so rather than failing the listing.
+    """
+    frames, rows, estimate = _coverage_sample(path)
+    frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if frame.empty:
+        raise ValueError("no rows read")
+    lat_col = "latitude" if "latitude" in frame.columns else "lat"
+    lon_col = "longitude" if "longitude" in frame.columns else "lon"
+    date_col = next((c for c in ("time", "acq_date", "date") if c in frame.columns), None)
+    if lat_col not in frame.columns or lon_col not in frame.columns or date_col is None:
+        raise ValueError("no latitude/longitude/date columns")
+    lat = pd.to_numeric(frame[lat_col], errors="coerce")
+    lon = pd.to_numeric(frame[lon_col], errors="coerce")
+    when = pd.to_datetime(frame[date_col], errors="coerce")
+    ok = lat.notna() & lon.notna() & when.notna()
+    lat, lon, when = lat[ok].to_numpy(float), lon[ok].to_numpy(float), when[ok]
+    if not len(lat):
+        raise ValueError("no usable rows")
+    # The 2° cell id the panel uses: one integer per cell, so a count over it is a count of
+    # ground, not of rows.
+    cells = (np.floor((lat + 90.0) / CELL_DEG).astype(np.int64) * int(360 / CELL_DEG)
+             + np.floor((lon + 180.0) / CELL_DEG).astype(np.int64))
+    years = when.dt.year.to_numpy()
+    out = []
+    for year in sorted(set(years.tolist())):
+        sel = years == year
+        share = float(sel.sum()) / len(years)
+        out.append({
+            "year": int(year),
+            "rows_sampled": int(sel.sum()),
+            "rows_estimate": int(round(estimate * share)),
+            "lat": [round(float(lat[sel].min()), 2), round(float(lat[sel].max()), 2)],
+            "lon": [round(float(lon[sel].min()), 2), round(float(lon[sel].max()), 2)],
+            "cells": int(np.unique(cells[sel]).size),
+        })
+    return {"sampled": rows < estimate, "rows_sampled": int(rows),
+            "rows_estimate": int(estimate), "years": out}
+
+
+def _read_coverage_cache(root: Path) -> dict:
+    """The per-root coverage cache, or an empty one. A corrupt file is simply replaced."""
+    path = root / COVERAGE_CACHE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("version") == COVERAGE_CACHE_VERSION and isinstance(data.get("files"), dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"version": COVERAGE_CACHE_VERSION, "files": {}}
+
+
+def _write_coverage_cache(root: Path, cache: dict) -> None:
+    """Replace the cache atomically: a half-written one would be read back as corruption."""
+    path = root / COVERAGE_CACHE
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(json.dumps(cache, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)          # a read-only archive folder still lists fine
+
+
+def _box_area(box_lat, box_lon) -> float:
+    """A box's area in square degrees, never zero (a one-cell box still has a cell)."""
+    return max(box_lat[1] - box_lat[0], CELL_DEG) * max(box_lon[1] - box_lon[0], CELL_DEG)
+
+
+def attach_coverage(items: list[dict]) -> list[dict]:
+    """`items` with a `coverage` block each, judged against the whole inventory.
+
+    Per year the entry says where that year's detections are (`lat`/`lon` box, 2° `cells`,
+    sampled and estimated row counts). Across the inventory it adds the judgement the numbers
+    are for: a year whose box is under `COVERAGE_THIN` of the inventory's own box is a
+    *regional* window rather than a record of the planet. This machine's `.data/` is the case
+    that motivated it -- two global years and a 358-day window over California, which until
+    now looked exactly like a third year in the picker.
+
+    Coverage is cached beside the archives (`COVERAGE_CACHE`) keyed by size and mtime, so the
+    listing pays the sample cost once per file rather than once per page load. A file that
+    cannot be sampled says why in its own block; the listing is never failed by one bad CSV.
+    """
+    if not items:
+        return []
+    caches: dict[Path, dict] = {}
+    touched: set[Path] = set()
+    rows_out: list[dict] = []
+    for item in items:
+        root = item["_root"]
+        cache = caches.setdefault(root, _read_coverage_cache(root))
+        try:
+            stat = item["_path"].stat()
+            stamp = [stat.st_size, int(stat.st_mtime)]
+        except OSError:
+            stamp = None
+        entry = cache["files"].get(item["id"])
+        coverage = entry.get("coverage") if entry and stamp and entry.get("stamp") == stamp else None
+        if coverage is None:
+            try:
+                coverage = file_coverage(item["_path"])
+            except Exception as e:                  # unreadable, not FIRMS, empty
+                coverage = {"unavailable": f"{type(e).__name__}: {str(e)[:200]}"}
+            if stamp is not None:
+                cache["files"][item["id"]] = {"stamp": stamp, "coverage": coverage}
+                touched.add(root)
+        rows_out.append({**item, "coverage": coverage})
+
+    # The reference box: every year of every window that could be sampled. A file smaller than
+    # a year, or a sample with no rows, simply does not contribute to it.
+    boxes = [year for item in rows_out for year in (item["coverage"].get("years") or [])]
+    if boxes:
+        union_lat = [min(b["lat"][0] for b in boxes), max(b["lat"][1] for b in boxes)]
+        union_lon = [min(b["lon"][0] for b in boxes), max(b["lon"][1] for b in boxes)]
+        total = _box_area(union_lat, union_lon)
+        for item in rows_out:
+            coverage = item["coverage"]
+            years = coverage.get("years") or []
+            for year in years:
+                fraction = _box_area(year["lat"], year["lon"]) / total
+                year["area_fraction"] = round(fraction, 4)
+                year["thin"] = bool(fraction < COVERAGE_THIN)
+            thin = [year for year in years if year["thin"]]
+            coverage["thin_years"] = [year["year"] for year in thin]
+            if thin:
+                spans = ", ".join(
+                    f"{year['year']} ({year['lat'][1] - year['lat'][0]:.0f}° × "
+                    f"{year['lon'][1] - year['lon'][0]:.0f}°, "
+                    f"{year['area_fraction'] * 100:.1f} % of the inventory's area)"
+                    for year in thin)
+                coverage["note"] = f"regional window: {spans}"
+
+    # Every block answers `thin_years`, even when there was nothing to compare against (a
+    # single unsampleable file leaves `boxes` empty): a consumer should never have to tell
+    # "no regional window" apart from "this key is missing".
+    for item in rows_out:
+        item["coverage"].setdefault("thin_years", [])
+
+    with COVERAGE_LOCK:
+        for root in touched:
+            cache = caches[root]
+            keep = {item["id"] for item in rows_out if item["_root"] == root}
+            cache["files"] = {k: v for k, v in cache["files"].items() if k in keep}
+            _write_coverage_cache(root, cache)
+    return rows_out

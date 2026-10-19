@@ -75,6 +75,41 @@ export function monthRows(monthly, threshold) {
   }));
 }
 
+/**
+ * One year's months against their normal band, as exactly twelve calendar rows.
+ *
+ * Unlike `monthRows`, a month the record does not cover — or one too early to have a band —
+ * stays `null` rather than becoming 0. A bar at zero would claim the year was quiet when the
+ * month was simply not sampled, so every renderer (bar, line, band) skips a null instead of
+ * drawing it; the chart breaks the series there rather than lying about it.
+ */
+export function seasonRows(months) {
+  const num = v => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  const by = new Map((months || []).map(m => [Number(m.month), m]));
+  return Array.from({ length: 12 }, (_, i) => {
+    const m = by.get(i + 1) || {};
+    return {
+      month: i + 1,
+      avg: num(m.avg), days: num(m.days) ?? 0,
+      normal: num(m.normal), low: num(m.low), high: num(m.high),
+      z: num(m.z), n: num(m.n) ?? 0,
+    };
+  });
+}
+
+/** Where a month falls against its band: "high", "low", "normal" — or null when there is no
+    verdict to give, which is not the same as "normal".
+
+    The verdict rides on `z`, not on the raw band edges. The backend suppresses a z-score for
+    a month whose level (or normal) is below five detections a day, because a band measured on
+    a near-zero baseline is arithmetic rather than evidence — a month averaging 0.1/day against
+    a 0.7–0.9 band is not an event worth reporting. No z therefore means no verdict, and a
+    month outside its band has |z| > 1 by construction. */
+export function seasonVerdict(row) {
+  if (row.z == null) return null;
+  return row.z > 1 ? "high" : row.z < -1 ? "low" : "normal";
+}
+
 /** Row indices to label: the first and last are always labelled, so the axis spans the data. */
 export function xTickIndices(n, count) {
   if (n <= 0) return [];

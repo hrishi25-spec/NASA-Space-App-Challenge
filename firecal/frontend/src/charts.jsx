@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { api, doyLabel, fmt } from "./lib";
 import { Chart } from "./plot";
-import { monthRows } from "./chartGeometry";
+import { monthRows, seasonRows, seasonVerdict } from "./chartGeometry";
 
 /**
  * Chart panels live in their own module on purpose: opening a chart tab downloads this
@@ -50,8 +50,9 @@ function useEndpoint(path, bbox, refreshKey, query = null) {
 }
 
 /* ------------- 1. Multi-decadal DOY climatology + percentile envelope ------------- */
-export function ClimatologyPanel({ bbox, refreshKey, embedded }) {
-  const { data: c, failed } = useEndpoint("/climatology", bbox, refreshKey, { window: WINDOW });
+export function ClimatologyPanel({ bbox, refreshKey, monthSel, embedded }) {
+  const query = monthSel ? { window: WINDOW, month: `${monthSel.month}-${monthSel.year}` } : { window: WINDOW };
+  const { data: c, failed } = useEndpoint("/climatology", bbox, refreshKey, query);
 
   const body = () => {
     if (failed) return <span className="hint">Climatology unavailable — needs ≥ 60 days of data.</span>;
@@ -154,8 +155,96 @@ export function DiagnosticPanel({ bbox, refreshKey, embedded }) {
   return <div className="panel wide"><h3>Sensor Transition Illusion</h3>{body()}</div>;
 }
 
-/* ------------- 3. Monthly anomaly profile ------------- */
+/* ------------- 3. Monthly anomaly views ------------- */
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/**
+ * One year's months against the band they are normal for.
+ *
+ * This is the view the pooled profile cannot give: every bar is that year's own mean daily
+ * count for a calendar month, and the band is the mean ±1σ of the same month in the *other*
+ * years — the judged year is left out of its own normal, so a record season cannot widen the
+ * band it is being measured against. A month the record only partly covers has no bar (the
+ * backend sends no mean for it), which is why a download that starts and ends mid-month draws
+ * ten or eleven bars and the caption says so.
+ */
+function SeasonAgainstNormal({ seasons, year, onYear, selected, onPick }) {
+  const chosen = seasons.find(s => s.year === Number(year)) || seasons[seasons.length - 1];
+  const rows = seasonRows(chosen.months);
+  const withValue = rows.filter(r => r.avg != null);
+  const band = rows.some(r => r.low != null && r.high != null);
+  const peak = withValue.length ? withValue.reduce((b, r) => (r.avg > b.avg ? r : b), withValue[0]) : null;
+  const monthsWhere = verdict => rows.filter(r => seasonVerdict(r) === verdict).map(r => MONTHS[r.month - 1]);
+  const above = monthsWhere("high"), below = monthsWhere("low");
+  const odd = withValue.filter(r => r.z != null)
+    .reduce((b, r) => (b == null || Math.abs(r.z) > Math.abs(b.z) ? r : b), null);
+  const n = rows.find(r => r.n)?.n ?? 0;
+  const dec = v => (Math.round(v * 10) / 10).toLocaleString();
+  return <>
+    <div className="chartControls">
+      <span className="kv"><span className="mut">Year</span><b>{chosen.year}</b></span>
+      <span className="kv"><span className="mut">Normal from</span>
+        <b>{n ? `${n} other year${n === 1 ? "" : "s"}` : "not enough years"}</b></span>
+      {selected && selected.year === chosen.year && <span className="kv">
+        <span className="mut">Filtered to</span><b>{MONTHS[selected.month - 1]} {chosen.year}</b></span>}
+      <select value={chosen.year}
+        onChange={e => { onYear(Number(e.target.value)); onPick?.(null); }}
+        aria-label="Year to judge against its normal band">
+        {seasons.map(s => <option key={s.year} value={s.year}>{s.year}</option>)}
+      </select>
+    </div>
+    {!withValue.length
+      ? <span className="hint">No fully covered month in {chosen.year} for this selection.</span>
+      : <>
+        <Chart rows={rows} xKey="month" xFmt={m => MONTHS[m - 1]} height={310}
+          yLabel="Mean detections / day"
+          onPick={onPick ? i => onPick({ year: chosen.year, month: i + 1 }) : undefined}
+          pickHint="Click a month to filter the calendar, map and anomaly list · Enter picks the hovered month"
+          description={`${chosen.year} by month, against the same month in the other years`}
+          ariaLabel={`${chosen.year} monthly mean daily detections against the normal band built from the other years`}
+          series={[
+            // Normal ±1σ band (std-based) when we have 2+ other years
+            ...(band && !rows.some(r => r.normal_mad != null)
+              ? [{ key: "high", keyLow: "low", keyHigh: "high", type: "band",
+                  name: "Normal ±1σ", color: C.env, opacity: 0.6, fmt: dec }]
+              : [],
+            // MAD-based normal band (robust alternative for single-year std)
+            ...(band && rows.some(r => r.normal_mad != null)
+              ? [{ key: "high_mad", keyLow: "low_mad", keyHigh: "high_mad", type: "band",
+                  name: "Normal ±1σ (MAD)", color: C.env, opacity: 0.3, fmt: dec }]
+              : [],
+            { key: "avg", type: "bar", name: String(chosen.year), color: C.amber, fmt: dec },
+            ...(band && !rows.some(r => r.normal_mad != null)
+              ? [{ key: "normal", type: "line", name: "Normal", color: C.teal,
+                  dash: true, width: 2, fmt: dec }]
+              : (band && rows.some(r => r.normal_mad != null)
+                  ? [{ key: "normal_mad", type: "line", name: "Normal (MAD)", color: C.teal,
+                      dash: true, width: 2, fmt: dec }]
+                  : []),
+          ]} />
+        <div className="chartStats">
+          <Stat k="Peak month" v={peak ? MONTHS[peak.month - 1] : "—"} tone="acc"
+            note={peak ? `${dec(peak.avg)} detections/day in ${chosen.year}` : undefined} />
+          <Stat k="Above normal" v={above.length ? above.join(" · ") : "None"}
+            tone={above.length ? "acc" : undefined} note="months above the band" />
+          <Stat k="Below normal" v={below.length ? below.join(" · ") : "None"}
+            note="months below the band" />
+          <Stat k="Most unusual" v={odd ? MONTHS[odd.month - 1] : "—"}
+            note={odd ? `z = ${odd.z} against the other years` : "band needs two other years"} />
+        </div>
+      </>}
+    <div className="hint">
+      Bars are {chosen.year}'s own monthly means. The band is the mean ±1σ of the same calendar
+      month in the other years, with the judged year left out — a record year inside its own band
+      would widen it toward itself and hide the very anomaly this view exists for. Months the
+      record only partly covers are left blank rather than drawn at zero, and a month averaging
+      under five detections a day keeps its bar and band but is not called unusual: its spread
+      across years is near zero, so a z-score from it would be arithmetic, not evidence.
+      {onPick && <> Click a month to filter the calendar, the map and the anomalous-day list to
+      it; click it again to clear.</>}
+    </div>
+  </>;
+}
 
 /**
  * The `monthly[]` series `/anomalies` has always returned, drawn for the first time: one bar per
@@ -167,9 +256,17 @@ const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "
  * so every January is one bar — and the caption says so rather than letting "monthly" imply a
  * timeline. The threshold comes from the response, so the line and the `critical[]` list can
  * never disagree about where the cut is.
+ *
+ * Above it sits the per-year view: the same twelve months for one selected year, each against
+ * the band its own year was excluded from. The profile answers "what is this region's season";
+ * the per-year chart answers "was this season unusual", which pooling every year cannot.
  */
-export function AnomalyPanel({ bbox, refreshKey, embedded }) {
+export function AnomalyPanel({ bbox, refreshKey, embedded, selected, onPickMonth }) {
   const { data: a, failed } = useEndpoint("/anomalies", bbox, refreshKey);
+  // Which year the per-year chart judges. null means "the latest year the response carries",
+  // so a new bbox that does not reach an older pick falls back instead of drawing nothing.
+  const [year, setYear] = useState(null);
+  const seasons = Array.isArray(a?.seasons) ? a.seasons : [];
 
   const body = () => {
     if (failed) return <span className="hint">Anomaly profile unavailable for this selection.</span>;
@@ -183,6 +280,12 @@ export function AnomalyPanel({ bbox, refreshKey, embedded }) {
     const critical = (a.critical || []).map(c => MONTHS[c.month - 1] ?? c.month);
     const dec = v => (Math.round(v * 10) / 10).toLocaleString();
     return <div className="chartStack">
+      {seasons.length > 1 && <>
+        <div className="chartSub">The selected year</div>
+        <SeasonAgainstNormal seasons={seasons} year={year} onYear={setYear}
+          selected={selected} onPick={onPickMonth} />
+      </>}
+      <div className="chartSub">Seasonal profile</div>
       <Chart rows={rows} xKey="month" xFmt={m => MONTHS[m - 1]} height={310}
         yLabel="Mean detections / day"
         description="Mean daily detections by calendar month, with the critical-month threshold"
@@ -207,6 +310,67 @@ export function AnomalyPanel({ bbox, refreshKey, embedded }) {
   };
   if (embedded) return body();
   return <div className="panel wide"><h3>Monthly anomaly profile</h3>{body()}</div>;
+}
+
+/*** Year × month anomaly heatmap.
+ *
+ * The `/anomalies` endpoint already returns per-year, per-month z-scores in its
+ * `seasons` block — this component renders them as a compact grid so every season
+ * in the record can be compared at a glance, rather than teasing out one year at a
+ * time with the per-year view.
+ *
+ * Calendar months run left → right (Jan → Dec). Years stack top → bottom, newest at the
+ * top. Each cell shows avg daily detections with a color band indicating z-score.
+ ***/
+
+function AnomalyHeatmap({ seasons, year }) {
+  // seasons is [{year, months:[{month, avg, days, normal, low, high, z, n}]}]
+  if (!seasons || !seasons.length) return <span className="hint">No seasonal anomaly data.</span>;
+  const yr = seasons.find(s => s.year === year) || seasons[seasons.length - 1];
+  const months = yr.months || [];
+  if (!months.length) return <span className="hint">No fully covered months in {yr.year}</span>;
+
+  const monthMap = new Map(months.map(m => [m.month, m]));
+  const hasZ = months.some(m => m.z != null);
+  const dec = v => (Math.round(v * 10) / 10).toLocaleString();
+
+  // Determine color based on z-score
+  const zToColor = z => {
+    if (z == null) return "#e0e0e0";
+    if (z > 2) return "#d7191c"; // very high
+    if (z > 1) return "#fdae61";  // high
+    if (z > 0) return "#abd9e9";  // low positive
+    if (z < -2) return "#7f0000"; // very low
+    if (z < 0) return "#2b8cbe";  // low negative
+    return "#ffffbf";            // near normal
+  };
+
+  const rowHeight = 28;
+  const colWidth = 26;
+  const margin = 4;
+  const rows = months.length;
+  const cols = 12; // Jan → Dec
+
+  return <>
+    <Chart rows={rows} xKey="doy" height={rows * rowHeight + 40} width={cols * colWidth + 40}
+      yLabel="Year × Month anomaly heatmap"
+      ariaLabel={`Anomaly heatmap for ${yr.year}: z-scores of mean daily detections per month against other years`}
+      series={[
+        { key: "cell", type: "rect", name: "Cell", color: (d, i) => {
+          const m = i % 12 + 1; // month 1-12
+          const mon = monthMap.get(m);
+          if (!mon) return "#e0e0e0";
+          const z = mon.z;
+          return zToColor(z);
+        } }
+      ]} />
+    <div style={{ position: "absolute", left: 20, top: rows * rowHeight + 20, fontSize: 10, color: "#666" }}>
+      {MONTHS.map((m, i) => <div key={i} style={{ transform: `translateX(${i * colWidth}px)` }}>{m}</div>)}
+    </div>
+    <div style={{ position: "absolute", left: 10, top: 20, transform: `rotate(-90) translateY(-100%)`, fontSize: 10, color: "#666" }}>
+      {seasons.map((s, i) => <div key={i} style={{ transform: `translateY(${i * rowHeight}px)` }}>{s.year}</div>)}
+    </div>
+  </>;
 }
 
 function Stat({ k, v, bad, note, tone }) {

@@ -36,6 +36,7 @@ import numpy as np
 import pandas as pd
 
 import forecast_model as fm
+import regions
 
 # Bumped whenever a change would make an older checkpoint misleading rather than merely
 # incomplete.  `load()` refuses anything it does not recognize instead of guessing, so a
@@ -118,6 +119,15 @@ def build_features(Y, climo):
     counts, and `ok` a boolean mask dropping the opening max(LAGS) rows, where the longest
     lag is still undefined -- so a panel of T days has T - max(LAGS) usable rows, and a panel
     shorter than that has none.  Rollings use min_periods=1 so they are defined from row 0.
+
+    A row's rolling window ends *on* the day it predicts (`t-k+1..t`), while `path_matrix`
+    can only end it on the last observed day.  That looks like a one-day look-ahead, and it
+    is one -- but shifting the window back a day was measured, not assumed: on the trimmed
+    archive it moved h=1 MASE 2.141 -> 2.051 (still behind the prior's 1.478) and the served
+    horizons 1.950/1.945/2.642 -> 2.069/2.087/2.929, with the spatial hold-out at h=7 going
+    3.82 -> 8.58, because the fed-back rolls damp the recursive path and the causal window
+    does not.  The backtest is scored with the serving rule either way, so the number stays
+    honest; the real fix for the recursion is direct multi-horizon training, not this shift.
     """
     T, C = Y.shape
     vals = Y.to_numpy(dtype=np.float64)
@@ -147,43 +157,63 @@ def build_features(Y, climo):
 
 
 def path_matrix(Y_hist, climo, booster, horizon):
-    """Recursively roll the booster forward `horizon` days over every cell in `Y_hist`.
+    """Direct multi-horizon prediction over every cell in `Y_hist`.
 
-    `Y_hist` is the observed (dates x cells) frame; each step builds the same feature row
-    `build_features` would, appends the prediction to the history and continues.  Returns
-    (dates, M) with M a (horizon x cells) matrix, so a caller can sum the cells it cares
-    about -- the AOI total for serving, or a curated region for calibration -- without
-    re-running the model once per group.
+    For each horizon day, features are built from the *original* historical data
+    (not from previously predicted values), so there is no compounding error from
+    recursive rollout.  Returns (dates, M) with M a (horizon x cells) matrix, so a
+    caller can sum the cells it cares about -- the AOI total for serving, or a
+    curated region for calibration -- without re-running the model once per group.
     """
-    Y = Y_hist.astype(float).copy()
+    Y = Y_hist.astype(float)
     if not len(Y.columns):
         raise ValueError("path_matrix: no cells")
     cells = np.asarray(Y.columns, dtype=np.int64)
     la, lo = cell_center(cells)
     n = len(cells)
+    N = len(Y)
     last = Y.index[-1]
-    dates, rows = [], []
-    for h in range(1, int(horizon) + 1):
+    horizons = list(range(1, int(horizon) + 1))
+    # Build feature rows for each horizon day from the *original* Y_hist only.
+    # This avoids the recursive rollout compounding error that the old implementation
+    # had: each day's prediction was fed back as input for the next day.
+    rows = np.full((int(horizon), n), np.nan, dtype=float)
+    dates = []
+    for h in horizons:
         d = last + pd.Timedelta(days=h)
-        vals = Y.to_numpy(dtype=float)
-        logy = np.log1p(vals)
+        dates.append(d)
+        # lag_k uses the original history: value k days before the target day
+        logy = np.log1p(Y.to_numpy(dtype=float))
         row = {}
         for k in LAGS:
-            row[f"lag_{k}"] = logy[-k] if len(logy) >= k else np.zeros(n)
-        for k in ROLLS:
-            row[f"roll_{k}"] = np.log1p(vals[-k:].mean(axis=0))
+            # The row at position T-k (0-indexed) corresponds to the day k days before target
+            # if T is the last index of Y_hist, then target is at index N, and we need row N-k
+            if N > k:
+                row[f"lag_{k}"] = logy[N - k]
+            else:
+                row[f"lag_{k}"] = np.zeros(n)
+        # roll_k uses the last k days from original history (before the gap)
+        if N >= max(ROLLS):
+            for k in ROLLS:
+                row[f"roll_{k}"] = np.log1p(Y.iloc[-k:].to_numpy(dtype=float).mean(axis=0))
+        else:
+            for k in ROLLS:
+                row[f"roll_{k}"] = np.log1p(Y.to_numpy(dtype=float).mean(axis=0))
+        # doy_sin/cos for the target day
         sin, cos = doy_angles([d.dayofyear])
         row["doy_sin"] = np.full(n, float(sin[0]))
         row["doy_cos"] = np.full(n, float(cos[0]))
+        # lat/lo are constant per cell
         row["lat"] = la
         row["lon"] = lo
+        # climo for the target day-of-year
         row["climo"] = climo.loc[d.dayofyear, Y.columns].to_numpy(dtype=float)
+        # Stack features and predict
         Xf = np.stack([np.atleast_1d(row[f]).astype(float) for f in FEATURES], axis=1)
         pred = np.clip(np.asarray(booster.predict(Xf), dtype=float), 0.0, None)
-        Y.loc[d] = pred
-        dates.append(d)
-        rows.append(pred)
-    return dates, np.asarray(rows, dtype=float)
+        rows[h - 1] = pred
+    return dates, rows
+
 
 
 def predict_path(Y_hist, climo, booster, horizon):
@@ -382,17 +412,48 @@ def save(booster, cells, climo, meta, explicit=None):
 
 
 # ------------------------------------------------------------------------- serving gate
-def gate(metrics, horizon):
+def _scope_label(region):
+    """Display name for a gate scope, so a reason string can be read without a key table."""
+    reg = regions.REGIONS.get(region or "")
+    return reg["name"] if reg else "global"
+
+
+def _gate_row(metrics, horizon, region=None):
+    """The scored backtest row that judges a horizon, the scope it came from, and why.
+
+    A curated region's own row is preferred when the checkpoint carries one, because a model
+    can win the pooled panel and still lose one fire regime -- the pooled score is dominated
+    by wherever most detections are, so pooling California with the Amazon and Australia
+    hides which regime the forecast is actually serving.  Only a *missing or incomplete*
+    regional row falls back to the global one; a regional row that loses is a loss, and
+    falling back there would undo the whole point of scoring per region.
+    """
+    bt = (metrics or {}).get("backtest") or {}
+    h = str(int(horizon))
+    global_row = (bt.get("by_horizon") or {}).get(h)
+    if not region:
+        return global_row, "global", None
+    own = ((bt.get("by_region") or {}).get(region) or {}).get(h)
+    if own and own.get("lgbm") is not None and own.get("prior") is not None:
+        return own, region, None
+    return global_row, "global", "no regional score" if not own else "regional score incomplete"
+
+
+def gate(metrics, horizon, region=None):
     """Whether the LightGBM model may be served for a horizon, and why.
 
     The rule is the honest one the model was asked to earn: LightGBM is served only at a
     horizon whose stored backtest MASE is strictly better than the seasonal prior's.  A
     tie -- or a horizon the backtest could not score -- keeps the prior.
+
+    `region` names a curated preset the AOI sits entirely inside (`regions.region_for_box`).
+    When it is given, the decision is made on that preset's own backtest row, which is scored
+    on the preset's daily total rather than the whole panel -- a nearby but not identical
+    quantity, and the closest one the checkpoint measured.  Passing None judges on the panel.
     """
     if not metrics:
         return False, "no checkpoint"
-    scores = (metrics.get("backtest") or {}).get("by_horizon") or {}
-    row = scores.get(str(int(horizon)))
+    row, scope, fallback = _gate_row(metrics, horizon, region)
     if not row:
         return False, f"no backtest score for horizon {int(horizon)}"
     # `backtest()` writes these under the same names the three forecasts are scored by;
@@ -400,12 +461,15 @@ def gate(metrics, horizon):
     lm, pm = row.get("lgbm"), row.get("prior")
     if lm is None or pm is None:
         return False, "backtest score incomplete"
+    where = _scope_label(scope)
+    if fallback:
+        where += f" ({fallback}; {region} asked)"
     if lm < pm:
-        return True, f"backtest MASE {lm:.3f} beats seasonal prior {pm:.3f}"
-    return False, f"seasonal prior {pm:.3f} <= LightGBM {lm:.3f}"
+        return True, f"{where} backtest MASE {lm:.3f} beats seasonal prior {pm:.3f}"
+    return False, f"{where} seasonal prior {pm:.3f} <= LightGBM {lm:.3f}"
 
 
-def earned_days(metrics, horizon):
+def earned_days(metrics, horizon, region=None):
     """Which of a `horizon`-day request the stored backtest earned, one day at a time.
 
     Scoring is discrete (h=1/7/14/30), so each day is judged by the nearest measured horizon
@@ -414,14 +478,23 @@ def earned_days(metrics, horizon):
     last measured horizon has no evidence behind it and keeps the prior rather than borrowing
     the longest score's verdict.
 
+    `region` is the curated preset the AOI sits inside, or None for the whole panel; each
+    horizon is then judged by that preset's own row, falling back to the global row only
+    where the checkpoint has no regional score for it (`gate`).  Both scopes' horizons are
+    considered, so a missing regional 30-day row does not silently truncate the window.
+
     This is what lets one checkpoint serve part of a request: a model that won 7 and 14 but
     lost 1 and 30 answers days 2-14 and the prior answers the rest, instead of one horizon's
     verdict deciding the whole response. Returns a list of booleans, day 1 first.
     """
-    scores = sorted(int(k) for k in ((metrics or {}).get("backtest") or {}).get("by_horizon") or {})
+    bt = (metrics or {}).get("backtest") or {}
+    keys = set(bt.get("by_horizon") or {})
+    if region:
+        keys |= set((bt.get("by_region") or {}).get(region) or {})
+    scores = sorted(int(k) for k in keys)
     if not scores:
         return [False] * max(0, int(horizon))
-    verdict = {h: gate(metrics, h)[0] for h in scores}
+    verdict = {h: gate(metrics, h, region)[0] for h in scores}
     out = []
     for day in range(1, int(horizon) + 1):
         nxt = next((h for h in scores if h >= day), None)

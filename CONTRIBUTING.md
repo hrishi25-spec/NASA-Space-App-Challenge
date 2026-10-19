@@ -25,7 +25,7 @@ scripts/check.sh          # POSIX   (bash)
 scripts\check.bat         # Windows
 ```
 
-It runs exactly what CI runs: the doc-figure check (`scripts/check-doc-figures.py`, which fails when a number the docs quote drifts from the code), the doc-link check (`scripts/check-doc-links.py`, which fails when a relative link does not resolve), that guard's own test suite (`scripts/test_check_doc_links.py`, 36 stdlib `unittest` tests pinning its slug, case, ignore and tracked-file rules), the backend test suite (139 tests: 68 smoke + 34 security + 37 local-archive, in-process via `TestClient`), and the frontend production build, whose prebuild step is the lazy-export guard and the adaptive-detail, chart-layout and orbital-drift policy checks.
+It runs exactly what CI runs: the doc-figure check (`scripts/check-doc-figures.py`, which fails when a number the docs quote drifts from the code), the doc-link check (`scripts/check-doc-links.py`, which fails when a relative link does not resolve), that guard's own test suite (`scripts/test_check_doc_links.py`, 36 stdlib `unittest` tests pinning its slug, case, ignore and tracked-file rules), the backend test suite (148 tests: 73 smoke + 34 security + 41 local-archive, in-process via `TestClient`), and the frontend production build, whose prebuild step is the lazy-export guard and the adaptive-detail, chart-layout and orbital-drift policy checks.
 
 Neither takes minutes. Training the forecast model does:
 

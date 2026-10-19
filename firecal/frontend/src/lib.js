@@ -63,3 +63,37 @@ export const fmtBytes = b => b == null ? "—"
   : b >= 1e9 ? (b / 1e9).toFixed(2) + " GB"
   : b >= 1e6 ? (b / 1e6).toFixed(1) + " MB"
   : Math.max(1, Math.round(b / 1e3)) + " KB";
+
+/** Where an archive's years actually are, in one line.
+
+    GET /datasets carries a sampled `coverage` block per file: per calendar year the latitude/
+    longitude box, the number of 2° cells and the row counts, plus `thin_years` when a year's box
+    is under a quarter of the inventory's own area. The picker needs it because "archive · 614
+    KB" described a California-only NRT window exactly as it described a global year, and that
+    read cost a training run: the merge's climatology averaged the two. */
+export const yearsRange = ys => !ys.length ? ""
+  : ys.length === 1 ? String(ys[0])
+  : ys.every((y, i) => i === 0 || y === ys[i - 1] + 1) ? `${ys[0]}–${ys[ys.length - 1]}`
+  : ys.join(", ");
+
+export function coverageLine(cov, max = 3) {
+  if (!cov) return "";
+  if (cov.unavailable) return `coverage unknown — ${cov.unavailable.split(":")[0]}`;
+  const years = cov.years || [];
+  if (!years.length) return "";
+  const parts = years.slice(0, max).map(y => {
+    const cells = y.cells >= 1000 ? (y.cells / 1000).toFixed(1) + "k" : y.cells;
+    // The box is the readable part: 9° × 10° is obviously one state, 121° × 339° is obviously
+    // not -- and it comes from the coordinates, not from a row count that the sample scaled.
+    const box = `${Math.round(y.lat[1] - y.lat[0])}° × ${Math.round(y.lon[1] - y.lon[0])}°`;
+    return `${y.year}${y.thin ? " ⚠" : ""} · ${box} · ${cells} cell${y.cells === 1 ? "" : "s"}`;
+  });
+  const rest = years.length - parts.length;
+  return parts.join(" · ") + (rest > 0 ? ` · +${rest} more` : "") + (cov.sampled ? " · sampled" : "");
+}
+
+/** The warning half: which years are regional windows rather than the planet. */
+export const coverageWarn = cov => {
+  const thin = cov?.thin_years || [];
+  return thin.length ? `regional only: ${yearsRange(thin)}` : "";
+};

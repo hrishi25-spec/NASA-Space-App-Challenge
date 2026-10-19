@@ -195,6 +195,62 @@ def test_anomalies():
     critical = {c["month"] for c in an["critical"]}
     assert critical <= {m["month"] for m in monthly if m["avg"] >= an["threshold"] - 0.1}
     assert {m["month"] for m in monthly if m["avg"] >= an["threshold"] + 0.1} <= critical
+    # Per-year months, each against a band its own year was left out of. That is the view that
+    # can show an unusual season; `monthly[]` above is only the pooled profile.
+    seasons = an["seasons"]
+    assert len(seasons) >= 3
+    assert [s["year"] for s in seasons] == sorted(s["year"] for s in seasons)
+    for s in seasons:
+        assert [m["month"] for m in s["months"]] == list(range(1, 13))
+    banded = [m for s in seasons for m in s["months"] if m["normal"] is not None]
+    assert banded, "the fixture spans enough years for at least one normal band"
+    assert all(m["low"] <= m["normal"] <= m["high"] and m["low"] >= 0 for m in banded)
+    assert any(m["z"] is not None for s in seasons for m in s["months"])
+
+
+def test_anomaly_season_leaves_the_judged_year_out_of_its_own_normal():
+    """The per-year view compares a month with the *other* years.
+
+    A record August must not widen the band it is judged against — that is how an exceptional
+    season hides — and a month the record only partly covers is reported with its day count
+    rather than scored as if one day were a month.
+    """
+    idx = pd.date_range("2019-01-01", "2023-12-31")
+    v = np.full(len(idx), 10.0)
+    for year, aug in {2019: 8, 2020: 10, 2021: 12, 2022: 9, 2023: 60}.items():
+        v[(idx.year == year) & (idx.month == 8)] = aug
+    seasons = main._season_anomaly(pd.Series(v, index=idx))
+    assert [s["year"] for s in seasons] == [2019, 2020, 2021, 2022, 2023]
+    assert all(len(s["months"]) == 12 for s in seasons)
+    aug = next(s for s in seasons if s["year"] == 2023)["months"][7]
+    assert aug["avg"] == 60 and aug["days"] == 31 and aug["n"] == 4
+    # the band is the other four Augusts (8, 10, 12, 9), not one that includes the 60
+    assert aug["normal"] == 9.8 and 7 < aug["low"] and aug["high"] < 12
+    assert aug["z"] > 20
+    # a near-zero month gets no z-score even when its band is razor thin: dividing a tenth of
+    # a detection by a near-zero spread is arithmetic, not evidence
+    quiet = v.copy()
+    for year, oct_value in {2019: 0.7, 2020: 0.8, 2021: 0.9, 2022: 0.6, 2023: 0.1}.items():
+        quiet[(idx.year == year) & (idx.month == 10)] = oct_value
+    oct_2023 = next(s for s in main._season_anomaly(pd.Series(quiet, index=idx))
+                    if s["year"] == 2023)["months"][9]
+    assert oct_2023["normal"] is not None and oct_2023["z"] is None
+    assert main.MIN_ANOMALY_LEVEL > 0.9           # the floor is what suppresses it
+    # no spread among the other years leaves no z-score rather than an infinite one
+    flat = pd.Series(np.full(len(idx), 6.0), index=idx)   # above the floor, so only σ = 0
+    for season in main._season_anomaly(flat):
+        for m in season["months"]:
+            assert m["z"] is None and m["normal"] == 6.0 and m["low"] == m["high"] == 6.0
+    # a partly covered month is reported with its day count and no mean, and cannot set a band
+    part = pd.Series(np.full(len(pd.date_range("2019-01-15", "2020-03-31")), 5.0),
+                     index=pd.date_range("2019-01-15", "2020-03-31"))
+    jan = main._season_anomaly(part)[0]["months"][0]
+    assert jan["avg"] is None and jan["days"] == 17 and jan["low"] is None
+    # two years is one other year: a value, but no spread, so no band
+    two = pd.Series(np.full(len(pd.date_range("2019-01-01", "2020-12-31")), 5.0),
+                    index=pd.date_range("2019-01-01", "2020-12-31"))
+    assert main._season_anomaly(two)[0]["months"][0]["normal"] is None
+    assert main._season_anomaly(pd.Series(dtype=float)) == []
 
 
 def test_forecast():
@@ -678,6 +734,28 @@ def test_regions_catalog():
         assert a <= lat <= c and b <= lon <= e
 
 
+def test_a_box_is_scored_by_a_region_only_when_it_sits_inside_one():
+    """The forecast gate claims a curated region's scores only for a box wholly inside it.
+
+    Half a preset is not the preset: a box straddling two regimes, or the whole frame, has
+    no one regional backtest that speaks for its total, so those cases must fall through to
+    the global scores rather than borrow a verdict from ground they only partly cover.
+    """
+    import regions
+
+    for key, reg in regions.REGIONS.items():
+        assert regions.region_for_box(reg["bbox"]) == key     # the preset itself
+        a, b, c, e = reg["bbox"]
+        inner = [a + 0.5, b + 0.5, c - 0.5, e - 0.5]
+        assert regions.region_for_box(inner) == key          # a drawn AOI inside it
+    ca = regions.region_box("california")
+    assert regions.region_for_box([ca[0], ca[1], ca[2] + 1.0, ca[3]]) is None   # pokes out
+    assert regions.region_for_box([-18.0, -124.4, 42.0, -48.0]) is None         # two presets
+    assert regions.region_for_box([-90.0, -180.0, 90.0, 180.0]) is None         # the world
+    assert regions.region_for_box(None) is None and regions.region_for_box([]) is None
+    assert regions.region_for_box([0.0, 0.0, 0.0, 0.0]) is None                 # nowhere curated
+
+
 def test_demo_per_region_stays_inside_its_bbox():
     r = client.post("/demo", params={"region": "california"})
     assert r.status_code == 200
@@ -883,9 +961,66 @@ def test_lgbm_features_use_only_past_and_training_years():
     assert ok.sum() == (T - max(lg.LAGS)) * C
     i = lg.FEATURES.index("lag_1")
     assert np.isclose(X[100 * C, i], np.log1p(Y.iloc[99, 0]))   # yesterday, never today
+    # the rolling window is the panel's documented convention (it ends on the row it
+    # predicts, and `build_features` says so with the measured cost of shifting it)
+    r7 = lg.FEATURES.index("roll_7")
+    assert np.isclose(X[100 * C, r7], np.log1p(Y.iloc[94:101, 0].mean()))
     # drop a season from the climatology and its value at a DOY must move
     climo_wo = lg.climo_table(Y, Y.index.year.to_numpy() != 2023)
     assert not np.allclose(climo.to_numpy()[74], climo_wo.to_numpy()[74])
+
+
+def test_coverage_break_is_a_seam_not_a_season():
+    """A record ending in a smaller export window is trimmed at the seam, not averaged across.
+
+    The real archive this was found on ends with a 355-day NRT download that covers one
+    state: 1/1000 of the global years before it.  `climo_table` averages day-of-year across
+    both, so the model trained on it serves a climatology a thousand times too small for
+    those months -- and its own backtest scores that bias rather than the model.
+    """
+    import train_forecast as tf
+
+    Y = _tiny_panel()
+    assert tf.consistent_span(Y) == (None, None)         # one consistent record: keep it whole
+
+    tail = pd.date_range("2024-01-01", periods=60)
+    low = pd.DataFrame(0.05, index=tail, columns=Y.columns)
+    cut, note = tf.consistent_span(pd.concat([Y, low]))
+    assert cut == Y.index[-1]                            # cut on the last day before the seam
+    assert "60 day(s)" in note and "coverage break" in note
+
+    # a quiet season is a shape to learn, not a sampling break
+    quiet = pd.concat([Y.iloc[:400], Y.iloc[400:] * 0.2])
+    assert tf.consistent_span(quiet) == (None, None)
+    # too little left to train on: keep the record rather than trim it to nothing
+    assert tf.consistent_span(pd.concat([Y.iloc[-120:], low])) == (None, None)
+
+
+def test_fit_uses_every_training_row_whatever_the_early_stop_says():
+    """The stop only picks a round count; the returned booster saw every training row.
+
+    Holding a whole training season out to choose the round count is fine on five seasons
+    and ruinous on two: after the coverage guard trims the archive's tail, a leave-one-
+    season-out fold keeps two seasons, and carving the later one left 65 usable days.  The
+    block is now a fixed recent tail and the fit is repeated on everything for the rounds
+    that block chose -- so a fold's score measures a model that saw its whole training set.
+    """
+    import lgbm_forecast as lg
+    import train_forecast as tf
+
+    Y = _tiny_panel()
+    climo = lg.climo_table(Y, None)
+    _, _, ok = lg.build_features(Y, climo)
+    every = np.ones(len(Y), dtype=bool)
+    _, best, n = tf.fit_model(Y, climo, every, rounds=20)
+    assert 0 < best <= 20
+    assert n == int(ok.sum())                                  # no row was spent on the stop
+    # a single-season panel has no recent block to stop on and still uses all its rows
+    one = Y.loc["2023"]
+    _, best, n = tf.fit_model(one, lg.climo_table(one, None), np.ones(len(one), dtype=bool),
+                              rounds=10)
+    assert n == int((~np.isnan(lg.build_features(one, lg.climo_table(one, None))[0])
+                     .any(axis=1)).sum())
 
 
 def test_lgbm_checkpoint_round_trip(tmp_path):
@@ -934,6 +1069,25 @@ def test_lgbm_checkpoint_round_trip(tmp_path):
     inside = {"backtest": {"by_horizon": {"7": {"lgbm": 0.5, "prior": 0.9}}}}
     assert lg.earned_days(inside, 10) == [True] * 7 + [False] * 3
     assert lg.earned_days(None, 3) == [False] * 3               # no checkpoint, no days
+    # ...and the verdict is scope-aware: a curated region is judged by its own row, which
+    # can disagree with the panel's in either direction. Only a missing or incomplete
+    # regional row falls back to the global one -- a regional *loss* is a loss.
+    scoped = {"backtest": {"by_horizon": {"30": {"lgbm": 0.5, "prior": 0.9}},
+                           "by_region": {"california": {"30": {"lgbm": 1.2, "prior": 0.9}},
+                                         "amazon": {"30": {"lgbm": 0.4, "prior": 1.1}}}}}
+    assert lg.gate(scoped, 30)[0] is True                       # the panel wins...
+    assert lg.gate(scoped, 30, region="california")[0] is False      # ...California loses
+    assert "California" in lg.gate(scoped, 30, region="california")[1]
+    assert "global" not in lg.gate(scoped, 30, region="california")[1]
+    assert lg.gate(scoped, 30, region="amazon")[0] is True
+    assert lg.gate(scoped, 30, region="punjab_crop")[0] is True      # no row: global fallback
+    assert "global" in lg.gate(scoped, 30, region="punjab_crop")[1]
+    gappy = {"backtest": {"by_horizon": {"30": {"lgbm": 0.5, "prior": 0.9}},
+                           "by_region": {"california": {"30": {"lgbm": 1.2}}}}}
+    assert lg.gate(gappy, 30, region="california")[0] is True        # incomplete: fallback
+    assert lg.earned_days(scoped, 30, region="california") == [False] * 30
+    assert lg.earned_days(scoped, 30, region="amazon") == [True] * 30
+    assert lg.earned_days(gappy, 30, region="california") == [True] * 30
     lg.clear_cache()
 
 
@@ -1071,6 +1225,52 @@ def test_lgbm_is_served_when_it_earns_the_horizon(monkeypatch):
         assert kinds == ["prior"] + ["lgbm"] * 13 + ["prior"] * 16
         assert fc["checkpoint"]["days"] == list(range(2, 15))
         assert [r["date"] for r in fc["forecast"]] == sorted(r["date"] for r in fc["forecast"])
+    finally:
+        main.DF = saved
+        main._invalidate()
+
+
+def test_forecast_gate_uses_the_regions_own_scores_inside_a_preset(monkeypatch):
+    """An AOI inside a curated region is judged by that region's backtest, not the panel's.
+
+    The checkpoint here wins 30 days on the pooled panel and loses 30 inside Australia while
+    winning 7 there. A box inside Australia must therefore serve days 1-7 from the model and
+    hold back days 8-10 that the global score would have handed over, and the response has
+    to say which scope judged it; the same request without a box is the panel's call.
+    """
+    import lgbm_forecast as lg
+    import train_forecast as tf
+
+    Y = _tiny_panel()
+    climo = lg.climo_table(Y, None)
+    booster, _, _ = tf.fit_model(Y, climo, np.ones(len(Y), dtype=bool), rounds=30)
+    ck = {"booster": booster, "climo": climo,
+          "metrics": {"generated": "test", "panel": {"seasons": [2021, 2022, 2023]},
+                      "backtest": {
+                          "by_horizon": {"30": {"lgbm": 0.2, "prior": 0.9}},
+                          "by_region": {"australia": {
+                              "7": {"lgbm": 0.3, "prior": 0.9},
+                              "30": {"lgbm": 2.0, "prior": 0.9}}}}}}
+    monkeypatch.setattr(main.lgbm_forecast, "load", lambda *a, **k: ck)
+    saved = main.DF
+    try:
+        main.DF = _tiny_detections(Y.index, Y.columns)
+        main._invalidate()
+        au = "-34,146,-32,148"            # inside `regions.REGIONS['australia']`
+        fc = client.get("/forecast", params={"bbox": au, "horizon": 10}).json()
+        assert fc["method"] == "blend"
+        assert [r["method"] for r in fc["forecast"]] == ["lgbm"] * 7 + ["prior"] * 3
+        assert fc["checkpoint"]["days"] == list(range(1, 8))
+        assert fc["checkpoint"]["scored_on"] == "Southeastern Australia"
+        assert "Southeastern Australia" in fc["model_reason"]
+        # the same checkpoint on the whole frame is judged by the panel, where 30 days won
+        fc = client.get("/forecast", params={"horizon": 30}).json()
+        assert fc["method"] == "lgbm" and len(fc["forecast"]) == 30
+        assert fc["checkpoint"]["scored_on"] == "global"
+        # a box that crosses the preset's edge is not the preset's forecast
+        wide = "-34,100,-32,148"
+        fc = client.get("/forecast", params={"bbox": wide, "horizon": 30}).json()
+        assert fc["checkpoint"]["scored_on"] == "global"
     finally:
         main.DF = saved
         main._invalidate()

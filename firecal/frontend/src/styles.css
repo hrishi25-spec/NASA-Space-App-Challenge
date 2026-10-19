@@ -353,6 +353,8 @@ select{
 .chartControls{display:flex;gap:10px 16px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
 .chartControls.end{justify-content:flex-end;margin:10px 0 0}
 .chartControls .kv{width:auto}
+/* a sub-heading inside a chart panel: the panel's own h3 names the tab, this names the chart */
+.chartSub{font-size:10px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;color:#a9bcbf;margin:2px 0 -2px}
 
 /* Respect users who ask for less motion (and save the work on weak devices). */
 @media (prefers-reduced-motion:reduce){

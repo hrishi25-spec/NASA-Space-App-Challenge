@@ -256,7 +256,11 @@ python train_forecast.py --no-backtest # fit and write the checkpoint, skip the 
 
 It reduces the archive to a 2°-cell × day panel whose target is the *harmonized* daily
 activity — the same quantity `/forecast` serves, built through the server's own
-`harmonize(geometry=False)` and the one sensor rescale — with features sin/cos day-of-year,
+`harmonize(geometry=False)` and the one sensor rescale. A trailing block whose level is
+decorrelated from the rest of the record is trimmed first (`consistent_span`, reported in
+`metrics.panel.coverage`): a download can end with a smaller export window, and averaging
+across that seam is how a climatology ends up a thousandth of the truth. Features are
+sin/cos day-of-year,
 1/7/14/28-day lags, 7/28-day rolling means, the cell's training-years day-of-year
 climatology and its latitude/longitude. It is validated by leave-one-fire-season-out in
 time plus a spatial hold-out by curated region (30° tiles as a fallback; never a random
@@ -271,13 +275,17 @@ day past the last measured horizon has no evidence behind it and keeps the prior
 days are served from the archive model and the rest of the window from the seasonal prior —
 `method` says `lgbm`, `prior` or `blend`, every forecast row carries its own `method`, and
 the chart draws the two as separate series — so one horizon's verdict never decides the whole
-request. The reference run over this machine's archive (15 exports, 10.3 GB, 126.2 M rows;
-1,089 days × 3,928 cells) is exactly that case: the held-out MASE at h=1/7/14/30 is LightGBM
-2.590 / 2.308 / 2.433 / 3.630 against the prior's 1.824 / 2.409 / 2.589 / 2.853, so a 30-day
-request answers day 1 and days 15–30 from the prior and days 2–14 from the model. A missing,
-truncated or foreign-schema checkpoint also falls back to the prior — and because LightGBM's
-parser aborts the process on a truncated model file, the loader verifies the checkpoint's
-SHA-256 before LightGBM ever sees it.
+request. The reference run over this machine's archive (15 exports, 10.3 GB, 126.2 M rows)
+trained on the 731 days × 3,928 cells that are one consistent record — the archive's last
+358 days are a state-sized NRT export, a thousandth of the level before them, so
+`consistent_span` trims that tail rather than averaging it into the climatology. The
+held-out MASE at h=1/7/14/30 is LightGBM 2.141 / 1.950 / 1.945 / 2.642 against the prior's
+1.478 / 1.934 / 1.983 / 2.027: the model earns h=14, h=7 is a 0.8 % *loss* and keeps the
+prior, and a 30-day request answers days 1–7 and 15–30 from the prior with days 8–14 from
+the model. Judged on a preset's own row it does better — a California AOI earns days 2–30
+and a Punjab one days 2–14. A missing, truncated or foreign-schema checkpoint also falls
+back to the prior — and because LightGBM's parser aborts the process on a truncated model
+file, the loader verifies the checkpoint's SHA-256 before LightGBM ever sees it.
 
 **The forecast carries a calibrated interval, and it says when it is not calibrated.** The
 trainer holds out a time block strictly later than the training block, measures the model's
@@ -289,17 +297,18 @@ and labels it. The band is only drawn when the checkpoint was actually calibrate
 the coverage it reports is *measured*, not assumed: on the synthetic fixture the nominal 90 %
 band came out at 79–87 % empirical coverage, so `coverage.within_tolerance` is `false` and
 the chart labels the band as indicative rather than quietly implying it is exact. On the real
-archive the shipped 365-day blocks do not fit at all — 1,089 days is six short of the 1,095
-the cut needs — so that checkpoint ships no band; a supplementary 300-day cut measured
+archive the shipped 365-day blocks do not fit at all — the trimmed 731-day record is 364
+short of the 1,095 the cut needs — so that checkpoint ships no band; a supplementary 300-day
+cut measured
 56–76 % coverage against 90 % nominal, so the gap does not close on real data either.
 
 The forecast panel names which one answered. With the prior (`Seasonal climatology +
 archive prior`) the archive's shape is blended into the frame's own season — in log space,
 fading out as the frame covers more years itself — because a record of a single fire season
 is one sample per day and cannot know its own shape. The reference run read 126 million
-detections across 1,089 days and learned what a 2° cell looks like through the year: the
-Thai dry-season peak in late March, Amazon burning in September, California's summer in
-July.
+detections over 1,089 days (731 of them one consistent record) and learned what a 2° cell
+looks like through the year: the Thai dry-season peak in late March, Amazon burning in
+September, California's summer in July.
 
 ## What you see
 
@@ -310,7 +319,7 @@ July.
 | **Burning calendar** | GitHub-style heatmap: one row per year, one cell per day, color = harmonized daily detections. A **Year** selector narrows it to a single-year calendar. Click any day to inspect it. |
 | **Region presets** | The *Fly to…* picker in the command bar (California, Amazon & Pantanal, Southeastern Australia, Punjab & Haryana, Mediterranean basin) sets the AOI filter, flies the camera to a regional zoom, and fills the **Selection** panel with the region's fuel type, peak season and notable fire years. Every panel then recomputes for that AOI; when an AOI holds no detections the Selection panel says so and offers *Clear area*, because the open archive may simply not cover that box. |
 | **Map** | One camera that morphs a **3D Earth globe** into a flat map as you zoom (the badge tracks `3D GLOBE → TRANSITION → 2D MAP`); scroll in past the transition for the flat view, or press **Globe view** to fly back. **Fly to AOI** fits the drawn box, **Reset orbit** returns to the default global attitude, and **Auto-rotate** turns the globe about **Earth's real axis**: the camera tilts to the planet's 23.44° obliquity while the drift runs, so the globe turns the way Earth turns and the north pole traces the small circle it traces from orbit, instead of spinning like a top about a vertical line. The rate is real too — 6°/s, or 3°/s on a weak machine, the same speed whatever the frame rate and never teleporting when a frame runs long (opt-in, any gesture stops it, and a camera you tilted by hand is levelled only if the drift is what tilted it). Detections for the selected day (±1/3/7/14 d span) — **MODIS coral, VIIRS amber, live points pale gold** — plus soft-sand DBSCAN cluster polygons, on one of three basemaps: **Satellite** imagery, the colour **Terrain** map, or **Vector** tiles (CARTO Dark Matter) whose coastlines and place names stay crisp however far you zoom, since vector geometry is redrawn rather than upscaled. All three toggles sit with the other view controls, in the bottom-left row under the readout, and a slow connection opens on **Vector** because it is the lightest of the three. The bottom-left column is readout first (`day · hotspots · clusters · MW`), controls beneath it, and it sits on the map's own edge; it steps up only while an *expanded* attribution notice would reach under it, so no control is ever covered and no space is left empty under the row. Dragging, rotating and zooming stay light on every basemap: the canvas render ratio is capped, MSAA and tile fade are off, and expired tiles are not re-fetched mid-gesture. Live-feed points/polygons overlay when pulled. Use **Select area** and click two corners to draw a bounding box; every panel then filters to it. |
-| **Anomalies & critical periods** | A click-through list of anomalous days (z-score vs the same ±7-day window in other years) and the months running above mean + 1σ flagged as *critical*. **Monthly chart** opens the Anomalies tab: twelve bars of mean daily detections per calendar month (pooled across the record) with the critical threshold as a dashed line, plus peak month, critical months and the threshold as cards. |
+| **Anomalies & critical periods** | A click-through list of anomalous days (z-score vs the same ±7-day window in other years) and the months running above mean + 1σ flagged as *critical*. **Monthly chart** opens the Anomalies tab: a per-year chart putting each month of a selected year against the mean ±1σ of that month in the other years (click a month to filter the calendar, the map and this list to it; click it again to clear), and below it twelve bars of mean daily detections per calendar month pooled across the record with the critical threshold as a dashed line. |
 | **Incident Commander briefing** | Threat level (Low/Watch/Elevated/Critical) with its score, record mean and last-30-days readout, then the full report split across **four sub-tabs** — Situation, Critical streaks, Fuel types, Actions — each with a count badge so you can see what is inside before opening it. Streak rows jump the map to that window; **Copy MD** exports the whole briefing. The right-rail card keeps the compact headline version. |
 | **Last year + 30-day forecast** | Full-width line chart of the trailing 365 days with the forecast appended, its method named (`Seasonal climatology + archive prior` once the model has been trained — see below), an Observed/Forecast legend — and zoom: drag across the plot to select a window, or take the last 90/180/365 days from the **Window** selector and **Reset zoom**. |
 | **Seasonal climatology** | Full-width day-of-year percentile envelope (10/50/90/95) with **Peak day**, **Fire season** (onset → cessation), the record span and the median day as cards beneath it. |
@@ -345,11 +354,18 @@ July.
   window), rendered as convex-hull polygons; parameters from the GISTDA Thailand paper
   (GIS-IDEAS 2024).
 - **Anomalies** — z-score of each day against the climatology of the same ±7-day window
-  in *other* years; critical months = monthly mean above mean + 1σ.
+  in *other* years; critical months = monthly mean above mean + 1σ; and a per-year view that
+  puts each month of a selected year against the mean ±1σ of that month in the *other* years
+  (the judged year is left out of its own band), so an unusual season is visible instead of
+  averaged into a seasonal profile. Clicking a month filters the console to it — the map draws
+  that month's detections and clusters, the calendar switches to a one-month view, and the rail
+  lists only that month's anomalous days.
 - **Forecast** — a 30-day horizon from a global LightGBM model (Tweedie) fitted offline on
 the archive's 2°-cell × day panel, served only where its stored backtest MASE beats the
-seasonal prior; otherwise the prior answers (day-of-year climatology scaled to the frame's
-recent level, blended with the archive's per-cell shape). A split-conformal band (log1p
+seasonal prior, judged by the curated preset's own scores when the AOI sits wholly inside
+one and by the pooled panel otherwise; on the days it does not win, the prior answers
+(day-of-year climatology scaled to the frame's recent level, blended with the archive's
+per-cell shape). A split-conformal band (log1p
 relative error, per horizon) is drawn when the checkpoint was calibrated, labelled with its
 *nominal* coverage and, when the two disagree, its measured coverage too. `torch` is not used.
 
@@ -362,7 +378,7 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
 |---|---|---|
 | `POST /upload` | multipart `files[]`, `demo_transition` (bool) | Add FIRMS CSVs (200 MB/file, 400 MB/request, ≤20 files). Returns `meta` plus an `upload` report naming every file — `files[]` with `rows`, `status` (accepted/rejected) and `reason`, plus `accepted`/`rejected` counts — so a file that harmonizes to nothing is never dropped in silence. HTTP 400 whose detail names each file and its reason when nothing is accepted, HTTP 413 if the request declares more than 400 MB. `demo_transition=true` replaces the dataset with the 2002–2024 demo — the poster dataset is loaded by this flag, **not** by naming a file `demo_transition.csv`. |
 | `POST /datasets/load` | `id`, `all` (bool), `limit` (1,000–2,000,000; default 750,000, or 2,000,000 when `all=true`), `spread` (bool, default true) | Open a local archive — or, with `all=true`, **every** archive merged into one record: all sensors, all years. Rows are *read*, so the reader stops and a 1.87 GB file costs about what a 50 MB one does; with `all=true` the budget is split across the files by size. An id the local inventory does not hold is resolved against the Hugging Face bucket first (`archives.hf_pull` into the cache, then re-listed), so the shared record opens on a machine with no `.data/` at all. That read needs no `hf` CLI: `huggingface_hub` does it, and the `hf` command is only the fallback, with `FIRECAL_HF_BUCKET` naming a different bucket. Parquet files (the bucket's format) open like CSVs — already-harmonized frames are passed through instead of re-harmonized. HTTP 404 for an id the inventory does not hold (400 when `all=true` and nothing exists locally or remotely) — both detailing the bucket's own state (empty, unreadable, no client installed) — 429 while another archive is opening, 400 when a CSV is not a FIRMS export or holds no usable rows. Returns `meta` plus a **`load`** block — for one file `file/sensor/kind/mb/capped`, for a merge `merged/archives/sensors/files[]/skipped[]` naming each export's rows — plus `rows_read`, `rows_kept`, `rows_estimate`, `spread`, `limit`. The console labels the slice from it, because the record on screen and the file it came from are not the same span. |
-| `GET /datasets` | — | The FIRMS archives found on this machine, smallest first: `{id, name, sensor, kind, label, bytes, mb}` each. `id` is relative to the archive root and is the only handle the load endpoint accepts — no absolute path is published, not even the roots that were walked. When nothing is local (fresh clone, container, CI), the Hugging Face bucket is pulled into the cache first and listed; `{"items": []}` means both the folder and the bucket came up empty (or unreachable), and the reason is not invented — `archives.hf_pull` names it (a bucket that is empty says so; so does a machine with no client at all). The pull itself is bounded: one runs at a time (the colliding request is told so), and a failed one is answered from memory for 60 s, because an empty `.data/` otherwise started a fresh outbound sync on every request. |
+| `GET /datasets` | — | The FIRMS archives found on this machine, smallest first: `{id, name, sensor, kind, label, bytes, mb, coverage}` each. `coverage` is *where and when* the window actually holds detections, from a bounded sample (24k rows from 12 seeks) cached beside the archives by size and mtime: per calendar year `{year, rows_sampled, rows_estimate, lat:[min,max], lon:[min,max], cells, area_fraction, thin}`, plus `thin_years` (and a `note`) for a year whose box is under a quarter of the inventory's own area — a state-sized NRT window beside global years is named as one instead of looking like another year. A file that cannot be sampled answers `{unavailable: reason}` and never fails the listing. `id` is relative to the archive root and is the only handle the load endpoint accepts — no absolute path is published, not even the roots that were walked. When nothing is local (fresh clone, container, CI), the Hugging Face bucket is pulled into the cache first and listed; `{"items": []}` means both the folder and the bucket came up empty (or unreachable), and the reason is not invented — `archives.hf_pull` names it (a bucket that is empty says so; so does a machine with no client at all). The pull itself is bounded: one runs at a time (the colliding request is told so), and a failed one is answered from memory for 60 s, because an empty `.data/` otherwise started a fresh outbound sync on every request. |
 | `POST /demo` | `mode=standard\|transition`, `region` | **Fixture, not a console feature** — the console has no demo button. Replace data with the synthetic 2020–2024 set, or the 2002–2024 transition set. `region` scopes the generated record (and its own seed) to a preset AOI; HTTP 400 for an unknown key. It is what the test suite loads, and the only data source a checkout without `.data/` has. |
 | `POST /archive` | `region`, `bbox`, `source`, `days` (1–5), `date`, `append` | Load a **real** FIRMS window through the area API and merge it into the record (like an upload). Needs `FIRMS_MAP_KEY`: HTTP 400 with the link and the `.env` locations when it is missing, 400 for an unknown source/region/bad date, 502 when FIRMS is unreachable. Rows outside the requested AOI are dropped, and the response is `meta` plus `{source, region, days}`. |
 | `DELETE /data` | — | Clear all loaded data. |
@@ -375,7 +391,7 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
 | `GET /calendar` | `bbox`, `start`, `end` | Daily rows: `{date, count, raw, frp}`. |
 | `GET /points` | `bbox`, `start`, `end`, `limit` (1–20000) | Map points (`{lat, lon, frp, sensor}`), randomly sampled if over the limit. |
 | `GET /clusters` | `bbox`, `start`, `end`, `eps` (10–5000), `min_pts` (1–100), `hours` (0.5–720) | DBSCAN clusters, top 300 by size, each with a convex `hull`. Only those 300 are hulled (hulling every cluster made one uncached call cost 33 s on a 23-year record); above 60k detections the input is stride-sampled across the whole period rather than truncated to the oldest rows. |
-| `GET /anomalies` | `bbox`, `z` (0.5–10) | `{anomalies[], critical[], threshold, monthly[]}`; needs >1 year of data. `threshold` is mean + 1σ of the twelve monthly means, which is what `critical[]` flags against and what the chart's line is drawn at. |
+| `GET /anomalies` | `bbox`, `z` (0.5–10) | `{anomalies[], critical[], threshold, monthly[], seasons[]}`; needs >1 year of data. `threshold` is mean + 1σ of the twelve monthly means, which is what `critical[]` flags against and what the chart's line is drawn at. `seasons[]` is one entry per year: twelve months with that year's mean daily count (`avg`, null when the record only partly covers the month), the band from the other years (`normal`, `low`, `high`), and `z` (null when there is no spread or the month is below five detections a day). |
 | `GET /forecast` | `bbox`, `horizon` (1–90) | `{model, forecast[]}`; needs ≥120 days. Additive fields name the path: `method` (`lgbm` | `prior` | `blend`), `model_reason`, a per-row `method` naming the model that drew that day, a `checkpoint` provenance block (with the day offsets the model served) when the LightGBM model serves any of the window, `lower`/`upper` on the model's rows and a `coverage` block (`nominal`, `empirical`, `within_tolerance`) when the checkpoint was conformally calibrated. The original keys are unchanged. |
 
 `bbox` format: `minlat,minlon,maxlat,maxlon` (e.g. `bbox=17,98,20,101`).
@@ -418,9 +434,9 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
     │   ├── train_forecast.py       ← fits the global LightGBM forecaster on the archive (writes model/lgbm_*)
     │   ├── lgbm_forecast.py        ← LightGBM features, hash-verified checkpoint IO, the prior-vs-model gate
     │   ├── train_data.py           ← headless run of every model over your own CSVs + a Markdown report
-    │   ├── model/                  ← trained checkpoint (gitignored; rebuilt by train.py)     │   ├── test_smoke.py           ← 68-test API smoke suite (encodings, gzip, cache, presets, archive, real-FIRMS schema guard, training, LightGBM forecast + its conformal band, /api prefix)
+    │   ├── model/                  ← trained checkpoint (gitignored; rebuilt by train.py)     │   ├── test_smoke.py           ← 73-test API smoke suite (encodings, gzip, cache, presets, archive, real-FIRMS schema guard, training, LightGBM forecast + its conformal band, /api prefix)
     │   ├── test_security.py        ← 34-test hardening suite (URL allowlist, upload caps, CORS, CSP hosts)
-    │   ├── test_archives.py        ← 37-test suite for the local-archive picker (inventory, slice, merge, ids, gate, HF bucket)
+    │   ├── test_archives.py        ← 41-test suite for the local-archive picker (inventory, slice, merge, ids, gate, HF bucket)
     │   ├── requirements.txt        ← runtime deps (with security floors)
     │   └── requirements-dev.txt    ← + pytest, httpx (for tests)
     └── frontend/
@@ -553,7 +569,7 @@ scripts/check.sh          # POSIX — or scripts\check.bat on Windows
 Both are thin wrappers around the commands below, which is also what CI runs:
 
 ```bash
-# 139 tests, ~2 min — starts the app in-process via TestClient
+# 148 tests, ~2 min — starts the app in-process via TestClient
 cd firecal/backend
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest -q
@@ -575,7 +591,7 @@ python scripts/test_check_doc_links.py
 
 `.github/workflows/ci.yml` runs all five on every push to `main` and on pull requests.
 
-**`test_smoke.py` (68) ** covers every endpoint end-to-end — demo load, calendar with and
+**`test_smoke.py` (73) ** covers every endpoint end-to-end — demo load, calendar with and
 without bbox, points clamping, clusters, climatology envelope, illusion diagnostic on both
 demos, briefing JSON + Markdown, live feed (skipped offline when FIRMS is unreachable),
 anomalies, forecast — plus error paths (bad bbox → 400, missing-column CSV → 400, valid CSV
@@ -587,7 +603,7 @@ and region-specific, `.env` parsing handles comments/`export`/quotes, and `/arch
 validates the request *before* the key, explains a missing key, builds the area-API URL in
 west,south,east,north order, and merges rows while dropping anything outside the AOI.
 
-**`test_archives.py` (37)** covers the local-archive picker against a purpose-built fixture
+**`test_archives.py` (41)** covers the local-archive picker against a purpose-built fixture
 directory — three archives over two instruments, one of them an S-NPP export that names its
 platform: the inventory order (smallest first) and its labels, that no filesystem path reaches
 the response, that no archive at all is an empty list rather than an error, that a CSV which is
@@ -697,7 +713,7 @@ the suite goes red.
 | Region allowlist | 8 FIRMS regions | `region` is interpolated into the outbound URL, so anything off the list → HTTP 400 before any fetch. |
 | Row cap | 2,000,000 | Oldest rows are dropped beyond this (in-memory store, no database). |
 | Query params | clamped | `limit` ≤ 20000, `eps` ≤ 5000, `horizon` ≤ 90, etc. |
-| Forecast model | LightGBM (lazily imported) | Serves each forecast day only where the nearest *measured* backtest horizon beat the seasonal prior; the rest of the window is the prior, and the response names which drew which day. A missing/broken checkpoint degrades to the prior, never an error. |
+| Forecast model | LightGBM (lazily imported) | Serves each forecast day only where the nearest *measured* backtest horizon beat the seasonal prior; the rest of the window is the prior, and the response names which drew which day. An AOI wholly inside a curated preset is judged by that preset's own backtest (`checkpoint.scored_on`), not the pooled panel's. A missing/broken checkpoint degrades to the prior, never an error. |
 
 ## Security notes
 
@@ -766,7 +782,8 @@ Known gaps, accepted for a prototype and worth closing before real deployment:
   estimating the rest; only one archive opens at a time, and a second request answers 429, which
   the console reports rather than hanging on.
 - **Forecast says “Seasonal climatology” or “Seasonal climatology + archive prior”** — the
-  LightGBM model either has no checkpoint or its stored backtest did not beat the prior, so
+  LightGBM model either has no checkpoint or its stored backtest did not beat the prior for
+  this AOI's scope (the preset's own scores when the box sits inside a curated region), so
   the prior answered. The response's `model_reason` says which. Run
   `python firecal/backend/train.py` for the prior and `python firecal/backend/train_forecast.py`
   for the LightGBM model over a FIRMS archive; the endpoint picks up `model/` on its next

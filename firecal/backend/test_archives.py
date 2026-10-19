@@ -111,6 +111,88 @@ def test_inventory_publishes_no_filesystem_paths(archive_root):
         assert not any(key.startswith("_") for key in item)
 
 
+def test_inventory_reports_per_year_coverage(archive_root):
+    """Every entry says where and when its detections are, not only how big the file is.
+
+    "2026 archive, 614 kB" described this machine's state-sized NRT download and a global year
+    the same way; the difference is the ground each covers, and that is what the picker now
+    carries. The fixture files all span the same box and the same two years, so none of them is
+    a regional window -- the flag is exercised by the test below.
+    """
+    items = client.get("/datasets").json()["items"]
+    by_id = {item["id"]: item for item in items}
+    year_rows = by_id[ARCHIVE_ID]["coverage"]
+    assert year_rows["rows_sampled"] > 0 and year_rows["rows_estimate"] > 0
+    assert isinstance(year_rows["sampled"], bool)
+    years = [year["year"] for year in year_rows["years"]]
+    assert years == [2024, 2025]                       # the 400-day fixture crosses one year
+    for year in year_rows["years"]:
+        assert year["lat"][0] < year["lat"][1] and year["lon"][0] < year["lon"][1]
+        assert year["cells"] > 0
+        assert 0 < year["area_fraction"] <= 1 and year["thin"] is False
+    assert year_rows["thin_years"] == [] and "note" not in year_rows
+
+
+def test_a_regional_window_is_named_as_one(monkeypatch, tmp_path):
+    """A window over one state is reported as one, against the inventory's own ground.
+
+    This is the case that cost a training run: 358 days of a California-only NRT export sitting
+    beside two global years, described in the picker as the same kind of thing. The comparison
+    is to the whole inventory's box, so it needs no external reference and no per-file flag.
+    """
+    root = tmp_path / ".data"
+    (root / "DL_FIRE_J1V-C2_900001").mkdir(parents=True)
+    (root / "DL_FIRE_J1V-C2_900002").mkdir(parents=True)
+    global_path = root / "DL_FIRE_J1V-C2_900001" / "fire_archive_J1V-C2_900001.csv"
+    regional_path = root / "DL_FIRE_J1V-C2_900002" / "fire_archive_J1V-C2_900002.csv"
+    header = "latitude,longitude,acq_date,acq_time,confidence,frp,brightness,satellite,instrument\n"
+    days = pd.date_range("2024-01-01", periods=40)
+    world = "".join(f"{lat},{lon},{d.date()},1015,80,9.5,320,NOAA-20,VIIRS\n"
+                    for d in days for lat in (-70, -20, 20, 70) for lon in (-160, -60, 60, 160))
+    state = "".join(f"{34 + i % 6},{ -124 + i % 8},{d.date()},1015,80,9.5,320,NOAA-20,VIIRS\n"
+                    for d in days for i in range(16))
+    global_path.write_text(header + world, encoding="utf-8")
+    regional_path.write_text(header + state, encoding="utf-8")
+    monkeypatch.setattr(main, "ARCHIVE_ROOTS", [root])
+    by_id = {item["id"]: item for item in client.get("/datasets").json()["items"]}
+    globe = by_id[global_path.relative_to(root).as_posix()]["coverage"]
+    state_cov = by_id[regional_path.relative_to(root).as_posix()]["coverage"]
+    assert globe["thin_years"] == []
+    assert state_cov["thin_years"] == [2024]
+    year = state_cov["years"][0]
+    assert year["thin"] is True and year["area_fraction"] < 0.25
+    assert year["lat"][0] >= 33 and year["lat"][1] <= 40
+    assert year["cells"] < globe["years"][0]["cells"]
+    assert "regional window: 2024" in state_cov["note"]
+
+
+def test_coverage_is_cached_beside_the_archives(monkeypatch, archive_root):
+    """The sample cost is paid once per file, keyed by size and mtime -- not per page load."""
+    client.get("/datasets")
+    cache = archive_root / archives.COVERAGE_CACHE
+    assert cache.is_file() and NRT_ID in json.loads(cache.read_text())["files"]
+
+    def boom(path):
+        raise AssertionError("coverage was resampled instead of read from the cache")
+
+    monkeypatch.setattr(archives, "file_coverage", boom)
+    items = client.get("/datasets").json()["items"]      # every entry is a cache hit
+    assert all("years" in item["coverage"] for item in items)
+
+
+def test_an_unsampleable_file_says_so_without_failing_the_listing(monkeypatch, tmp_path):
+    """One unreadable CSV must not cost the picker its inventory."""
+    root = tmp_path / ".data" / "DL_FIRE_M-C61_814283"
+    root.mkdir(parents=True)
+    (root / "fire_nrt_M-C61_814283.csv").write_text("a,b,c\n1,2,3\n", encoding="utf-8")
+    monkeypatch.setattr(main, "ARCHIVE_ROOTS", [tmp_path / ".data"])
+    r = client.get("/datasets")
+    assert r.status_code == 200
+    entry = r.json()["items"][0]
+    assert "missing required columns" in entry["coverage"]["unavailable"]
+    assert entry["coverage"]["thin_years"] == []
+
+
 def test_no_archives_is_an_empty_list(monkeypatch, tmp_path):
     """The normal case in CI, on a fresh clone and in the container: nothing to offer, not an
     error, and the console falls back to uploads."""

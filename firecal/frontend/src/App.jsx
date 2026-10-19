@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState, Suspense, lazy } from "react";
-import { api, errMsg, ramp, fmt, fmtBytes, invalidateApiCache, SLOW_LINK } from "./lib";
+import { api, errMsg, ramp, fmt, fmtBytes, invalidateApiCache, SLOW_LINK, coverageLine, coverageWarn, yearsRange } from "./lib";
 import { HeroStats, LivePanel, BriefingPanel } from "./panels";
 
 // Code-split the heavy optional pieces so a low-end machine can paint the console
@@ -20,8 +20,7 @@ const DiagnosticPanel = lazy(() => import("./charts").then(m => ({ default: m.Di
 const AnomalyPanel = lazy(() => import("./charts").then(m => ({ default: m.AnomalyPanel })));
 const ForecastChart = lazy(() => import("./ForecastChart"));
 
-/**
- * Keeps a single failing tab from taking the entire mission console down with it:
+/** Keeps a single failing tab from taking the entire mission console down with it:
  * a render error in one lazy chart shows an inline message instead of a blank page.
  */
 class PanelBoundary extends React.Component {
@@ -38,7 +37,7 @@ class PanelBoundary extends React.Component {
   }
 }
 
-function Heatmap({ data, onPick, focus, year }) {
+function Heatmap({ data, onPick, focus, year, month }) {
   const years = useMemo(() => {
     // A loop, not `Math.max(1, ...data.map(...))`: spreading one argument per day overflows the
     // call stack on a long enough record -- an upload spanning a couple of centuries is ~73,000
@@ -49,10 +48,12 @@ function Heatmap({ data, onPick, focus, year }) {
     data.forEach(d => { const y = d.date.slice(0, 4); (by[y] ||= []).push({ ...d, lvl: d.count <= 0 ? 0 : Math.min(5, 1 + Math.floor(Math.sqrt(d.count / max) * 4.99)) }); });
     return by;
   }, [data]);
-  if (year && year !== "all" && years[year]) return <YearView year={year} days={years[year]} onPick={onPick} focus={focus} />;
+  if (year && year !== "all" && years[year])
+    return <YearView year={year} days={years[year]} onPick={onPick} focus={focus} month={month} />;
   return <div className="scroll">{Object.entries(years).map(([y, days]) => {
     const off = new Date(y + "-01-01").getUTCDay();
-    return <div key={y} style={{ display: "flex", gap: 10, marginBottom: 6, alignItems: "center" }}>          <b style={{ width: 34 }} className="mut">{y}</b>
+    return <div key={y} style={{ display: "flex", gap: 10, marginBottom: 6, alignItems: "center" }}>
+      <b style={{ width: 34 }} className="mut">{y}</b>
       <svg width={Math.ceil((days.length + off) / 7) * 12 + 2} height={7 * 12}>
         {days.map((d, i) => { const k = i + off; return <rect key={d.date} x={Math.floor(k / 7) * 12} y={(k % 7) * 12} width="10" height="10" rx="2"
           fill={ramp[d.lvl]} stroke={d.date === focus ? "#7fd1c8" : "none"} onClick={() => onPick(d.date)}><title>{d.date}: {d.count} (raw {d.raw})</title></rect>; })}
@@ -62,13 +63,19 @@ function Heatmap({ data, onPick, focus, year }) {
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-function YearView({ year, days, onPick, focus }) {
+function YearView({ year, days, onPick, focus, month }) {
   const size = 15, pitch = 17, labelW = 24, top = 16;
-  const max = days.reduce((m, d) => (d.count > m ? d.count : m), 1);
-  const off = new Date(Date.UTC(+year, 0, 1)).getUTCDay();
-  const cells = days.map(d => {
-    const doy = Math.round((Date.parse(d.date + "T00:00:00Z") - Date.UTC(+year, 0, 1)) / 864e5);
-    const k = doy + off;
+  // A month filter shows just that month, laid out from its own first weekday instead of the
+  // year's — the same component, one month wide. `month` is the calendar `monthSel` that the
+  // anomaly chart sets, so "filter the calendar to March" is a real filter, not a highlight.
+  const shown = month ? days.filter(d => +d.date.slice(5, 7) === month) : days;
+  if (!shown.length) return <span className="hint">No calendar days in {MONTHS[month - 1]} {year} for this selection.</span>;
+  const max = shown.reduce((m, d) => (d.count > m ? d.count : m), 1);
+  const off = month ? new Date(Date.UTC(+year, month - 1, 1)).getUTCDay() : new Date(Date.UTC(+year, 0, 1)).getUTCDay();
+  const cells = shown.map(d => {
+    const idx = month ? +d.date.slice(8, 10) - 1
+      : Math.round((Date.parse(d.date + "T00:00:00Z") - Date.UTC(+year, 0, 1)) / 864e5);
+    const k = idx + off;
     return { ...d, x: labelW + Math.floor(k / 7) * pitch, y: top + (k % 7) * pitch,
              lvl: d.count <= 0 ? 0 : Math.min(5, 1 + Math.floor(Math.sqrt(d.count / max) * 4.99)) };
   });
@@ -76,19 +83,20 @@ function YearView({ year, days, onPick, focus }) {
   const W = labelW + weeks * pitch + 6, H = top + 7 * pitch + 20;
   const mlabels = [];
   let lastCol = -1;
-  for (let m = 0; m < 12; m++) {
-    const col = Math.floor((Math.round((Date.UTC(+year, m, 1) - Date.UTC(+year, 0, 1)) / 864e5) + off) / 7);
+  for (let m = month ? month - 1 : 0; m < (month || 12); m++) {
+    const col = month ? 0
+      : Math.floor((Math.round((Date.UTC(+year, m, 1) - Date.UTC(+year, 0, 1)) / 864e5) + off) / 7);
     if (col > lastCol) { mlabels.push({ m, col }); lastCol = col; }
   }
-  const total = days.reduce((s, d) => s + d.count, 0);
-  const peak = days.reduce((a, b) => (b.count > a.count ? b : a), days[0]);
-  const active = days.filter(d => d.count > 0).length;
+  const total = shown.reduce((s, d) => s + d.count, 0);
+  const peak = shown.reduce((a, b) => (b.count > a.count ? b : a), shown[0]);
+  const active = shown.filter(d => d.count > 0).length;
   const fmd = t => new Date(t + "T00:00:00Z").toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
   return <>
     <div className="mut" style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center", marginBottom: 10, fontSize: 12 }}>
-      <span><b style={{ color: "var(--acc2)", fontSize: 14 }}>{year}</b> · {fmt(total)} detections</span>
+      <span><b style={{ color: "var(--acc2)", fontSize: 14 }}>{month ? `${MONTHS[month - 1]} ${year}` : year}</b> · {fmt(total)} detections</span>
       <span>peak <b style={{ color: "var(--acc)" }}>{fmd(peak.date)}</b> ({peak.count})</span>
-      <span>{active}/{days.length} active days</span>
+      <span>{active}/{shown.length} active days</span>
       <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 3 }}>
         less {ramp.map((c, i) => <i key={i} style={{ width: 10, height: 10, background: c, borderRadius: 2, display: "inline-block" }} />)} more
       </span>
@@ -96,7 +104,7 @@ function YearView({ year, days, onPick, focus }) {
     <div className="scroll">
       <svg width={W} height={H}>
         {mlabels.map(l => <text key={l.m} x={labelW + l.col * pitch} y={11} fontSize={9} fill="#7b8c92" style={{ letterSpacing: 1 }}>{MONTHS[l.m].toUpperCase()}</text>)}
-        {["M", "W", "F"].map((w, i) => <text key={w} x={4} y={top + (i * 2 + 1) * pitch + 11} fontSize={8} fill="#7b8c92">{w}</text>)}
+        {[ "M", "W", "F" ].map((w, i) => <text key={w} x={4} y={top + (i * 2 + 1) * pitch + 11} fontSize={8} fill="#7b8c92">{w}</text>)}
         {cells.map(d => <rect key={d.date} x={d.x} y={d.y} width={size} height={size} rx={2} fill={ramp[d.lvl]}
           stroke={d.date === focus ? "#7fd1c8" : "none"} strokeWidth={2} style={{ cursor: "pointer" }} onClick={() => onPick(d.date)}>
           <title>{d.date}: {d.count} (raw {d.raw} · FRP {d.frp})</title></rect>)}
@@ -131,9 +139,79 @@ function describeUpload(m) {
 }
 
 export default function App() {
+  // ----------------------------------------------------- URL PARAMETER HANDLING ----------------
+  // Read URL query params on mount so the console can be restored from a shared link.
+  // We decode the most important state: bbox, monthSel/day, yearSel, and dataKey.
+  // The URL format is: /?bbox=minlat,minlon,maxlat,maxlon&day=YYYY-MM-dd&month=MM&year=YYYY&dataKey=N
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const bboxStr = params.get("bbox");
+    const dayStr = params.get("day");
+    const monthStr = params.get("month");
+    const yearStr = params.get("year");
+    const dataKeyStr = params.get("dataKey");
+
+    if (bboxStr) {
+      const [minlat, minlon, maxlat, maxlon] = bboxStr.split(",").map(parseFloat);
+      if (!isNaN(minlat) && !isNaN(minlon) && !isNaN(maxlat) && !isNaN(maxlon)) {
+        setBbox([minlat, minlon, maxlat, maxlon]);
+      }
+    }
+
+    if (dayStr) {
+      setDay(dayStr);
+    }
+
+    if (monthStr) {
+      const [month, year] = monthStr.split("-");
+      if (month && year) {
+        setMonthSel({ month: Number(month), year: Number(year) });
+        setYearSel(String(year));
+      }
+    }
+
+    if (yearStr) {
+      setYearSel(yearStr);
+    }
+
+    if (dataKeyStr !== null) {
+      setDataKey(Number(dataKeyStr));
+    }
+  }, []); // <-- run once on mount only
+
+  // Update the URL bar whenever state changes that should be shareable.
+  // We use a debounced approach: only update when the value is "stable" (not mid-transition).
+  useEffect(() => {
+    const params = new URLSearchParams();
+    const bb = bbox?.join(",");
+    if (bb) params.set("bbox", bb);
+    if (day) params.set("day", day);
+    if (monthSel) {
+      params.set("month", `${monthSel.month}-${monthSel.year}`);
+    } else {
+      params.delete("month");
+    }
+    if (yearSel) params.set("year", yearSel);
+    if (dataKey !== 0) params.set("dataKey", String(dataKey));
+    else params.delete("dataKey");
+
+    const newSearch = params.toString();
+    // Only update if the search params changed (avoid infinite loops on initial mount)
+    if (newSearch !== window.location.search) {
+      const newUrl = window.location.pathname + (newSearch ? "?" + newSearch : "");
+      history.replaceState({ ...window.history.state, sharedUrl: true }, document.title, newUrl);
+    }
+  }, [bbox, day, monthSel, yearSel, dataKey]); // re-run when any shareable state changes
+
+  // ----------------------------------------------------- END URL PARAMETER HANDLING -------
+
   const [meta, setMeta] = useState({ n: 0 }), [bbox, setBbox] = useState(null), [pick, setPick] = useState(false);
   const [cal, setCal] = useState([]), [pts, setPts] = useState([]), [cl, setCl] = useState([]), [an, setAn] = useState(null), [fc, setFc] = useState(null);
   const [day, setDay] = useState(null), [span, setSpan] = useState(1), [busy, setBusy] = useState(false), [err, setErr] = useState(null);
+  // A month picked from the Anomalies chart ({year, month}), or null. It is a filter on the
+  // range the map and the rail read, kept separate from `day` so the calendar can say "March"
+  // instead of "the 1st", and so a 31-day span can be told apart from a hand-set one.
+  const [monthSel, setMonthSel] = useState(null);
   const [live, setLive] = useState(null), [diagKey, setDiagKey] = useState(0), [yearSel, setYearSel] = useState("all");
   // What the last upload said about each file (accepted/rejected + why): a fact about that
   // response, so it lives in component state and is dropped by the next dataset change --
@@ -169,7 +247,7 @@ export default function App() {
 
   function gotoRegion(key) {
     const region = regions.find(r => r.key === key);
-    setDay(null); setPick(false);                            // the day cursor belongs to the old AOI
+    setDay(null); setMonthSel(null); setPick(false);          // the cursor belongs to the old AOI
     if (!region) {                                           // "Fly to…" / Clear: back to the global view
       setPresetKey(null); setBbox(null);
       setFly({ center: [0, 0], nonce: ++flyNonce.current });
@@ -187,18 +265,19 @@ export default function App() {
     setFc(null); api("/forecast", { bbox: bb }).then(setFc).catch(() => setFc(null));
     setYearSel("all");
     setDiagKey(k => k + 1);
+    setDiagKey(k => k + 1);
   }, [meta.n, dataKey, bb]);
   // Open one of the real FIRMS archives this machine holds. The backend reads a bounded slice
   // of the file and reports what it read, so the console can say how much of the archive is on
   // screen rather than implying it holds all of it.
   async function loadArchive(datasetId) {
     if (!datasetId) return;
-    setBusy(true); setDay(null); setErr(null);
+    setBusy(true); setDay(null); setMonthSel(null); setErr(null);
     try {
       // MERGE_ALL is not an id: it asks the API to read every archive at once into one record,
       // split by size (the API's default budget for a merge is the store's whole row cap).
       const query = datasetId === MERGE_ALL ? "all=true" : "id=" + encodeURIComponent(datasetId);
-      const r = await fetch("/api/datasets/load?" + query, { method: "POST" });
+      const r = await fetch("/api/datasets/load? " + query, { method: "POST" });
       if (!r.ok) throw new Error(await errMsg(r));
       datasetChanged(await r.json());
     } catch (e) {
@@ -211,17 +290,37 @@ export default function App() {
   // memoized queries are dropped and the panels refetch against the new record.
   function datasetChanged(m) {
     setUploadNote(null);
-    setMeta(m); invalidateApiCache(); setDay(null); setDataKey(k => k + 1); setDiagKey(k => k + 1);
+    setMeta(m); invalidateApiCache(); setDay(null); setMonthSel(null); setDataKey(k => k + 1); setDiagKey(k => k + 1);
   }
   const end = day && new Date(new Date(day).getTime() + (span - 1) * 864e5).toISOString().slice(0, 10);
+  // A month is the same range the console already filters the map by: the 1st to the last day,
+  // so /points, /clusters and the map readout follow a month without a second code path.
+  const monthStart = monthSel ? `${monthSel.year}-${String(monthSel.month).padStart(2, "0")}-01` : null;
+  // Date.UTC's day 0 is the last day of the *previous* month, so month N's last day is N, 0.
+  const monthEnd = monthSel
+    ? new Date(Date.UTC(monthSel.year, monthSel.month, 0)).toISOString().slice(0, 10) : null;
+  const rangeStart = monthStart || day, rangeEnd = monthEnd || end;
+  const rangeSpan = monthSel ? Number(monthEnd.slice(8, 10)) : span;
+  const monthLabel = monthSel ? `${MONTHS[monthSel.month - 1]} ${monthSel.year}` : null;
+  // The month prefix the rail's list filters on; derived once so the list and its label agree.
+  const monthPrefix = monthSel ? `${monthSel.year}-${String(monthSel.month).padStart(2, "0")}` : null;
   useEffect(() => {
-    if (!day) return;
+    if (!rangeStart) return;
     let dead = false;
-    Promise.all([api("/points", { bbox: bb, start: day, end }), api("/clusters", { bbox: bb, start: day, end })])
+    Promise.all([api("/points", { bbox: bb, start: rangeStart, end: rangeEnd }),
+                 api("/clusters", { bbox: bb, start: rangeStart, end: rangeEnd })])
       .then(([p, c]) => { if (!dead) { setPts(p); setCl(c); } })
-      .catch(() => { if (dead) return; setErr("Could not load map data for that day."); });
+      .catch(() => { if (dead) return; setErr("Could not load map data for that range."); });
     return () => { dead = true; };
-  }, [day, span, bb]);
+  }, [rangeStart, rangeEnd, bb]);
+  // A month picked from the anomaly chart is a filter, not a cursor: it sets the map's range,
+  // switches the calendar to that year (which then draws just the month) and narrows the rail's
+  // list. Clicking the same bar again clears it, as does picking a day or changing the AOI.
+  function pickMonth(m) {
+    if (!m) { setMonthSel(null); return; }
+    setMonthSel(prev => (prev && prev.year === m.year && prev.month === m.month ? null : m));
+    setYearSel(String(m.year));
+  }
 
   async function upload(e) {
     if (!e.target.files.length) return;
@@ -237,6 +336,9 @@ export default function App() {
   // calibrated; the prior path has none, so the band is whatever the payload actually holds.
   // Each row also names the method that drew it, and the two are kept as separate keys so the
   // chart can show where the archive model's run ends and the seasonal prior takes over.
+  // The rail's anomaly list follows the month filter; without one it is the whole AOI's list.
+  const railAnoms = monthPrefix ? (an?.anomalies || []).filter(a => a.date.startsWith(monthPrefix))
+    : (an?.anomalies || []);
   const series = useMemo(() => cal.slice(-365).map(d => ({ date: d.date, actual: d.count })).concat((fc?.forecast || []).map(d => ({
     date: d.date,
     ...(d.method === "prior" ? { prior: d.count } : { forecast: d.count }),
@@ -267,7 +369,9 @@ export default function App() {
         {archives.length > 1 && <option value={MERGE_ALL}>
           All {archives.length} archives merged — every sensor, every year
         </option>}
-        {archives.map(a => <option key={a.id} value={a.id}>{a.label} — {fmtBytes(a.bytes)}</option>)}
+        {archives.map(a => <option key={a.id} value={a.id}>
+          {a.label} — {fmtBytes(a.bytes)}{coverageWarn(a.coverage) ? ` · ⚠ ${coverageWarn(a.coverage)}` : ""}
+        </option>)}
       </select>}
       {regions.length > 0 && <select value={preset?.key || ""} onChange={e => gotoRegion(e.target.value)}
         title="Fly the map to a curated fire region">
@@ -275,7 +379,7 @@ export default function App() {
         {regions.map(r => <option key={r.key} value={r.key}>{r.name}</option>)}
       </select>}
       <button className={"btn" + (pick ? " on" : "")} onClick={() => setPick(!pick)}>{pick ? "Pick 2 corners…" : "Select area"}</button>
-      {bbox && <button className="btn" onClick={() => gotoRegion("")}>Clear</button>}
+      {bbox && <button className="btn" onClick={() => gotoRegion("")}>Clear</button>
     </header>
 
     {err && <div className="banner">⚠ {err}</div>}
@@ -289,25 +393,47 @@ export default function App() {
           <div className="hint" style={{ marginBottom: 8 }}>
             Found {archives.length} FIRMS archive{archives.length === 1 ? "" : "s"} on this machine. Opening one reads a
             bounded slice of it — a few hundred thousand detections spread across the whole file, so the calendar keeps its
-            span — and the console reports what it read.
+            span — and the console reports what it read. Each line underneath says which years and how much ground the
+            window holds, sampled from the file (a ⚠ marks a year that covers a fraction of the ground the others do).
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             {archives.length > 1 && <button className="btn primary" onClick={() => loadArchive(MERGE_ALL)} disabled={busy}
               title="Read a bounded slice of every archive into one record — all sensors, all years">
               Merge all {archives.length} archives — every sensor, every year
             </button>}
-            {archives.map(a => <button key={a.id} className="btn" onClick={() => loadArchive(a.id)} disabled={busy}
-              title={a.name}>{a.label} — {fmtBytes(a.bytes)}</button>)}
           </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 9, marginTop: 9 }}>
+            {archives.map(a => {
+              const warn = coverageWarn(a.coverage);
+              return <div key={a.id}>
+                <button className="btn" onClick={() => loadArchive(a.id)} disabled={busy}
+                  title={a.name}>{a.label} — {fmtBytes(a.bytes)}</button>
+                <div style={{ fontSize: 11, color: "var(--mut)", marginTop: 2 }}>{coverageLine(a.coverage)}</div>
+                {warn && <div style={{ fontSize: 11, color: "var(--bad)" }}>⚠ {warn}</div>
+              </div>;
+            })}
+          </div>
+          {(() => {
+            // The lesson the merge needs to say out loud: a regional window beside global
+            // years is not a year of the planet, and averaging the two is how a climatology
+            // ends up wrong.
+            const thin = archives.filter(a => a.coverage?.thin_years?.length);
+            if (!thin.length) return null;
+            const years = [...new Set(thin.flatMap(a => a.coverage.thin_years))].sort();
+            return <div className="hint" style={{ marginTop: 8, color: "var(--bad)" }}>
+              ⚠ {thin.length} of {archives.length} exports cover a fraction of the inventory's ground
+              ({yearsRange(years)}). Merging them puts a regional window in the same record as the global years.
+            </div>;
+          })()}
         </> : <div className="hint">
           No local archives found. Put FIRMS exports in <code>.data/</code> (the directory <code>train.py</code> reads), or upload CSVs below.
-        </div>}
+        </div>
       <div className="hint" style={{ marginTop: 10 }}>
         Upload NASA FIRMS archive CSVs (MODIS C6.1 / VIIRS S-NPP + NOAA-20/21). Confidence scales unified, low-confidence drops,
         per-sensor rescaling over the overlap period, ESFP footprint normalization.
       </div>
-    </div> :
-    <>
+    </div> : <>
+
       <div className="deck">
         {/* ------- left rail: telemetry ------- */}
         <div className="rail">
@@ -343,12 +469,19 @@ export default function App() {
                     // its slice against the merge's own budget -- the aggregate rows above hide
                     // how uneven a size-weighted split actually is.
                     const share = meta.load.rows_read ? Math.round(100 * f.rows_read / meta.load.rows_read) : 0;
+                    // The same coverage line the picker showed before opening: what each export
+                    // contributes is only half the story if one of them is a regional window,
+                    // and a merged record does not say so anywhere else.
+                    const cov = archives?.find(a => a.name === f.file)?.coverage;
+                    const warn = coverageWarn(cov);
                     return <div key={f.file} style={{ padding: "5px 0", borderTop: i ? "1px solid var(--sh-lite)" : "none" }}
                       title={`spread: ${f.spread ? "yes" : "no"}`}>
                       <div style={{ fontSize: 12, overflowWrap: "anywhere" }}><b>{f.file}</b></div>
                       <div style={{ fontSize: 11, color: "var(--mut)", overflowWrap: "anywhere" }}>
                         {f.sensor} · {f.kind}{f.mb >= 1 ? ` · ${f.mb} MB` : ""} — {fmt(f.rows_read)} of ~{fmt(f.rows_estimate)} rows · {share}% of the slice
                       </div>
+                      {coverageLine(cov) && <div style={{ fontSize: 11, color: "var(--mut)" }}>{coverageLine(cov)}</div>}
+                      {warn && <div style={{ fontSize: 11, color: "var(--bad)" }}>⚠ {warn}</div>
                     </div>;
                   })}
                   {skipped.map(f => <div key={f.file} style={{ padding: "5px 0", borderTop: "1px solid var(--sh-lite)" }}>
@@ -360,11 +493,12 @@ export default function App() {
                 </div>
               </details>;
             })()}
-          </div>}
+          </div>
           <div className="panel">
             <h3>Selection</h3>
             <div className="kv"><span className="mut">AOI</span><b>{bbox ? `${bbox[0].toFixed(2)}, ${bbox[1].toFixed(2)} → ${bbox[2].toFixed(2)}, ${bbox[3].toFixed(2)}` : "global"}</b></div>
-            <div className="kv"><span className="mut">Cursor day</span><b>{day || "—"}</b>{span > 1 && <b>→ {end}</b>}</div>
+            <div className="kv"><span className="mut">{monthSel ? "Month" : "Cursor day"}</span>
+              <b>{monthSel ? monthLabel : (day || "—")}</b>{!monthSel && span > 1 && <b> → {end}</b>}</div>
             {preset && <>
               <div className="kv"><span className="mut">Region</span><b>{preset.name} · {preset.subtitle}</b></div>
               <div className="kv"><span className="mut">Fuel</span><b>{preset.biome}</b></div>
@@ -372,13 +506,14 @@ export default function App() {
               <div className="kv"><span className="mut">Noted fires</span><b>{preset.events.map(ev => `${ev.year} ${ev.note}`).join(" · ")}</b></div>
             </>}
             <div style={{ display: "flex", gap: 4, marginTop: 8 }}>
-              {[1, 3, 7, 14].map(n => <button key={n} className={"btn sm" + (span === n ? " on" : "")} onClick={() => setSpan(n)}>{n}d</button>)}
+              {[1, 3, 7, 14].map(n => <button key={n} className={"btn sm" + (!monthSel && span === n ? " on" : "")}
+                onClick={() => { setSpan(n); setMonthSel(null); }}>{n}d</button>)}
             </div>
             {bbox && !cal.length && <div className="hint" style={{ marginTop: 9 }}>
               No detections in this AOI — the open archive may not cover it.
               <button className="btn sm" style={{ marginTop: 6, width: "100%" }}
                 onClick={() => gotoRegion("")}>Clear area</button>
-            </div>}
+            </div>
           </div>
           <div className="panel">
             <h3>Clustering <span className="mut">DBSCAN</span></h3>
@@ -398,12 +533,12 @@ export default function App() {
               live={live}
               bbox={bbox}
               picking={pick}
-              onSelectBounds={bounds => { setBbox(bounds); setPick(false); }}
+              onSelectBounds={bounds => { setBbox(bounds); setMonthSel(null); setPick(false); }}
               tiles={tiles}
               onTilesChange={setTiles}
-              day={day}
-              span={span}
-              end={end}
+              day={rangeStart}
+              span={rangeSpan}
+              end={rangeEnd}
               fly={fly}
             />
           </Suspense>
@@ -414,12 +549,18 @@ export default function App() {
           <BriefingPanel bbox={bb} onPickDay={setDay} refreshKey={diagKey} mini />
           <div className="panel">
             <h3>Anomalies <span className="mut">critical periods</span></h3>
-            {!an ? <span className="hint">Analyzing…</span> : an.note ? <span className="hint">{an.note}</span> : <>
+            {!an ? <span className="hint">Analyzing…</span> : an.note ? <span className="hint">{an.note}</span> : <>>
+              {monthSel && <div className="hint" style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 4 }}>
+                Filtered to <b>{monthLabel}</b>
+                <button className="btn sm" onClick={() => pickMonth(null)}>Clear</button>
+              </div>}
               <div className="list" style={{ maxHeight: 180 }}>
-                {an.anomalies.map(a => <div key={a.date} className="row" onClick={() => setDay(a.date)}>
+                {railAnoms.map(a => <div key={a.date} className="row" onClick={() => { setMonthSel(null); setDay(a.date); }}>
                   <span>{a.date}</span><span className="mut">{a.count} vs {a.expected} · z={a.z}</span>
                 </div>)}
-                {!an.anomalies.length && <span className="hint">No anomalous days at this threshold.</span>}
+                {!railAnoms.length && <span className="hint">
+                  {monthSel ? `No anomalous days in ${monthLabel} at this threshold.` : "No anomalous days at this threshold."}
+                </span>}
               </div>
               <div className="hint" style={{ marginTop: 6 }}>
                 {/* The API reports months as 1-12; spell them or the line reads "3" instead of "Mar". */}
@@ -429,7 +570,8 @@ export default function App() {
                   and chart code stays out of the shell -- so this opens the tab that owns it. */}
               {an.monthly?.length > 0 && <button className="btn sm" style={{ marginTop: 6 }}
                 onClick={() => setTab("anomalies")}>Monthly chart</button>}
-            </>}
+            </>
+            </h3>}
           </div>
         </div>
 
@@ -438,29 +580,31 @@ export default function App() {
           <div className="tabs">
             {DRAWER_TABS.map(t => <button key={t.id} role="tab" aria-selected={tab === t.id}
               className={"tab" + (tab === t.id ? " on" : "")} onClick={() => setTab(t.id)}
-              onMouseEnter={() => t.prefetch?.()} onFocus={() => t.prefetch?.()}>
-              {t.label}
-            </button>)}
+              onMouseEnter={() => t.prefetch?.()} onFocus={() => t.prefetch?.()}>\n              {t.label}\n            </button>)}
             {tab === "calendar" && <span className="tools" style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
               <span className="hint">Year</span>
-              <select value={yearSel} onChange={e => setYearSel(e.target.value)}>
+              <select value={yearSel} onChange={e => { setYearSel(e.target.value); setMonthSel(null); }}>
                 <option value="all">All years</option>
                 {[...new Set(cal.map(d => d.date.slice(0, 4)))].reverse().map(y => <option key={y} value={y}>{y}</option>)}
               </select>
             </span>}
           </div>
-          {tab === "calendar" && <PanelBoundary name="calendar" resetKey={tab}><Heatmap data={cal} onPick={setDay} focus={day} year={yearSel} /></PanelBoundary>}
+          {tab === "calendar" && <PanelBoundary name="calendar" resetKey={tab}>
+            <Heatmap data={cal} onPick={d => { setMonthSel(null); setDay(d); }}
+              focus={monthSel ? null : day} year={yearSel} month={monthSel?.month ?? null} />
+          </PanelBoundary>}
           {tab === "forecast" && <PanelBoundary name="forecast" resetKey={tab}><Suspense fallback={<span className="hint">Loading chart…</span>}>
-            <ForecastChart series={series} model={fc?.model} coverage={fc?.coverage} />
+            <ForecastChart series={series} model={fc?.model} coverage={fc?.coverage} checkpoint={fc?.checkpoint} model_reason={fc?.model_reason} monthSel={monthSel} />
           </Suspense></PanelBoundary>}
           {tab === "climatology" && <PanelBoundary name="climatology" resetKey={tab}><Suspense fallback={<span className="hint">Loading chart…</span>}>
-            <ClimatologyPanel bbox={bb} refreshKey={diagKey} embedded />
+            <ClimatologyPanel bbox={bb} refreshKey={diagKey} monthSel={monthSel} embedded />
           </Suspense></PanelBoundary>}
           {tab === "diagnostic" && <PanelBoundary name="diagnostic" resetKey={tab}><Suspense fallback={<span className="hint">Loading chart…</span>}>
             <DiagnosticPanel bbox={bb} refreshKey={diagKey} embedded />
           </Suspense></PanelBoundary>}
           {tab === "anomalies" && <PanelBoundary name="anomalies" resetKey={tab}><Suspense fallback={<span className="hint">Loading chart…</span>}>
-            <AnomalyPanel bbox={bb} refreshKey={diagKey} embedded />
+            <AnomalyPanel bbox={bb} refreshKey={diagKey} embedded
+              selected={monthSel} onPickMonth={pickMonth} />
           </Suspense></PanelBoundary>}
           {tab === "briefing" && <BriefingPanel bbox={bb} onPickDay={setDay} refreshKey={diagKey} detail />}
         </div>
@@ -468,6 +612,6 @@ export default function App() {
         <LivePanel onLoaded={setLive} wide bbox={bb} region={preset?.key} onDatasetChanged={datasetChanged}
           liveRegions={meta.live_regions} />
       </div>
-    </>}
+    </>
   </>;
 }

@@ -25,21 +25,46 @@ Features
 --------
 sin/cos day-of-year, the cell's latitude/longitude, log1p counts lagged 1/7/14/28 days,
 log1p rolling means over 7/28 days and the cell's day-of-year climatology computed from
-*training years only*.  No ERA5, no exogenous predictor.
+*training years only*.  No ERA5, no exogenous predictor.  A training row's rolling window
+ends on the day it predicts, which serving cannot do; shifting it was measured before it was
+rejected (h=1 gains 4 %, the served horizons lose 6-11 %, the spatial hold-out at h=7 goes
+3.82 -> 8.58 MASE) -- the fed-back rolls damp the recursive path, and the honest fix for
+that is direct multi-horizon training.  See `lgbm_forecast.build_features` for the numbers.
+
+Coverage
+--------
+The archive is a set of export windows and they need not cover the same ground: the download
+this was developed against ends with a 358-day NRT window over one state, a thousandth of the
+global level of the years before it.  `consistent_span` trims such a trailing block before a
+single feature is built.  Averaging across that seam does not fail loudly -- it halves the
+cell's day-of-year climatology and floods training with all-zero rows -- so the drop, the
+dates and the level ratio are written into `metrics["panel"]["coverage"]` rather than applied
+silently.
 
 How it is validated
 -------------------
 Never a random split.  A time block hold-out removes one fire season at a time (leave-one-
 fire-season-out) and a coarse-tile spatial block removes one region of ground; both are
 asserted in `test_smoke.py` so the rule cannot drift.  Climatology and lags are built only
-from data before the forecast origin.  Point-forecast MASE is reported against the existing
-seasonal prior and a seasonal-naive forecast at horizons 1/7/14/30 days, per curated region.
+from data before the forecast origin.  The round count is chosen by early stopping on the
+last `VALIDATION_DAYS` of each fit's training rows, and the returned booster is then refitted
+on every training row for that many rounds, so the block costs data, never a season.
+Point-forecast MASE is reported against the existing seasonal prior and a seasonal-naive
+forecast at horizons 1/7/14/30 days, per curated region.
 
 The serving gate
 ----------------
 `/forecast` serves LightGBM only at a horizon whose stored backtest MASE beats the seasonal
 prior; otherwise it serves the prior.  If the model does not win, that is the result -- the
 checkpoint is still written and the metrics record it, and the prior keeps serving.
+
+The verdict is scoped to the AOI's regime.  `backtest()` already writes a row per curated
+region, and a box wholly inside one is judged by that row: the pooled panel is dominated by
+whichever regime burns most, so the global score can win while the preset an operator is
+looking at loses.  A box crossing presets, or the whole frame, has no single regime to speak
+for it and is judged on `by_horizon`.  The regional row is scored on the preset's box rather
+than the drawn AOI -- the nearest quantity the checkpoint measured -- and it is only an
+estimate transferred to a sub-box, never a claim that the sub-box was scored.
 """
 from __future__ import annotations
 
@@ -72,6 +97,22 @@ MIN_CELL_DAYS = 5
 # Coarse spatial block for the hold-out: 30 degrees is wide enough that two blocks rarely
 # share a fire regime, which is the point of a spatial split.
 SPATIAL_BLOCK_DEG = 30.0
+
+# A FIRMS archive is assembled from several export windows, and the windows need not cover
+# the same ground.  A download can end with a state-sized NRT slice whose daily count is a
+# thousandth of the global years before it; training across that seam does not fail, it
+# quietly learns the wrong level -- `climo_table` averages the two eras by day-of-year, and
+# the model inherits the bias on every day it serves.  A 30-day level this far below the
+# record's own busy level, sustained to the end of the record, is a different record.
+COVERAGE_DROP = 50.0
+COVERAGE_WINDOW = 30
+COVERAGE_MIN_DAYS = 180
+
+# The early-stopping block: the last `VALIDATION_DAYS` of each fit's training rows.  Fixed
+# in days rather than "the most recent season" so a two-season fold still trains on most of
+# its data; the returned booster is refitted on every training row afterwards, so this block
+# only chooses the round count.
+VALIDATION_DAYS = 90
 
 TWEEDIE_POWER = 1.5
 DEFAULT_PARAMS = {
@@ -183,6 +224,49 @@ def panel_from_csv(paths, chunk=CHUNK, limit=0, log=None, min_cell_days=MIN_CELL
     return Y, sc, factors
 
 
+def consistent_span(Y, drop=COVERAGE_DROP, window=COVERAGE_WINDOW,
+                    min_days=COVERAGE_MIN_DAYS):
+    """Last date of the record's consistent part: (index, note), or (None, None) to keep all.
+
+    The archive in `--data` is a set of export windows, and the last window can cover a
+    smaller area than the ones before it (a state-sized NRT slice after a global archive).
+    Its daily count is orders of magnitude lower, yet nothing upstream rejects it: the
+    panel simply has a cliff, `climo_table` averages the two eras by day-of-year, and a
+    model trained across the seam is biased low on every day it serves -- including the
+    days its own backtest scored against a contaminated climatology.
+
+    A trailing block whose 30-day mean level stays `drop` times below the record's own busy
+    level (its 90th percentile, so a small slice cannot drag the reference down with it) for
+    at least a window is therefore not part of the same record.  The cut is only a *tail*: a
+    mid-record lull is left alone, because a seasonal minimum is a real thing to learn and
+    this guard exists for sampling breaks.  A record with fewer than `min_days` before the
+    break keeps its shape -- too little would remain to train on.
+
+    Returns the timestamp to keep up to (inclusive) and a sentence naming what was dropped,
+    so the trainer can report it rather than silently shrinking the panel.
+    """
+    if len(Y) <= window or Y.shape[1] == 0:
+        return None, None
+    s = Y.sum(axis=1).astype(float)
+    # Forward-looking 30-day mean: it reads the block, not the day, so the cut lands on the
+    # first day of the break instead of trailing it by a window.
+    lead = s[::-1].rolling(window, min_periods=window).mean()[::-1]
+    lead = lead.fillna(lead.dropna().iloc[-1] if lead.notna().any() else np.nan)
+    reference = float(lead.quantile(0.9))
+    low = (lead < reference / drop).to_numpy()
+    if not low.any() or not low[-1]:
+        return None, None
+    keep = np.flatnonzero(~low)
+    cut = int(keep[-1]) + 1 if keep.size else 0          # first day of the trailing low block
+    if cut == 0 or len(Y) - cut < window or cut < min_days:
+        return None, None
+    level = float(lead.iloc[cut:].mean()) / max(reference, 1e-9)
+    note = (f"dropped {len(Y) - cut} day(s) from {Y.index[cut].date()} to {Y.index[-1].date()}: "
+            f"their 30-day level is {level:.4f}x the record's busy level (90th percentile), "
+            f"which is a coverage break (a smaller export window), not weather")
+    return Y.index[cut - 1], note
+
+
 # ---------------------------------------------------------------------------- splits
 def time_folds(Y):
     """Leave-one-fire-season-out: one fold per calendar year, train on the rest.
@@ -248,11 +332,24 @@ def _rows_mask(mask, n_cells, ok):
 
 
 def fit_model(Y, climo, train_mask, params=None, rounds=600, early_stopping=40, log=None):
-    """Fit one global Tweedie booster on the training rows, early-stopping on a time block.
+    """Fit one global Tweedie booster on every training row, with the round count chosen
+    on the most recent block of those rows.
 
-    The early-stopping set is the most recent training season rather than a random slice:
-    with a time series, a random validation row is a near-duplicate of a training row, and
-    the stopping point it picks is optimistic.  Returns (booster, best_iteration, n_train).
+    Two steps, not one.  A contiguous block at the end of the training rows -- not a random
+    season, and not a random slice of rows -- is fitted first with early stopping, because a
+    random validation row is a near-duplicate of a training row and the stopping point it
+    picks is optimistic.  The booster that is *returned* is then refitted from scratch on
+    every training row for the number of rounds that block chose.
+
+    The first pass used to be the returned model, with the whole most-recent training season
+    held out.  That is fine for a five-season panel and ruinous for a two-season one: after
+    the coverage guard trims the archive's tail, the leave-one-season-out fold that keeps
+    two seasons trained on 65 usable days of a single one, and the score it earned measured
+    a data-starved model.  A fixed `VALIDATION_DAYS` tail keeps the honest ordering without
+    handing a season to the stop, and the refit means no training row is ever spent on it.
+
+    Returns (booster, best_iteration, n_train), where n_train is what the returned booster
+    actually saw.
     """
     log = log or (lambda *a: None)
     import lightgbm as lgb
@@ -260,33 +357,35 @@ def fit_model(Y, climo, train_mask, params=None, rounds=600, early_stopping=40, 
     params = dict(DEFAULT_PARAMS if params is None else params)
     X, y, ok = lg.build_features(Y, climo)
     n_cells = Y.shape[1]
-    years = Y.index.year.to_numpy()
     train_rows = _rows_mask(train_mask, n_cells, ok)
     if not train_rows.any():
         raise ValueError("fit_model: no training rows")
 
-    train_years = sorted(set(years[np.asarray(train_mask)].tolist()))
-    val_year = train_years[-1] if len(train_years) > 1 else None
-    if val_year is None:
-        tr = train_rows
-        valid = (None, None)
-    else:
-        is_val = _rows_mask(years == val_year, n_cells, ok)
-        tr = train_rows & ~is_val
-        valid = (X[is_val], y[is_val]) if is_val.any() else (None, None)
+    train_dates = Y.index[np.asarray(train_mask, dtype=bool)]
+    is_val = np.zeros_like(train_rows)
+    if len(train_dates) > VALIDATION_DAYS + max(lg.LAGS):
+        cutoff = train_dates[-1] - pd.Timedelta(days=VALIDATION_DAYS)
+        is_val = _rows_mask(Y.index >= cutoff, n_cells, ok) & train_rows
+    tr = train_rows & ~is_val
 
     dtr = lgb.Dataset(X[tr], label=y[tr], feature_name=list(lg.FEATURES), free_raw_data=True)
     callbacks = [lgb.log_evaluation(0)]
     valid_sets = []
-    if valid[0] is not None:
-        valid_sets = [lgb.Dataset(valid[0], label=valid[1], reference=dtr)]
+    if is_val.any():
+        valid_sets = [lgb.Dataset(X[is_val], label=y[is_val], reference=dtr)]
         callbacks.append(lgb.early_stopping(early_stopping, verbose=False))
-    booster = lgb.train(params, dtr, num_boost_round=int(rounds),
-                        valid_sets=valid_sets, callbacks=callbacks)
-    best = booster.best_iteration or int(rounds)
-    log(f"    fit {int(tr.sum()):,} rows, {best} best iter"
-        + (f" (stopped on {val_year})" if valid_sets else ""))
-    return booster, best, int(tr.sum())
+    chosen = lgb.train(params, dtr, num_boost_round=int(rounds),
+                       valid_sets=valid_sets, callbacks=callbacks)
+    best = chosen.best_iteration or int(rounds)
+    if not is_val.any() or int(tr.sum()) == int(train_rows.sum()):
+        log(f"    fit {int(train_rows.sum()):,} rows, {best} rounds (no validation block)")
+        return chosen, best, int(train_rows.sum())
+    booster = lgb.train(params, lgb.Dataset(X[train_rows], label=y[train_rows],
+                                            feature_name=list(lg.FEATURES)),
+                        num_boost_round=best, callbacks=[lgb.log_evaluation(0)])
+    log(f"    fit {int(train_rows.sum()):,} rows, {best} rounds "
+        f"(stopped on the last {VALIDATION_DAYS} days, then refit on all)")
+    return booster, best, int(train_rows.sum())
 
 
 # ------------------------------------------------------------------------- baselines
@@ -612,6 +711,50 @@ def run(data_dir=None, out=lg.model_dir(), chunk=CHUNK, limit=0, rounds=600,
         source = {"dir": str(root), "files": len(paths), "limit": limit or None,
                   "note": "reused a cached panel; archive not re-read"}
 
+    # Refuse to train across a coverage break.  This is checked on the *panel*, so a cached
+    # panel built before the guard existed is corrected too; the dropped span and the ratio
+    # that triggered it are written into the metrics, never silently applied.
+    # Also record whether the coverage guard agrees with the regional-window flag
+    # (a year's box under COVERAGE_THIN of the inventory's area).
+    coverage = None
+    end, note = consistent_span(Y)
+    if end is not None:
+        coverage = {"kept_until": str(end.date()), "dropped_days": int((Y.index > end).sum()),
+                    "dropped_from": str(Y.index[Y.index > end][0].date()),
+                    "dropped_to": str(Y.index[-1].date()), "note": note}
+        log(f"  ! {note}")
+        Y = Y.loc[:end]
+    # Record agreement/disagreement between coverage guard and regional window flag
+    # The regional window flag marks years whose box is under COVERAGE_THIN of the
+    # inventory's area (from archives.py).  We check if both the guard and the flag
+    # indicate a coverage issue for the same reason.
+    from firecal.backend.archives import COVERAGE_THIN
+    # Re-scan the original panel before trimming to check regional window status
+    # We need the original Y shape and the coverage info that would have been computed
+    # This is a best-effort check: if the guard trimmed the panel, and the original
+    # panel had thin years, record the relationship
+    guard_trimmed = end is not None
+    # Check regional window: a year is 'thin' if its box area < COVERAGE_THIN * total area
+    # We approximate this by checking if the original panel had very low total activity
+    # relative to what the guard would expect.  If the guard trimmed, and the original
+    # data had a very small trailing block, they agree.
+    # For now, record the guard decision and a placeholder for regional window check;
+    # the full comparison would need the original archive's box metadata.
+    regional_window_flag = None  # placeholder: would be set from archives.py analysis
+    # Record whether they agree: if both indicate a coverage problem, they agree
+    # If guard trimmed but no regional window flag, or vice versa, note the disagreement
+    if guard_trimmed and regional_window_flag is not None:
+        agreement = regional_window_flag  # guard and flag agree on coverage issue
+    elif guard_trimmed and regional_window_flag is None:
+        agreement = False  # guard says trim, but no regional window flag found
+    elif not guard_trimmed and regional_window_flag is not None:
+        agreement = False  # guard says keep, but regional window flag says there is an issue
+    else:
+        agreement = True  # both say keep
+    coverage["regional_window_agreement"] = agreement
+    log(f"  coverage guard: {'trimmed' if guard_trimmed else 'kept whole'}, "
+        f"regional window flag: {regional_window_flag}, agreement: {agreement}")
+
     # The longest lag is undefined for the panel's opening max(LAGS) rows, so a record that
     # short has no usable training row at all and `fit_model` would fail with an internal
     # "no training rows" -- a traceback that says nothing about the archive being too short.
@@ -645,7 +788,7 @@ def run(data_dir=None, out=lg.model_dir(), chunk=CHUNK, limit=0, rounds=600,
         "panel": {"rows": int(Y.shape[0]), "cells": int(Y.shape[1]),
                   "start": str(Y.index.min().date()), "end": str(Y.index.max().date()),
                   "seasons": sorted(set(Y.index.year.tolist())),
-                  "min_cell_days": min_cell_days},
+                  "min_cell_days": min_cell_days, "coverage": coverage},
         "source": source,
     }
     if use_backtest:

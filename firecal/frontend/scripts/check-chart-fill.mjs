@@ -15,7 +15,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   FALLBACK_W, PAD, TIP_W, axisScale, monthRows, nearestIndex, peak, plotHeight, plotWidth, runs,
-  tickCount, tickValues, tooltipLeft, xAt, xTickIndices, yAt,
+  seasonRows, seasonVerdict, tickCount, tickValues, tooltipLeft, xAt, xTickIndices, yAt,
 } from "../src/chartGeometry.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -142,7 +142,26 @@ check("a fully missing series draws nothing", runs(3, () => false), []);
   check("a NaN threshold is no line either", monthRows([{ month: 1, avg: 1 }], NaN)[0].threshold, null);
 }
 
-// 11. Source-level guard: the plot must measure its container and must not go back to a scaled,
+// 11. The per-year anomaly view is twelve fixed slots too, but a month the record does not cover
+//     stays null rather than becoming a zero bar — and a month without a band has no verdict,
+//     because a missing band is not the same answer as "normal".
+{
+  const rows = seasonRows([{ month: 8, avg: 60, days: 31, normal: 9.8, low: 8, high: 11.5, z: 29.4, n: 4 },
+                           { month: 7, avg: 0.2, normal: 0.8, low: 0.6, high: 1, z: null, n: 4 }]);
+  check("the per-year view is twelve slots", rows.length, 12);
+  check("a covered month keeps its value and band", [rows[7].avg, rows[7].low, rows[7].high], [60, 8, 11.5]);
+  check("an uncovered month is null, not zero", [rows[0].avg, rows[0].low], [null, null]);
+  check("a month more than a band above reads high", seasonVerdict(rows[7]), "high");
+  check("a month more than a band below reads low", seasonVerdict({ ...rows[7], z: -3 }), "low");
+  check("a month within a band of normal reads normal", seasonVerdict({ ...rows[7], z: 0.4 }), "normal");
+  // No z is no verdict: the backend withholds one for a near-zero month, and a missing month
+  // has neither a value nor a band. Neither is an answer of "normal".
+  check("no z is no verdict", seasonVerdict({ ...rows[7], z: null }), null);
+  check("a month with no value is not 'normal' either", seasonVerdict(rows[0]), null);
+  check("a near-zero month is not called unusual", seasonVerdict(rows[6]), null);
+}
+
+// 12. Source-level guard: the plot must measure its container and must not go back to a scaled,
 //    letterboxing viewBox; and the CSS card must be exactly the width the clamp assumes.
 {
   const plot = read("plot.jsx");

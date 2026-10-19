@@ -32,8 +32,8 @@ It runs exactly what CI runs (`.github/workflows/ci.yml`):
    error classes, and the ignore rule — as assertions, so changing one has to be
    deliberate. 36 stdlib `unittest` tests, no pytest and no network, so the `docs` job
    still installs nothing.
-4. **Backend suite — 139 tests** (`cd firecal/backend && .venv/bin/pytest -q`):
-   68 smoke + 34 security + 37 local-archive, in-process via `TestClient`. No `.data/`
+4. **Backend suite — 148 tests** (`cd firecal/backend && .venv/bin/pytest -q`):
+   73 smoke + 34 security + 41 local-archive, in-process via `TestClient`. No `.data/`
    archive and no trained model required — fixtures are built inside the tests. Exactly one
    test dials out (`test_live`, the public FIRMS 24 h feeds; it skips when they are
    unreachable) and it is the slowest in the suite; every other test is stubbed or offline.

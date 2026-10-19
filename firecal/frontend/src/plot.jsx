@@ -53,11 +53,15 @@ const KEY_STEP = { ArrowRight: 1, ArrowLeft: -1, ArrowUp: 1, ArrowDown: -1, Page
  *                  on an axis drawn in thousands)
  * @param yLabel    rotated axis title
  * @param onSelect  given, the plot becomes a brush: dragging reports the [i0, i1] row range
+ * @param onPick    given, clicking a column (or Enter on the hovered one) reports its index;
+ *                  `onSelect` owns the pointer when both are set, so brush and pick never
+ *                  fight over a drag
  */
 export function Chart({
   rows, series, xKey, xFmt = String, yFmt = v => Math.round(v).toLocaleString(),
   height = 280, xTicks, yTicks, ariaLabel, tickFmt, yLabel, description,
   onSelect, selectHint = "Drag across the plot to zoom",
+  onPick, pickHint = "Click a column to select it",
 }) {
   const [wrapRef, measured] = useWidth();
   const width = measured || FALLBACK_W;
@@ -132,10 +136,24 @@ export function Chart({
     };
   }, [onSelect]);
 
+  /* The whole column is clickable, not the drawn rect: a month the record does not cover has
+     no bar to hit, and a reader aiming at a thin one should not have to hit a 4px sliver. */
+  const onPickAt = event => {
+    if (!onPick || onSelect) return;
+    const unit = unitOf(event);
+    if (unit == null) return;
+    onPick(nearestIndex(unit, n, width, inset));
+  };
+
   /* Keyboard walking, so the readout is not mouse-only. */
   const onKey = event => {
     if (!n) return;
     if (event.key === "Escape") { setHover(null); return; }
+    if ((event.key === "Enter" || event.key === " ") && onPick && hover != null) {
+      onPick(hover);
+      event.preventDefault();
+      return;
+    }
     const step = KEY_STEP[event.key];
     if (!step) return;
     const next = hover == null ? (step > 0 ? 0 : n - 1) : Math.max(0, Math.min(n - 1, hover + step));
@@ -160,6 +178,8 @@ export function Chart({
   return <div className="plot" ref={wrapRef}>
     <svg viewBox={`0 0 ${width} ${height}`} width="100%" height={height} role="img"
       tabIndex={0} aria-label={ariaLabel} onMouseMove={onMove} onMouseDown={onDown}
+      onClick={onPick ? onPickAt : undefined}
+      style={onPick ? { cursor: "pointer" } : undefined}
       onMouseLeave={() => { setHover(null); }} onKeyDown={onKey}
       onTouchStart={onMove} onTouchMove={onMove}>
       {/* gridlines + y axis */}
@@ -187,6 +207,9 @@ export function Chart({
         if (s.type === "bar") {
           const gi = [...new Set(groups.map(g => g.group ?? 0))].indexOf(s.group ?? 0);
           return <g key={s.name}>{rows.map((r, i) => {
+            // A month the record does not cover has no value; drawing it at zero would claim
+            // the year was quiet there. Lines and bands already break on null — bars skip.
+            if (typeof r[s.key] !== "number") return null;
             const left = x(i) - groupWidth / 2 + gi * (groupWidth / groupCount);
             const yy = y(r[s.key]);
             return <rect key={i} x={left} y={yy} width={Math.max(1, groupWidth / groupCount - 1)}
@@ -244,6 +267,7 @@ export function Chart({
         </span>)}
       </span>
       {onSelect && <span className="plotHint">{selectHint}</span>}
+      {onPick && <span className="plotHint">{pickHint}</span>}
     </div>
   </div>;
 }

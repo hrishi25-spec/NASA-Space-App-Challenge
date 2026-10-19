@@ -16,35 +16,50 @@ const WINDOWS = [
 const pct = v => `${Math.round(v * 100)}%`;
 
 /** Lazy-loaded so no charting code is part of the first paint (see charts.jsx). */
-export default function ForecastChart({ series, model, coverage }) {
+export default function ForecastChart({ series, model, coverage, checkpoint, model_reason, monthSel }) {
   // Row range into `series`: null means the whole record. Held in absolute indices so a second,
   // tighter drag inside a zoomed view composes instead of re-zooming from the full series.
   const [zoom, setZoom] = useState(null);
-  if (!series || !series.length)
+  // Filter series to the selected month if a month is chosen
+  let workSeries = series;
+  if (monthSel) {
+    const monthStart = new Date(monthSel.year, monthSel.month - 1, 1);
+    const monthEnd = new Date(monthSel.year, monthSel.month, 0);
+    workSeries = series.filter(d => {
+      const dDate = new Date(d.date);
+      return dDate >= monthStart && dDate <= monthEnd;
+    });
+  }
+  if (!workSeries || !workSeries.length)
     return <span className="hint">No calendar data yet — open a local archive or upload FIRMS CSVs to fit a forecast.</span>;
 
-  const observed = series.filter(d => d.actual != null).length;
-  const lookahead = series.filter(d => d.forecast != null || d.prior != null).length;
+  const observed = workSeries.filter(d => d.actual != null).length;
+  const lookahead = workSeries.filter(d => d.forecast != null || d.prior != null).length;
   // The archive model serves only the days its stored backtest earned; the rest is the
   // seasonal prior. The two are drawn as separate series so the switch is visible rather
   // than one dashed line implying a single method drew the whole window.
-  const hasModel = series.some(d => d.forecast != null);
-  const hasPrior = series.some(d => d.prior != null);
-  const rows = zoom ? series.slice(zoom[0], zoom[1] + 1) : series;
+  const hasModel = workSeries.some(d => d.forecast != null);
+  const hasPrior = workSeries.some(d => d.prior != null);
+  const rows = zoom ? workSeries.slice(zoom[0], zoom[1] + 1) : workSeries;
 
   /* The interval is only drawn when the payload actually carries it. The archive model emits
      `lower`/`upper` per day once it was conformally calibrated; the seasonal-prior fallback
      emits neither, so no band appears rather than a band that was never measured. */
-  const hasBand = series.some(d => typeof d.lower === "number" && typeof d.upper === "number");
+  const hasBand = workSeries.some(d => typeof d.lower === "number" && typeof d.upper === "number");
   const nominal = coverage?.nominal;
   const emp = coverage?.empirical
     ? Object.values(coverage.empirical).filter(v => typeof v === "number") : [];
   const bandName = nominal != null ? `${pct(nominal)} interval` : "Interval";
 
   const pickWindow = value =>
-    value === "all" || Number(value) >= series.length
+    value === "all" || Number(value) >= workSeries.length
       ? setZoom(null)
-      : setZoom([series.length - Number(value), series.length - 1]);
+      : setZoom([workSeries.length - Number(value), workSeries.length - 1]);
+
+  const scored_on = checkpoint?.scored_on || "global";
+  const regionMASE = checkpoint?.metrics?.backtest?.by_region?.[scored_on]
+    ? checkpoint.metrics.backtest.by_region[scored_on]
+    : {};
 
   return <>
     <div className="chartControls">
@@ -55,6 +70,7 @@ export default function ForecastChart({ series, model, coverage }) {
         <b>{pct(nominal)}{emp.length ? ` · measured ${pct(Math.min(...emp))}–${pct(Math.max(...emp))}` : ""}</b></span>}
       {zoom && <span className="kv"><span className="mut">Showing</span>
         <b>{rows[0].date} → {rows[rows.length - 1].date}</b></span>}
+      {scored_on && scored_on !== "global" && <div className="hint" style={{ marginTop: 6, background: "var(--sh-lite)", padding: 6 }}>          <b>Scope:</b> {scored_on}{model_reason && <span className="hint"> {model_reason}</span>}</div>}
     </div>
     <Chart rows={rows} xKey="date" height={280} xFmt={d => String(d).slice(5)}
       yLabel="Detections / day" onSelect={(a, b) => setZoom(z => [z ? z[0] + a : a, z ? z[0] + b : b])}
@@ -73,7 +89,7 @@ export default function ForecastChart({ series, model, coverage }) {
     <div className="chartControls end">
       <span className="hint">Window</span>
       <select value={zoom ? "custom" : "all"} onChange={e => pickWindow(e.target.value)}>
-        <option value="all">All {series.length} days</option>
+        <option value="all">All {workSeries.length} days</option>
         {WINDOWS.map(w => <option key={w.value} value={w.value}>{w.label}</option>)}
         {zoom && <option value="custom">Custom selection</option>}
       </select>
@@ -87,6 +103,9 @@ export default function ForecastChart({ series, model, coverage }) {
     {hasModel && hasPrior && <div className="hint" style={{ marginTop: 6 }}>
       The archive model drew only the days its own backtest beat the seasonal prior at; the rest
       is the prior. Hover a day to see which series it came from.
+    </div>}
+    {regionMASE && <div className="hint" style={{ marginTop: 6, fontSize: 11 }}>
+      <b>Regional MASE:</b> {json.stringify(regionMASE)}
     </div>}
     {lookahead === 0 && <div className="hint" style={{ marginTop: 6 }}>
       No forecast window available for this record — the model needs a longer daily series.
