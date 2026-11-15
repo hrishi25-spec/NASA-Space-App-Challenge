@@ -37,17 +37,17 @@ Two structural decisions do most of the work:
 
 | Path | What lives there |
 |---|---|
-| `firecal/backend/main.py` | Every endpoint plus the cores: `harmonize`, `harmonized_daily`, `_zstats`, `_streaks`, `_threat`, `_biomes`, `_cluster_payload`, `_esfp`, `cached` |
-| `firecal/backend/train.py` | Trains the seasonal *prior* from the FIRMS archive in chunks and writes `model/` |
-| `firecal/backend/forecast_model.py` | The trained prior — 2° cell × day-of-year shape, bbox lookup, checkpoint IO |
-| `firecal/backend/train_forecast.py` | Trains the global LightGBM forecaster on a 2°-cell × day panel; blocked backtest, writes `model/lgbm_*` |
-| `firecal/backend/lgbm_forecast.py` | The LightGBM model's shared half: features, checkpoint IO (hash-verified), the prior-vs-model gate, the conformal band, `/forecast` serving |
-| `firecal/backend/model/` | The trained checkpoints (prior + LightGBM). Gitignored, rebuilt by the trainers, optional to the API |
-| `firecal/backend/archives.py` | The local-archive inventory under `.data/`, the bounded spread slice reader, `allocate()` (a merge budget split by file size) and `read_merge()` (all of them at once) |
-| `firecal/backend/demo.py` | Synthetic FIRMS generator (2020–24 standard + 2002–24 transition) — the test fixture; nothing in the UI calls it |
-| `firecal/backend/regions.py` | Five curated AOI presets |
-| `firecal/backend/test_*.py` | Smoke, security and archive suites, colocated with the app |
-| `firecal/frontend/src/` | Console: `App.jsx`, `MissionMap.jsx`, `panels.jsx`, `charts.jsx`, `plot.jsx`, `chartGeometry.js`, `lib.js`, `styles.css` |
+| `backend/main.py` | Every endpoint plus the cores: `harmonize`, `harmonized_daily`, `_zstats`, `_streaks`, `_threat`, `_biomes`, `_cluster_payload`, `_esfp`, `cached` |
+| `backend/train.py` | Trains the seasonal *prior* from the FIRMS archive in chunks and writes `model/` |
+| `backend/forecast_model.py` | The trained prior — 2° cell × day-of-year shape, bbox lookup, checkpoint IO |
+| `backend/train_forecast.py` | Trains the global LightGBM forecaster on a 2°-cell × day panel; blocked backtest, writes `model/lgbm_*` |
+| `backend/lgbm_forecast.py` | The LightGBM model's shared half: features, checkpoint IO (hash-verified), the prior-vs-model gate, the conformal band, `/forecast` serving |
+| `backend/model/` | The trained checkpoints (prior + LightGBM). Gitignored, rebuilt by the trainers, optional to the API |
+| `backend/archives.py` | The local-archive inventory under `.data/`, the bounded spread slice reader, `allocate()` (a merge budget split by file size) and `read_merge()` (all of them at once) |
+| `backend/demo.py` | Synthetic FIRMS generator (2020–24 standard + 2002–24 transition) — the test fixture; nothing in the UI calls it |
+| `backend/regions.py` | Five curated AOI presets |
+| `backend/test_*.py` | Smoke, security and archive suites, colocated with the app |
+| `frontend/src/` | Console: `App.jsx`, `MissionMap.jsx`, `panels.jsx`, `charts.jsx`, `plot.jsx`, `chartGeometry.js`, `lib.js`, `styles.css` |
 | `docs/` | This page, PRD, sensor review, challenge brief, ADRs |
 | `scripts/check.sh` / `.bat` + `scripts/check-doc-figures.py` + `scripts/check-doc-links.py` + `scripts/test_check_doc_links.py` | The same checks CI runs: two doc guards (one fails when a documented figure drifts from the code, the other when a relative link does not resolve) plus the link guard's own test suite, so its rules cannot drift either |
 | `Dockerfile` | Console build + API in one image, one port ([decisions/0002](decisions/0002-single-image-deployment.md)) |
@@ -85,9 +85,9 @@ The console's opening move is the first of those: `GET /datasets` publishes the 
 ```bash
 python run.py                      # set up + start both servers (any OS)
 scripts/check.sh                   # backend tests + doc figures + frontend build (scripts\check.bat on Windows)
-cd firecal/backend && python train.py          # train the seasonal prior over .data/ (~15 min)
-cd firecal/backend && python train_forecast.py # train the LightGBM forecaster over .data/ (writes model/lgbm_*)
-cd firecal/backend && python demo.py   # write demo_modis.csv / demo_viirs.csv to upload (fixture)
+cd backend && python train.py          # train the seasonal prior over .data/ (~15 min)
+cd backend && python train_forecast.py # train the LightGBM forecaster over .data/ (writes model/lgbm_*)
+cd backend && python demo.py   # write demo_modis.csv / demo_viirs.csv to upload (fixture)
 FIRMS_MAP_KEY=… in .env            # enables POST /archive (real 1–5 day windows)
 ```
 
@@ -108,7 +108,7 @@ FIRMS_MAP_KEY=… in .env            # enables POST /archive (real 1–5 day win
 - **A coverage break in the archive is trimmed, not trained across.** `consistent_span` drops a trailing block whose 30-day level stays 50× below the record's own busy level for a month — this machine's archive ends with a 358-day NRT export over one state, 0.0007× the global level before it. Averaging across that seam halves the day-of-year climatology and floods training with all-zero rows; the drop, its dates and the ratio go into `metrics.panel.coverage`.
 - **The training panel is a contiguous daily grid.** `train_forecast.panel_from_counts` reindexes to every day (a day no cell burned is a zero row). Without it a lag or rolling feature reaches across unobserved days in training while `frame_cell_series` reindexes at serve time, and the model is fitted on a different quantity from the one it predicts.
 - **Never hand LightGBM a file it did not write.** Its C++ parser calls `Log::Fatal` on a truncated model and aborts the process, so `lgbm_forecast.load()` checks the recorded SHA-256 and parses from memory.
-- **The training archive is never committed.** `.data/` is ~10 GB of local NASA exports and `firecal/backend/model/` is derived from it; both are gitignored, and a missing or malformed checkpoint is not an error.
+- **The training archive is never committed.** `.data/` is ~10 GB of local NASA exports and `backend/model/` is derived from it; both are gitignored, and a missing or malformed checkpoint is not an error.
 - **Training and serving must harmonize identically.** `train.py` reads the archive through the server's own `harmonize(geometry=False)` and `harmonized_daily()`. A second implementation of the sensor rescale would train the model on a different quantity than the endpoint predicts.
 - **CSS uppercases labels.** Write labels in sentence case and let the contract do the casing; acronyms are the only all-caps strings in source.
 
@@ -122,7 +122,7 @@ The follow-ups from the last review round, highest value first — two have land
 | Launch the console live and verify calendar, forecast and the dataset picker end to end | This repo is developed on Windows, the one platform the docs admit was never exercised (PRD gap 5); the suite now passes here, so the running app is the remaining check |
 | Add a Windows job to the CI matrix | The suite is green on Windows since the `hf`-CLI resolution fix (`archives.py`); CI should keep it that way (NFR-5) |
 | ✅ Done — per-file upload outcomes in `/upload` | PRD gap 8 is closed: a file whose rows all fail harmonization used to be silently ignored when a dataset already exists (200, unchanged data); the response now carries an `upload` block naming each file's rows or refusal reason, a request where nothing is accepted is a 400 naming every file, and the console shows it in a neutral banner |
-| ✅ Done — keep the root a lobby per [ADR 0001](decisions/0001-repository-layout.md) | `TRAINING_REPORT.md` and `TRAINING_BRIEFING.md` (the `train_data.py` outputs) are gitignored and the stray `~/skills/` folder a tool created in the repo root is gone — the root holds only product files again |
+| ✅ Done — keep the root a lobby per [ADR 0001](decisions/0001-repository-layout.md) | The root holds only product files; the former ad-hoc training reports are gone, and the stray `~/skills/` folder a tool created in the repo root is gone too |
 
 ## Where to look next
 

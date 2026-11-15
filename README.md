@@ -190,13 +190,13 @@ The image builds the console (guards included) and serves it from the same uvico
 
 ```bash
 # Terminal 1: backend on :8000
-cd firecal/backend
+cd backend
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 
 # Terminal 2: frontend on :5173
-cd firecal/frontend
+cd frontend
 npm install
 npm run dev
 ```
@@ -217,7 +217,7 @@ A fresh clone has no archives (they are ~10 GB and git-ignored), so the console 
 2. **Upload CSVs.** Download exports from <https://firms.modaps.eosdis.nasa.gov/download/> (MODIS C6.1 and/or VIIRS SNPP / NOAA-20 / NOAA-21) and upload several at once. UTF-8, cp1252 (Excel on Windows) and UTF-16 (Excel on macOS) all parse, and every file is accounted for: accepted with its row count, or refused with the reason.
 3. **Live feed.** *Pull live hotspots* needs no key and gives you real NASA data in seconds. With a free [FIRMS MAP_KEY](https://firms.modaps.eosdis.nasa.gov/api/map_key/) in `.env`, *Real 3-day pull* loads 1–5 real days for any area of interest.
 
-To build a multi-year archive yourself, `python firecal/backend/fetch_archive.py` walks the FIRMS area API in resumable 5-day windows. A fire season is not a calendar year, so the span is explicit: `--regions world --from 2022-09-30 --to 2023-09-29` fetches one whole season, tiled so it abuts an existing archive with no doubled rows and no gap.
+To build a multi-year archive yourself, `python backend/fetch_archive.py` walks the FIRMS area API in resumable 5-day windows. A fire season is not a calendar year, so the span is explicit: `--regions world --from 2022-09-30 --to 2023-09-29` fetches one whole season, tiled so it abuts an existing archive with no doubled rows and no gap.
 
 Forecasts need ~120 days of data; anomalies need more than a year; the illusion diagnostic needs the pre-2012 MODIS era *and* the 2012–2015 overlap.
 
@@ -294,34 +294,36 @@ Thin selections answer **`200` with a `note`** rather than failing, and every pa
 ├── README.md                       ← you are here
 ├── LICENSE                         ← MIT
 ├── CONTRIBUTING.md · SECURITY.md · CHANGELOG.md
+├── .gitignore · .dockerignore · .editorconfig · .env.example
 ├── run.py                          ← one-command launcher (any OS, stdlib only)
 ├── start.sh / start.bat            ← thin wrappers around run.py
 ├── Dockerfile                      ← console build + API in one image
+├── .github/workflows/ci.yml
 ├── scripts/
 │   ├── check.sh / check.bat        ← the same checks CI runs
 │   ├── check-doc-figures.py        ← fails when a documented count drifts from the code
 │   ├── check-doc-links.py          ← fails when a relative link does not resolve
 │   └── test_check_doc_links.py     ← the link guard's own tests
 ├── docs/
-│   ├── PRD.md · brain.md · frontend.md · AGENTS.md
+│   ├── README.md · PRD.md · brain.md · frontend.md · AGENTS.md
 │   ├── nasa-space-apps-challenge.md · modis-viirs-integrated-review.md
 │   ├── img/                        ← console screenshots used in this README
 │   └── decisions/                  ← ADRs
-├── .github/workflows/ci.yml
-└── firecal/
-    ├── backend/
-    │   ├── main.py                 ← FastAPI app: endpoints, harmonization, analytics
-    │   ├── archives.py             ← local-archive inventory, coverage sampling, bounded slice reader
-    │   ├── regions.py · demo.py    ← curated AOIs · synthetic test fixture
-    │   ├── train.py · forecast_model.py          ← the seasonal prior
-    │   ├── train_forecast.py · lgbm_forecast.py  ← the LightGBM forecaster and its serving gate
-    │   ├── fetch_archive.py · hf_export.py       ← build and publish archives
-    │   ├── test_smoke.py           ← 73-test API smoke suite
-    │   ├── test_security.py        ← 34-test hardening suite
-    │   └── test_archives.py        ← 42-test suite for the local-archive picker
-    └── frontend/
-        ├── scripts/                ← four prebuild guards (below)
-        └── src/                    ← App, MissionMap, panels, charts, plot, chartGeometry, autoRotate, …
+├── backend/
+│   ├── main.py                     ← FastAPI app: endpoints, harmonization, analytics
+│   ├── archives.py                 ← local-archive inventory, coverage sampling, bounded slice reader
+│   ├── regions.py · demo.py        ← curated AOIs · synthetic test fixture
+│   ├── train.py · forecast_model.py          ← the seasonal prior
+│   ├── train_forecast.py · lgbm_forecast.py  ← the LightGBM forecaster and its serving gate
+│   ├── fetch_archive.py · hf_export.py       ← build and publish archives
+│   ├── requirements.txt · requirements-dev.txt
+│   ├── test_smoke.py               ← 73-test API smoke suite
+│   ├── test_security.py            ← 34-test hardening suite
+│   └── test_archives.py            ← 42-test suite for the local-archive picker
+└── frontend/
+    ├── index.html · package.json · package-lock.json · vite.config.js
+    ├── scripts/                    ← four prebuild guards (below)
+    └── src/                        ← App, MissionMap, panels, charts, plot, chartGeometry, autoRotate, …
 ```
 
 | Layer | Choices |
@@ -345,10 +347,10 @@ It runs exactly what CI runs:
 
 ```bash
 # 149 tests, ~2 min: starts the app in-process via TestClient
-cd firecal/backend && .venv/bin/pytest -q
+cd backend && .venv/bin/pytest -q
 
 # Frontend production build: prebuild runs the four guards, then Vite bundles
-cd firecal/frontend && npm run build
+cd frontend && npm run build
 
 python scripts/check-doc-figures.py     # documented counts must match the code
 python scripts/check-doc-links.py       # relative links, anchors and tracked targets must resolve
@@ -412,7 +414,7 @@ The complete list, with severity and mitigations, is [PRD §13](docs/PRD.md#13-k
 - **Anomalies say "Need >1 year of data".** Open an archive whose record spans a year.
 - **"Real-window pull failed: FIRMS_MAP_KEY is not set".** Expected: copy `.env.example` to `.env` and add a free key, or keep using uploads and the open 24 h feeds.
 - **Opening a big archive takes a few seconds.** It reads up to 750,000 rows; one archive opens at a time and a second request answers 429.
-- **The forecast says "Seasonal climatology".** No LightGBM checkpoint exists, or its stored backtest did not beat the prior for this AOI. `model_reason` in the response says which. Train with `python firecal/backend/train.py` and `python firecal/backend/train_forecast.py`.
+- **The forecast says "Seasonal climatology".** No LightGBM checkpoint exists, or its stored backtest did not beat the prior for this AOI. `model_reason` in the response says which. Train with `python backend/train.py` and `python backend/train_forecast.py`.
 - **`Could not create a virtualenv` on Linux.** `sudo apt install python3-venv`, then rerun.
 - **`port 5173 is already in use`.** The launcher reports the port Vite actually chose; the `/api` proxy keeps working.
 - **CORS errors after deploying.** Set `ALLOW_ORIGINS` to your frontend's origin.

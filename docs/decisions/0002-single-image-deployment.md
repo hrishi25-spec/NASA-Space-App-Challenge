@@ -15,7 +15,7 @@ Three shapes were available:
 
 ## Decision
 
-**Option 3.** The `Dockerfile` is multi-stage: a Node stage runs `npm ci && npm run build` and is discarded; the runtime stage installs the backend requirements, copies `firecal/backend/` and copies `dist/` to `firecal/frontend/dist`, so the paths stay repo-relative and the image serves the console through exactly the code path a local `npm run build` produces.
+**Option 3.** The `Dockerfile` is multi-stage: a Node stage runs `npm ci && npm run build` and is discarded; the runtime stage installs the backend requirements, copies `backend/` and copies `dist/` to `frontend/dist`, so the paths stay repo-relative and the image serves the console through exactly the code path a local `npm run build` produces.
 
 Two small pieces of the API make that work, both at the end of `main.py`:
 

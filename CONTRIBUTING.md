@@ -30,7 +30,7 @@ It runs exactly what CI runs: the doc-figure check (`scripts/check-doc-figures.p
 Neither takes minutes. Training the forecast model does:
 
 ```bash
-cd firecal/backend && python train.py        # ~15 min over a 10 GB FIRMS archive, once
+cd backend && python train.py        # ~15 min over a 10 GB FIRMS archive, once
 ```
 
 It is not part of the check — the archive is local data that is not in the repository — so the tests build a few dozen synthetic rows and push them through the same scan/save/load path instead. The console's dataset picker is tested the same way: `test_archives.py` writes its own small FIRMS export directory — three files over two instruments, one of them naming its platform (`SNPP`) the way the real S-NPP downloads do — and points the app at it, so `GET /datasets`, `POST /datasets/load` and the all-archives merge are exercised without a 10 GB directory. The console itself needs one only for a look at real data — drop FIRMS exports in `.data/`, pick one from the standby card, or merge them all.
@@ -40,7 +40,7 @@ It is not part of the check — the archive is local data that is not in the rep
 - Branch from `main` — `fix/…` or `feat/…` — and keep the change focused.
 - Update the docs a change invalidates; [docs/PRD.md](docs/PRD.md) is the acceptance-criteria contract.
 - New non-trivial logic leaves one runnable check behind (a test, or an assert-style self-check for a script).
-- Don't commit datasets (`*.csv`), the FIRMS training directory (`.data/`), `.env` files or build output — `.gitignore` covers all four, and the checkpoint trained from the archive (`firecal/backend/model/`) is derived data that belongs with it.
+- Don't commit datasets (`*.csv`), the FIRMS training directory (`.data/`), `.env` files or build output — `.gitignore` covers all four, and the checkpoint trained from the archive (`backend/model/`) is derived data that belongs with it.
 - Don't reintroduce synthetic data into the console. `demo.py` and `POST /demo` exist as fixtures for the suite and are documented as such; the UI opens the real archives in `.data/`, and a new UI path that fabricates a dataset needs a reason a reviewer can weigh against that.
 - Layout decisions are recorded as ADRs in [docs/decisions/](docs/decisions/); add one when a change is expensive to reverse.
 
@@ -48,7 +48,10 @@ It is not part of the check — the archive is local data that is not in the rep
 
 | Path | What it holds |
 |---|---|
-| `firecal/backend/` | FastAPI app, the local-archive inventory + slice reader, the synthetic fixture generator, region presets, the forecast model and its trainer, tests |
-| `firecal/frontend/` | React + Vite console (hand-rolled SVG charts, MapLibre map) |
+| `backend/` | FastAPI app, the local-archive inventory + slice reader, the synthetic fixture generator, region presets, the forecast model and its trainer, tests |
+| `frontend/` | React + Vite console (hand-rolled SVG charts, MapLibre map) |
 | `docs/` | Requirements, background material, ADRs |
 | `scripts/` | Automation shared by humans and CI |
+| `run.py` · `start.sh` / `start.bat` | The one-command launcher and its thin wrappers |
+| `Dockerfile` | Console build + API in one image, one port |
+| `.github/workflows/ci.yml` | The backend, frontend and docs CI jobs |

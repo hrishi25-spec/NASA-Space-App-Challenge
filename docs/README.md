@@ -9,5 +9,6 @@
 | [modis-viirs-integrated-review.md](modis-viirs-integrated-review.md) | MODIS/VIIRS sensor comparison behind the harmonization method |
 | [AGENTS.md](AGENTS.md) | House rules for AI coding agents working in this repository |
 | [decisions/](decisions/) | Architecture Decision Records — why the repo is arranged this way |
+| [decisions/0005-flatten-repository-layout.md](decisions/0005-flatten-repository-layout.md) | Why `firecal/` was removed and backend/frontend became top-level siblings |
 
 Install steps, the API contract and troubleshooting stay in the root [README.md](../README.md).

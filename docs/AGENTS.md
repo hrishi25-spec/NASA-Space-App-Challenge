@@ -32,12 +32,12 @@ It runs exactly what CI runs (`.github/workflows/ci.yml`):
    error classes, and the ignore rule — as assertions, so changing one has to be
    deliberate. 36 stdlib `unittest` tests, no pytest and no network, so the `docs` job
    still installs nothing.
-4. **Backend suite — 149 tests** (`cd firecal/backend && .venv/bin/pytest -q`):
+4. **Backend suite — 149 tests** (`cd backend && .venv/bin/pytest -q`):
    73 smoke + 34 security + 42 local-archive, in-process via `TestClient`. No `.data/`
    archive and no trained model required — fixtures are built inside the tests. Exactly one
    test dials out (`test_live`, the public FIRMS 24 h feeds; it skips when they are
    unreachable) and it is the slowest in the suite; every other test is stubbed or offline.
-5. **Frontend production build** (`cd firecal/frontend && npm run build`): the
+5. **Frontend production build** (`cd frontend && npm run build`): the
    `prebuild` step runs four zero-dependency guards — `check-lazy-exports.mjs`,
    `check-quality-policy.mjs`, `check-chart-fill.mjs`, `check-spin-policy.mjs` — then
    Vite bundles. Run one guard alone with `npm run check:charts` (or `check:lazy`,
@@ -49,27 +49,30 @@ A change that fails any of the three is not finished. Run the check before prese
 
 ```bash
 python run.py                       # set up + start backend (:8000) and console (:5173)
-cd firecal/backend && python train.py   # optional: train the forecast prior over .data/ (~15 min)
+cd backend && python train.py   # optional: train the forecast prior over .data/ (~15 min)
 ```
 
 Python 3.10+ and Node 18+ are the only requirements; `.venv` lives in
-`firecal/backend/`. `torch` is optional — without it `/forecast` falls back to scaled
+`backend/`. `torch` is optional — without it `/forecast` falls back to scaled
 seasonal climatology and the UI names the fallback.
 
 ## Where things live
 
 | Path | What it holds |
 |---|---|
-| `firecal/backend/main.py` | Every endpoint plus the cores: `harmonize`, `harmonized_daily`, `_zstats`, `_streaks`, `_threat`, `_biomes`, `_cluster_payload`, `_esfp`, `cached` |
-| `firecal/backend/archives.py` | Local-archive inventory under `.data/`, the bounded spread slice reader (byte offsets for CSV, row groups for parquet), `allocate()` (merge budget by file size), `read_merge()`, `hf_pull()` (the Hugging Face bucket pulled on demand through `huggingface_hub`, the `hf` CLI being the fallback, with `bucket_id()` reading `FIRECAL_HF_BUCKET`; one pull at a time, and a failed one is remembered for 60 s so a repeated request cannot stack outbound syncs) |
-| `firecal/backend/fetch_archive.py` | Pulls real FIRMS area exports into `.data/` over 5-day windows (needs `FIRMS_MAP_KEY`), reusing `main.firms_area_url` + `regions.region_box`; `--from/--to` names a season rather than a calendar year and `--regions world` covers the globe; resumable, `--dry-run` plans without network |
-| `firecal/backend/hf_export.py` | Builds the harmonized year (2024-09-30 → 2025-09-29) parquet in `data/` for `hf sync ./data hf://buckets/hriishiibanerjee/FIRMS_DATA`; runs the server's own `harmonize()` |
-| `firecal/backend/regions.py` | The five curated AOI presets behind `GET /regions` |
-| `firecal/backend/demo.py` | Synthetic FIRMS generator — the test fixture; nothing in the UI calls it |
-| `firecal/backend/train.py`, `forecast_model.py` | Train the checkpoint; carry it to `/forecast` |
-| `firecal/backend/test_*.py` | Smoke, security and archive suites, colocated with the app |
-| `firecal/frontend/src/` | Console: `App.jsx`, `MissionMap.jsx`, `panels.jsx`, `charts.jsx`, `plot.jsx`, `chartGeometry.js`, `autoRotate.js`, `adaptiveQuality.js`, `basemapStyles.js`, `lib.js`, `styles.css` |
-| `firecal/frontend/scripts/` | The four prebuild guards |
+| `backend/main.py` | Every endpoint plus the cores: `harmonize`, `harmonized_daily`, `_zstats`, `_streaks`, `_threat`, `_biomes`, `_cluster_payload`, `_esfp`, `cached` |
+| `backend/archives.py` | Local-archive inventory under `.data/`, the bounded spread slice reader (byte offsets for CSV, row groups for parquet), `allocate()` (merge budget by file size), `read_merge()`, `hf_pull()` (the Hugging Face bucket pulled on demand through `huggingface_hub`, the `hf` CLI being the fallback, with `bucket_id()` reading `FIRECAL_HF_BUCKET`; one pull at a time, and a failed one is remembered for 60 s so a repeated request cannot stack outbound syncs) |
+| `backend/fetch_archive.py` | Pulls real FIRMS area exports into `.data/` over 5-day windows (needs `FIRMS_MAP_KEY`), reusing `main.firms_area_url` + `regions.region_box`; `--from/--to` names a season rather than a calendar year and `--regions world` covers the globe; resumable, `--dry-run` plans without network |
+| `backend/hf_export.py` | Builds the harmonized year (2024-09-30 → 2025-09-29) parquet in `data/` for `hf sync ./data hf://buckets/hriishiibanerjee/FIRMS_DATA`; runs the server's own `harmonize()` |
+| `backend/regions.py` | The five curated AOI presets behind `GET /regions` |
+| `backend/demo.py` | Synthetic FIRMS generator — the test fixture; nothing in the UI calls it |
+| `backend/train.py`, `forecast_model.py` | Train the checkpoint; carry it to `/forecast` |
+| `backend/test_*.py` | Smoke, security and archive suites, colocated with the app |
+| `frontend/src/` | Console: `App.jsx`, `MissionMap.jsx`, `panels.jsx`, `charts.jsx`, `plot.jsx`, `chartGeometry.js`, `autoRotate.js`, `adaptiveQuality.js`, `basemapStyles.js`, `lib.js`, `styles.css` |
+| `frontend/scripts/` | The four prebuild guards |
+| `run.py` / `start.sh` / `start.bat` | The one-command launcher and its thin wrappers |
+| `Dockerfile` | Console build + API in one image, one port |
+| `.github/workflows/ci.yml` | The backend, frontend and docs CI jobs |
 | `docs/` | PRD, this file, orientation, frontend guide, ADRs |
 | `scripts/check.sh` / `.bat` | The same checks CI runs |
 
@@ -93,7 +96,7 @@ seasonal climatology and the UI names the fallback.
   a default export or `check-lazy-exports.mjs` fails the build.
 - **Keep `scipy`/`scikit-learn` imports lazy** inside clustering/briefing. Moving them
   to module scope costs ~2.5 s of startup.
-- **Never commit `.data/`, `data/`, `firecal/backend/model/`, `.env`, `*.csv` or build output.**
+- **Never commit `.data/`, `data/`, `backend/model/`, `.env`, `*.csv` or build output.**
   All are gitignored; the checkpoint is derived data rebuilt by `train.py`, and a
   missing or malformed checkpoint is not an error.
 - **Never diverge the two harmonizers.** `train.py` reads through the server's own

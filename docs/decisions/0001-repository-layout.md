@@ -20,6 +20,6 @@ A stranger who clones this repository should be able to run it and find the code
 - **No LICENSE yet** — a deliberate, reversible choice. Unlicensed work is only usable locally, so this must be revisited before any public release or reuse.
 - **No CODEOWNERS** — there are no teams to map folders to yet; writing one would be fiction. Add it when maintainers are named.
 - **CI keeps two parallel jobs** (backend, frontend) instead of one call into `scripts/check.*`: the two toolchains install independently and parallelism halves the wall-clock. Both jobs run the same commands the local script runs.
-- **`firecal/backend` and `firecal/frontend` stay side by side without workspace tooling** — one product, two runtimes (FastAPI and Vite). Splitting them further would be folder churn with no benefit to a reader, so the layout is documented instead.
+- **`firecal/backend` and `firecal/frontend` stay side by side without workspace tooling** — one product, two runtimes (FastAPI and Vite). Splitting them further would be folder churn with no benefit to a reader, so the layout is documented instead. **The `firecal/` wrapper was later removed** — the backend and frontend are now top-level siblings, superseding this deviation ([0005](0005-flatten-repository-layout.md)).
 - **The backend is not a Python package yet** (`pyro_harmony/`) — move code when you touch it, not in a cosmetic pass. This ADR is the place to record it when it happens.
 - **`github setup/` is local-only.** It is a reference scaffold, not part of the product, so it is gitignored and never committed.
