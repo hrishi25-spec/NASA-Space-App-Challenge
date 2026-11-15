@@ -47,7 +47,11 @@ Two structural decisions do most of the work:
 | `backend/demo.py` | Synthetic FIRMS generator (2020–24 standard + 2002–24 transition) — the test fixture; nothing in the UI calls it |
 | `backend/regions.py` | Five curated AOI presets |
 | `backend/test_*.py` | Smoke, security and archive suites, colocated with the app |
+| `backend/requirements.txt` / `requirements-dev.txt` | Runtime and test dependencies |
 | `frontend/src/` | Console: `App.jsx`, `MissionMap.jsx`, `panels.jsx`, `charts.jsx`, `plot.jsx`, `chartGeometry.js`, `lib.js`, `styles.css` |
+| `frontend/scripts/` | The four prebuild guards |
+| `frontend/index.html` · `package.json` · `vite.config.js` | Vite entry point, dependencies and dev proxy |
+| `run.py` / `start.sh` / `start.bat` | The one-command launcher and its thin wrappers |
 | `docs/` | This page, PRD, sensor review, challenge brief, ADRs |
 | `scripts/check.sh` / `.bat` + `scripts/check-doc-figures.py` + `scripts/check-doc-links.py` + `scripts/test_check_doc_links.py` | The same checks CI runs: two doc guards (one fails when a documented figure drifts from the code, the other when a relative link does not resolve) plus the link guard's own test suite, so its rules cannot drift either |
 | `Dockerfile` | Console build + API in one image, one port ([decisions/0002](decisions/0002-single-image-deployment.md)) |
