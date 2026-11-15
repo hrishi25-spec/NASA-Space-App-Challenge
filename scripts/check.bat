@@ -6,8 +6,8 @@ setlocal
 cd /d "%~dp0.."
 
 echo == doc figures ==
-if exist "firecal\backend\.venv\Scripts\python.exe" (
-    "firecal\backend\.venv\Scripts\python.exe" scripts\check-doc-figures.py
+if exist "backend\.venv\Scripts\python.exe" (
+    "backend\.venv\Scripts\python.exe" scripts\check-doc-figures.py
 ) else (
     python scripts\check-doc-figures.py
 )
@@ -15,16 +15,16 @@ if errorlevel 1 goto fail
 
 echo.
 echo == doc links ==
-if exist "firecal\backend\.venv\Scripts\python.exe" (
-    "firecal\backend\.venv\Scripts\python.exe" scripts\check-doc-links.py
+if exist "backend\.venv\Scripts\python.exe" (
+    "backend\.venv\Scripts\python.exe" scripts\check-doc-links.py
 ) else (
     python scripts\check-doc-links.py
 )
 if errorlevel 1 goto fail
 
 echo == doc-link self-test ==
-if exist "firecal\backend\.venv\Scripts\python.exe" (
-    "firecal\backend\.venv\Scripts\python.exe" scripts\test_check_doc_links.py
+if exist "backend\.venv\Scripts\python.exe" (
+    "backend\.venv\Scripts\python.exe" scripts\test_check_doc_links.py
 ) else (
     python scripts\test_check_doc_links.py
 )
@@ -32,7 +32,7 @@ if errorlevel 1 goto fail
 
 echo.
 echo == backend tests ==
-cd firecal\backend
+cd backend
 if exist ".venv\Scripts\python.exe" (
     ".venv\Scripts\python.exe" -m pytest -q
 ) else (

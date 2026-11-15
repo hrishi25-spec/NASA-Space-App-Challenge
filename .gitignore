@@ -11,13 +11,13 @@ dist/
 *.csv
 
 # The FIRMS training archive (~10 GB of NASA area exports) and the forecast checkpoint
-# trained from it. Both are local: `python firecal/backend/train.py` rebuilds the
+# trained from it. Both are local: `python backend/train.py` rebuilds the
 # checkpoint from `.data/`, and the API works without either.
 .data/
-firecal/backend/model/
+backend/model/
 
 # The harmonized-year dataset staged for `hf sync ./data hf://buckets/…`. Derived: it is
-# rebuilt from `.data/` by `firecal/backend/hf_export.py` and published to the Hugging Face
+# rebuilt from `.data/` by `backend/hf_export.py` and published to the Hugging Face
 # bucket, which is where it lives. A manifest and dataset card go with it.
 data/
 
@@ -38,8 +38,3 @@ github setup/
 .DS_Store
 Thumbs.db
 *.swp
-
-# train_data.py's run reports: written to the repo root on demand, derived from a run
-# rather than part of the product docs (ADR 0001 keeps the root a lobby)
-TRAINING_REPORT.md
-TRAINING_BRIEFING.md

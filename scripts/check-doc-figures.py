@@ -14,7 +14,7 @@ Two things are checked:
    drift the way they did when it grew from 34 to 36 tests.
 
 2. **Prebuild-guard names.** Every ``check-*.mjs`` named in a markdown file must
-   exist in ``firecal/frontend/scripts/``, every guard on disk must be named in
+   exist in ``frontend/scripts/``, every guard on disk must be named in
    the README and the frontend guide, and every guard must be wired into an npm
    script that ``prebuild`` chains — so a renamed or newly added guard cannot
    leave a stale name behind.
@@ -34,8 +34,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-BACKEND = ROOT / "firecal" / "backend"
-FRONTEND = ROOT / "firecal" / "frontend"
+BACKEND = ROOT / "backend"
+FRONTEND = ROOT / "frontend"
 SCRIPTS = ROOT / "scripts"
 
 # The doc-link guard's own stdlib suite. Counted here so the number three documents
@@ -43,7 +43,7 @@ SCRIPTS = ROOT / "scripts"
 LINKS_SELF_TEST = SCRIPTS / "test_check_doc_links.py"
 
 # The three suites the docs name individually. A file added or removed under
-# firecal/backend/test_*.py that is not here means the docs' composition claims
+# backend/test_*.py that is not here means the docs' composition claims
 # are incomplete — reported explicitly rather than only through a total mismatch.
 NAMED_SUITES = ("test_smoke.py", "test_security.py", "test_archives.py")
 
@@ -211,7 +211,7 @@ def check_guard_names(disk: set[str]) -> None:
         for name in sorted(set(re.findall(guard_pattern, read(path)))):
             if name not in disk:
                 rel = path.relative_to(ROOT)
-                ERRORS.append(f"{rel}: names {name}, which does not exist in firecal/frontend/scripts/")
+                ERRORS.append(f"{rel}: names {name}, which does not exist in frontend/scripts/")
 
     # A guard on disk must be named where the docs enumerate them.
     for relpath in ("README.md", "docs/frontend.md"):
@@ -227,13 +227,13 @@ def check_guard_names(disk: set[str]) -> None:
     for value in scripts.values():
         referenced.update(re.findall(r"scripts/(check-[a-z-]+\.mjs)", value))
     for missing in sorted(disk - referenced):
-        ERRORS.append(f"firecal/frontend/package.json: guard {missing} is not wired into any npm script")
+        ERRORS.append(f"frontend/package.json: guard {missing} is not wired into any npm script")
     for stale in sorted(referenced - disk):
-        ERRORS.append(f"firecal/frontend/package.json: references scripts/{stale}, which does not exist")
+        ERRORS.append(f"frontend/package.json: references scripts/{stale}, which does not exist")
     prebuild = scripts.get("prebuild", "")
     for key in sorted(key for key in scripts if key.startswith("check:")):
         if f"npm run {key}" not in prebuild:
-            ERRORS.append(f"firecal/frontend/package.json: prebuild does not run {key} — a guard must join the chain")
+            ERRORS.append(f"frontend/package.json: prebuild does not run {key} — a guard must join the chain")
 
 
 def main() -> int:
@@ -245,11 +245,11 @@ def main() -> int:
 
     for name in sorted(set(counts) - set(NAMED_SUITES)):
         ERRORS.append(
-            f"firecal/backend/{name}: a new suite — quote it in the docs' compositions "
+            f"backend/{name}: a new suite — quote it in the docs' compositions "
             "and add it to NAMED_SUITES in scripts/check-doc-figures.py"
         )
     for name in sorted(set(NAMED_SUITES) - set(counts)):
-        ERRORS.append(f"firecal/backend/{name}: the docs describe this suite but the file is gone")
+        ERRORS.append(f"backend/{name}: the docs describe this suite but the file is gone")
 
     # --- figures the docs quote -------------------------------------------------
     check_claims("README.md", r"(\d+)-test API smoke suite", (smoke,), "the smoke-suite size in the project tree")
@@ -304,7 +304,7 @@ def main() -> int:
     guard_dir = FRONTEND / "scripts"
     disk_guards = {path.name for path in guard_dir.glob("check-*.mjs")}
     if not disk_guards:
-        ERRORS.append("firecal/frontend/scripts/: no check-*.mjs guards found — did they move?")
+        ERRORS.append("frontend/scripts/: no check-*.mjs guards found — did they move?")
     check_guard_names(disk_guards)
 
     if ERRORS:

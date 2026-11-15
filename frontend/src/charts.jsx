@@ -312,67 +312,6 @@ export function AnomalyPanel({ bbox, refreshKey, embedded, selected, onPickMonth
   return <div className="panel wide"><h3>Monthly anomaly profile</h3>{body()}</div>;
 }
 
-/*** Year × month anomaly heatmap.
- *
- * The `/anomalies` endpoint already returns per-year, per-month z-scores in its
- * `seasons` block — this component renders them as a compact grid so every season
- * in the record can be compared at a glance, rather than teasing out one year at a
- * time with the per-year view.
- *
- * Calendar months run left → right (Jan → Dec). Years stack top → bottom, newest at the
- * top. Each cell shows avg daily detections with a color band indicating z-score.
- ***/
-
-function AnomalyHeatmap({ seasons, year }) {
-  // seasons is [{year, months:[{month, avg, days, normal, low, high, z, n}]}]
-  if (!seasons || !seasons.length) return <span className="hint">No seasonal anomaly data.</span>;
-  const yr = seasons.find(s => s.year === year) || seasons[seasons.length - 1];
-  const months = yr.months || [];
-  if (!months.length) return <span className="hint">No fully covered months in {yr.year}</span>;
-
-  const monthMap = new Map(months.map(m => [m.month, m]));
-  const hasZ = months.some(m => m.z != null);
-  const dec = v => (Math.round(v * 10) / 10).toLocaleString();
-
-  // Determine color based on z-score
-  const zToColor = z => {
-    if (z == null) return "#e0e0e0";
-    if (z > 2) return "#d7191c"; // very high
-    if (z > 1) return "#fdae61";  // high
-    if (z > 0) return "#abd9e9";  // low positive
-    if (z < -2) return "#7f0000"; // very low
-    if (z < 0) return "#2b8cbe";  // low negative
-    return "#ffffbf";            // near normal
-  };
-
-  const rowHeight = 28;
-  const colWidth = 26;
-  const margin = 4;
-  const rows = months.length;
-  const cols = 12; // Jan → Dec
-
-  return <>
-    <Chart rows={rows} xKey="doy" height={rows * rowHeight + 40} width={cols * colWidth + 40}
-      yLabel="Year × Month anomaly heatmap"
-      ariaLabel={`Anomaly heatmap for ${yr.year}: z-scores of mean daily detections per month against other years`}
-      series={[
-        { key: "cell", type: "rect", name: "Cell", color: (d, i) => {
-          const m = i % 12 + 1; // month 1-12
-          const mon = monthMap.get(m);
-          if (!mon) return "#e0e0e0";
-          const z = mon.z;
-          return zToColor(z);
-        } }
-      ]} />
-    <div style={{ position: "absolute", left: 20, top: rows * rowHeight + 20, fontSize: 10, color: "#666" }}>
-      {MONTHS.map((m, i) => <div key={i} style={{ transform: `translateX(${i * colWidth}px)` }}>{m}</div>)}
-    </div>
-    <div style={{ position: "absolute", left: 10, top: 20, transform: `rotate(-90) translateY(-100%)`, fontSize: 10, color: "#666" }}>
-      {seasons.map((s, i) => <div key={i} style={{ transform: `translateY(${i * rowHeight}px)` }}>{s.year}</div>)}
-    </div>
-  </>;
-}
-
 function Stat({ k, v, bad, note, tone }) {
   return <div className="stat">
     <div className="k">{k}</div>

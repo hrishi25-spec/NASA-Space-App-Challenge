@@ -16,9 +16,9 @@
 FROM node:22-slim AS console
 WORKDIR /build
 # Manifest and lockfile first: this layer is cached until one of them changes.
-COPY firecal/frontend/package.json firecal/frontend/package-lock.json ./
+COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci --no-audit --no-fund
-COPY firecal/frontend/ ./
+COPY frontend/ ./
 RUN npm run build
 
 # ---------------------------------------------------------------- runtime
@@ -33,14 +33,14 @@ RUN apt-get update \
 WORKDIR /app
 
 # Requirements before source, for the same caching reason as the lockfile above.
-COPY firecal/backend/requirements.txt firecal/backend/requirements.txt
-RUN pip install --no-cache-dir -r firecal/backend/requirements.txt
+COPY backend/requirements.txt backend/requirements.txt
+RUN pip install --no-cache-dir -r backend/requirements.txt
 
 # Source, then the built console. The paths stay repo-relative because the API finds the console
 # at <backend>/../frontend/dist -- exactly the layout a local `npm run build` produces, so the
 # image and a development checkout serve the console through the same code path.
-COPY firecal/backend/ firecal/backend/
-COPY --from=console /build/dist firecal/frontend/dist
+COPY backend/ backend/
+COPY --from=console /build/dist frontend/dist
 
 # Unbuffered so `docker logs` shows the API's output as it happens rather than at exit.
 ENV PYTHONUNBUFFERED=1 PORT=8000
@@ -48,7 +48,7 @@ EXPOSE 8000
 
 # The app's own working directory, set before dropping privileges so nothing has to be created
 # as the unprivileged user at start-up.
-WORKDIR /app/firecal/backend
+WORKDIR /app/backend
 
 # The API keeps no state on disk: an upload spools through /tmp and is parsed in memory, and the
 # loaded dataset lives in the process. So there is no volume, no writable data directory, and no

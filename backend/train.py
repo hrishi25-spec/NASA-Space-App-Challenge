@@ -132,7 +132,7 @@ def build(scan_result, cfg):
     counts = [round(float(v), 2) for v in series["count"]] if series is not None else []
     y = np.log1p(np.asarray(counts, dtype=float)) if counts else np.zeros(1)
     manifest = {
-        "trained_by": "firecal/backend/train.py",
+        "trained_by": "backend/train.py",
         "grid_deg": fm.GRID_DEG,
         "min_cell_days": fm.MIN_CELL_DAYS,
         "source": {"dir": str(cfg["data"]), "files": len(scan_result["files"]),

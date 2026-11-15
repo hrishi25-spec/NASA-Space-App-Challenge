@@ -61,14 +61,14 @@ def parse_env(text: str) -> dict:
 
 
 def load_env_file():
-    """Load the first .env found next to this file, in firecal/, or at the repo root.
+    """Load the first .env found next to this file or at the repo root.
 
     Real environment variables always win (`setdefault`), so exporting FIRMS_MAP_KEY in
-    the shell keeps working exactly as before.  Searching the parents means the launcher
-    -- which runs uvicorn from firecal/backend -- still finds a repo-root .env.
+    the shell keeps working exactly as before.  Searching the parent means the launcher
+    -- which runs uvicorn from backend -- still finds a repo-root .env.
     """
     here = Path(__file__).resolve().parent
-    for candidate in (here / ".env", here.parent / ".env", here.parent.parent / ".env"):
+    for candidate in (here / ".env", here.parent / ".env"):
         if candidate.is_file():
             for key, value in parse_env(candidate.read_text(encoding="utf-8", errors="replace")).items():
                 os.environ.setdefault(key, value)
@@ -92,7 +92,7 @@ CLUSTER_RETURN = 300                # clusters returned; only these get a convex
 # the archives the model was trained on are the ones the
 # console can open. Empty and absent are both normal -- there is an upload path and a live
 # feed without it, so this is a list of directories to try, not a requirement.
-ARCHIVE_ROOTS = archives.roots(Path(__file__).resolve().parent.parent.parent)
+ARCHIVE_ROOTS = archives.roots(Path(__file__).resolve().parent.parent)
 # One bounded archive read at a time: it is seconds of pandas work, and two at once would
 # double peak memory for no benefit.
 _LOAD_SLOTS = threading.Semaphore(1)
@@ -838,7 +838,7 @@ def archive(region: str = None, bbox: str = None, source: str = "VIIRS_S-NPP",
     if not key:
         raise HTTPException(400, "FIRMS_MAP_KEY is not set. Get a free key at "
                                  "https://firms.modaps.eosdis.nasa.gov/api/map_key/ then copy "
-                                 ".env.example to .env (repo root or firecal/backend), or export FIRMS_MAP_KEY.")
+                                 ".env.example to .env (repo root or backend), or export FIRMS_MAP_KEY.")
     if not MAP_KEY_RE.fullmatch(key):
         raise HTTPException(400, "FIRMS_MAP_KEY looks malformed (expected 6-64 letters/digits)")
     days = min(max(days, 1), 5)          # the area API accepts 1-5 days per request
@@ -1763,7 +1763,7 @@ def forecast(bbox: str = None, horizon: int = 30):
 
 # ----------------------------------------------------------- single-origin serving (image)
 # In development the console is served by Vite, which proxies /api to this process and strips
-# the prefix on the way through (see firecal/frontend/vite.config.js). A container has no proxy
+# the prefix on the way through (see frontend/vite.config.js). A container has no proxy
 # in front of it: one uvicorn serves the built console *and* the API, so the browser's /api/...
 # calls arrive with the prefix still attached and have to be peeled off before routing. No
 # endpoint starts with /api, so the rewrite cannot shadow one -- and the unprefixed paths keep
@@ -1810,7 +1810,7 @@ async def strip_api_prefix(request, call_next):
 #
 # This header only ever constrains documents *this* process serves, so it changes nothing in
 # development: there the page is served by Vite on :5173 and only its /api calls come here.
-# `firecal/backend/test_security.py` checks this policy against the hosts the frontend really
+# `backend/test_security.py` checks this policy against the hosts the frontend really
 # loads, so adding a basemap without allowing it here fails the suite rather than the map.
 SECURITY_HEADERS = {
     "Content-Security-Policy": "; ".join([

@@ -55,7 +55,7 @@ MIN_CELL_DAYS = 25
 DATA_DIRS = (".data",)
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent.parent
+ROOT = HERE.parent
 MODEL_DIR = HERE / "model"
 CHECKPOINT = MODEL_DIR / "forecast.json"
 CELL_GRID = MODEL_DIR / "cells.npz"

@@ -1,6 +1,6 @@
 """Build the harmonized one-year FIRMS record and stage it in `./data` for `hf sync`.
 
-    firecal/backend/.venv/bin/python firecal/backend/hf_export.py
+    backend/.venv/bin/python backend/hf_export.py
 
 Reads every CSV under `.data/` (MODIS C6.1 and VIIRS S-NPP / NOAA-20 / NOAA-21, archive and
 nrt exports), keeps the rows whose `acq_date` falls in 2024-09-30 .. 2025-09-29, runs them
@@ -39,7 +39,7 @@ sys.path.insert(0, str(BACKEND))
 
 from main import harmonize  # noqa: E402  the canonical harmonizer — train/serving/export share it
 
-ROOT = BACKEND.parent.parent          # repository root
+ROOT = BACKEND.parent               # repository root
 SRC = ROOT / ".data"                  # the 9.6 GB download folder
 DST = ROOT / "data"                   # what `hf sync ./data ...` ships
 NAME = "fire_archive_ALL_2024-09-30_2025-09-29.parquet"
@@ -166,7 +166,7 @@ on demand through the `huggingface_hub` client (the `hf` command is only the fal
 machine without the library), and `FIRECAL_HF_BUCKET` names a different bucket without a code
 change.
 
-Rebuild: `firecal/backend/.venv/bin/python firecal/backend/hf_export.py`
+Rebuild: `backend/.venv/bin/python backend/hf_export.py`
 """, encoding="utf-8")
 
 
@@ -250,7 +250,7 @@ def build(args: argparse.Namespace) -> int:
             "sensors": sorted(sensors),
             "rows_scanned": scanned,
             "source": "NASA FIRMS area exports (.data/), MODIS C6.1 + VIIRS S-NPP/NOAA-20/NOAA-21",
-            "harmonizer": "firecal/backend/main.py:harmonize (confidence >= 30, geometry kept)",
+            "harmonizer": "backend/main.py:harmonize (confidence >= 30, geometry kept)",
             "dedupe": ["lat", "lon", "time", "sensor"],
             "format": "parquet+zstd; rows chronological within each source export, row groups of "
                       "250000; the spread read picks row groups by their time statistics",

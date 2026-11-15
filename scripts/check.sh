@@ -8,10 +8,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "== doc figures =="
-if [ -x "firecal/backend/.venv/bin/python" ]; then
-    PY="firecal/backend/.venv/bin/python"
-elif [ -x "firecal/backend/.venv/Scripts/python.exe" ]; then
-    PY="firecal/backend/.venv/Scripts/python.exe"   # Git Bash on Windows
+if [ -x "backend/.venv/bin/python" ]; then
+    PY="backend/.venv/bin/python"
+elif [ -x "backend/.venv/Scripts/python.exe" ]; then
+    PY="backend/.venv/Scripts/python.exe"   # Git Bash on Windows
 else
     PY="$(command -v python3 || command -v python || true)"
     if [ -z "$PY" ]; then
@@ -31,7 +31,7 @@ echo "== doc-link self-test =="
 
 echo
 echo "== backend tests =="
-cd firecal/backend
+cd backend
 if [ -x ".venv/bin/python" ]; then
     .venv/bin/python -m pytest -q
 elif [ -x ".venv/Scripts/python.exe" ]; then

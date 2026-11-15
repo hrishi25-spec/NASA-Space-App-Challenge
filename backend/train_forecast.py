@@ -735,7 +735,7 @@ def run(data_dir=None, out=lg.model_dir(), chunk=CHUNK, limit=0, rounds=600,
             f"{Y.index.max().date()}), but the model's longest feature is a {warmup}-day lag "
             f"and is undefined for the panel's first {warmup} days, so {len(Y)} days leaves no "
             "usable training row at all. Point --data at a longer record -- "
-            "firecal/backend/fetch_archive.py builds one from the FIRMS area API."
+            "backend/fetch_archive.py builds one from the FIRMS area API."
         )
 
     # The stored climatology is the full-archive one: at serve time "training years" is the
@@ -745,7 +745,7 @@ def run(data_dir=None, out=lg.model_dir(), chunk=CHUNK, limit=0, rounds=600,
                                        rounds=rounds, log=log)
 
     metrics = {
-        "trained_by": "firecal/backend/train_forecast.py",
+        "trained_by": "backend/train_forecast.py",
         "grid_deg": fm.GRID_DEG,
         "objective": DEFAULT_PARAMS["objective"],
         "tweedie_variance_power": TWEEDIE_POWER,

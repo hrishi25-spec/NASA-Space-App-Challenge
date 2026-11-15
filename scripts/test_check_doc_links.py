@@ -22,7 +22,7 @@ run anywhere python3 does, and its CI job installs nothing. It runs under either
 runner:
 
     python scripts/test_check_doc_links.py       # no dependencies at all
-    firecal/backend/.venv/bin/python -m pytest scripts/test_check_doc_links.py
+    backend/.venv/bin/python -m pytest scripts/test_check_doc_links.py
 
 The filename cannot be imported normally (the guard's name has hyphens), so it is
 loaded by path below.
@@ -255,8 +255,8 @@ class GuardEndToEnd(unittest.TestCase):
     @needs_git
     def test_a_healthy_repository_passes(self):
         root = self.repo({
-            "README.md": "# Firecal\n\n[the PRD](docs/PRD.md)\n",
-            "docs/PRD.md": "# PRD\n\n## Roadmap\n\n[back](../README.md#firecal)\n",
+            "README.md": "# Pyro-Harmony\n\n[the PRD](docs/PRD.md)\n",
+            "docs/PRD.md": "# PRD\n\n## Roadmap\n\n[back](../README.md#pyro-harmony)\n",
         }, commit=("README.md", "docs/PRD.md"))
         code, report = self.run_guard(root)
         self.assertEqual(code, 0, report)

@@ -291,7 +291,7 @@ def main_cli(argv=None) -> int:
                         help="last day of the range, inclusive (with --from)")
     parser.add_argument("--sources", default=",".join(DEFAULT_SOURCES),
                         help=f"comma-separated area-API sources (default: {','.join(DEFAULT_SOURCES)})")
-    parser.add_argument("--out", default=str(Path(__file__).resolve().parents[2] / ".data"),
+    parser.add_argument("--out", default=str(Path(__file__).resolve().parents[1] / ".data"),
                         help="archive directory (default: the repo's .data/)")
     parser.add_argument("--max-windows", type=int, default=0,
                         help="stop after this many windows, for a smoke run")

@@ -872,7 +872,7 @@ def test_api_prefix_is_transparent():
 
 
 def test_console_mount_follows_the_build():
-    """Dockerfile builds the console into firecal/frontend/dist and copies it next to the API,
+    """Dockerfile builds the console into frontend/dist and copies it next to the API,
     which is what turns a single uvicorn into the whole deployment. The mount is conditional so
     a development checkout -- where Vite serves the console -- does not 404 on /."""
     built = (Path(main.__file__).resolve().parent.parent / "frontend" / "dist" / "index.html").is_file()

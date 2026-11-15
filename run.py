@@ -37,8 +37,8 @@ import webbrowser
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-BACKEND = ROOT / "firecal" / "backend"
-FRONTEND = ROOT / "firecal" / "frontend"
+BACKEND = ROOT / "backend"
+FRONTEND = ROOT / "frontend"
 VENV = BACKEND / ".venv"
 VITE_JS = FRONTEND / "node_modules" / "vite" / "bin" / "vite.js"
 API_PORT = 8000
