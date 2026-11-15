@@ -714,8 +714,6 @@ def run(data_dir=None, out=lg.model_dir(), chunk=CHUNK, limit=0, rounds=600,
     # Refuse to train across a coverage break.  This is checked on the *panel*, so a cached
     # panel built before the guard existed is corrected too; the dropped span and the ratio
     # that triggered it are written into the metrics, never silently applied.
-    # Also record whether the coverage guard agrees with the regional-window flag
-    # (a year's box under COVERAGE_THIN of the inventory's area).
     coverage = None
     end, note = consistent_span(Y)
     if end is not None:
@@ -724,36 +722,6 @@ def run(data_dir=None, out=lg.model_dir(), chunk=CHUNK, limit=0, rounds=600,
                     "dropped_to": str(Y.index[-1].date()), "note": note}
         log(f"  ! {note}")
         Y = Y.loc[:end]
-    # Record agreement/disagreement between coverage guard and regional window flag
-    # The regional window flag marks years whose box is under COVERAGE_THIN of the
-    # inventory's area (from archives.py).  We check if both the guard and the flag
-    # indicate a coverage issue for the same reason.
-    from firecal.backend.archives import COVERAGE_THIN
-    # Re-scan the original panel before trimming to check regional window status
-    # We need the original Y shape and the coverage info that would have been computed
-    # This is a best-effort check: if the guard trimmed the panel, and the original
-    # panel had thin years, record the relationship
-    guard_trimmed = end is not None
-    # Check regional window: a year is 'thin' if its box area < COVERAGE_THIN * total area
-    # We approximate this by checking if the original panel had very low total activity
-    # relative to what the guard would expect.  If the guard trimmed, and the original
-    # data had a very small trailing block, they agree.
-    # For now, record the guard decision and a placeholder for regional window check;
-    # the full comparison would need the original archive's box metadata.
-    regional_window_flag = None  # placeholder: would be set from archives.py analysis
-    # Record whether they agree: if both indicate a coverage problem, they agree
-    # If guard trimmed but no regional window flag, or vice versa, note the disagreement
-    if guard_trimmed and regional_window_flag is not None:
-        agreement = regional_window_flag  # guard and flag agree on coverage issue
-    elif guard_trimmed and regional_window_flag is None:
-        agreement = False  # guard says trim, but no regional window flag found
-    elif not guard_trimmed and regional_window_flag is not None:
-        agreement = False  # guard says keep, but regional window flag says there is an issue
-    else:
-        agreement = True  # both say keep
-    coverage["regional_window_agreement"] = agreement
-    log(f"  coverage guard: {'trimmed' if guard_trimmed else 'kept whole'}, "
-        f"regional window flag: {regional_window_flag}, agreement: {agreement}")
 
     # The longest lag is undefined for the panel's opening max(LAGS) rows, so a record that
     # short has no usable training row at all and `fit_model` would fail with an internal

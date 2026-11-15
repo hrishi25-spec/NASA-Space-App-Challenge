@@ -1501,8 +1501,9 @@ def _season_anomaly(s):
                     zs = (float(mean[(y, m)]) - normal) / sd
                 # Robust alternative: median and MAD (Median Absolute Deviation)
                 # Useful when std is unstable (e.g., only one other year)
-                median_others = float(np.median(others))
-                mad = float(np.median(np.abs(others - median_others)))
+                arr = np.asarray(others, dtype=float)
+                median_others = float(np.median(arr))
+                mad = float(np.median(np.abs(arr - median_others)))
                 mad_sigma = 1.4826 * mad  # MAD to sigma conversion for normal dist
                 low_mad = max(0.0, median_others - mad_sigma)
                 high_mad = median_others + mad_sigma

@@ -23,12 +23,8 @@ export default function ForecastChart({ series, model, coverage, checkpoint, mod
   // Filter series to the selected month if a month is chosen
   let workSeries = series;
   if (monthSel) {
-    const monthStart = new Date(monthSel.year, monthSel.month - 1, 1);
-    const monthEnd = new Date(monthSel.year, monthSel.month, 0);
-    workSeries = series.filter(d => {
-      const dDate = new Date(d.date);
-      return dDate >= monthStart && dDate <= monthEnd;
-    });
+    const prefix = `${monthSel.year}-${String(monthSel.month).padStart(2, "0")}`;
+    workSeries = series.filter(d => d.date.startsWith(prefix));
   }
   if (!workSeries || !workSeries.length)
     return <span className="hint">No calendar data yet — open a local archive or upload FIRMS CSVs to fit a forecast.</span>;
@@ -57,9 +53,6 @@ export default function ForecastChart({ series, model, coverage, checkpoint, mod
       : setZoom([workSeries.length - Number(value), workSeries.length - 1]);
 
   const scored_on = checkpoint?.scored_on || "global";
-  const regionMASE = checkpoint?.metrics?.backtest?.by_region?.[scored_on]
-    ? checkpoint.metrics.backtest.by_region[scored_on]
-    : {};
 
   return <>
     <div className="chartControls">
@@ -70,8 +63,10 @@ export default function ForecastChart({ series, model, coverage, checkpoint, mod
         <b>{pct(nominal)}{emp.length ? ` · measured ${pct(Math.min(...emp))}–${pct(Math.max(...emp))}` : ""}</b></span>}
       {zoom && <span className="kv"><span className="mut">Showing</span>
         <b>{rows[0].date} → {rows[rows.length - 1].date}</b></span>}
-      {scored_on && scored_on !== "global" && <div className="hint" style={{ marginTop: 6, background: "var(--sh-lite)", padding: 6 }}>          <b>Scope:</b> {scored_on}{model_reason && <span className="hint"> {model_reason}</span>}</div>}
     </div>
+    {scored_on && scored_on !== "global" && <div className="hint" style={{ marginTop: 6 }}>
+      <b>Scope:</b> {scored_on}{model_reason && <span className="hint"> {model_reason}</span>}
+    </div>}
     <Chart rows={rows} xKey="date" height={280} xFmt={d => String(d).slice(5)}
       yLabel="Detections / day" onSelect={(a, b) => setZoom(z => [z ? z[0] + a : a, z ? z[0] + b : b])}
       ariaLabel="Observed daily detections with the forecast appended and its calibrated interval"
@@ -103,9 +98,6 @@ export default function ForecastChart({ series, model, coverage, checkpoint, mod
     {hasModel && hasPrior && <div className="hint" style={{ marginTop: 6 }}>
       The archive model drew only the days its own backtest beat the seasonal prior at; the rest
       is the prior. Hover a day to see which series it came from.
-    </div>}
-    {regionMASE && <div className="hint" style={{ marginTop: 6, fontSize: 11 }}>
-      <b>Regional MASE:</b> {json.stringify(regionMASE)}
     </div>}
     {lookahead === 0 && <div className="hint" style={{ marginTop: 6 }}>
       No forecast window available for this record — the model needs a longer daily series.
