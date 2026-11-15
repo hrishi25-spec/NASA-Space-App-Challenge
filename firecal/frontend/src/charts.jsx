@@ -207,12 +207,12 @@ function SeasonAgainstNormal({ seasons, year, onYear, selected, onPick }) {
             ...(band && !rows.some(r => r.normal_mad != null)
               ? [{ key: "high", keyLow: "low", keyHigh: "high", type: "band",
                   name: "Normal ±1σ", color: C.env, opacity: 0.6, fmt: dec }]
-              : [],
+              : []),
             // MAD-based normal band (robust alternative for single-year std)
             ...(band && rows.some(r => r.normal_mad != null)
               ? [{ key: "high_mad", keyLow: "low_mad", keyHigh: "high_mad", type: "band",
                   name: "Normal ±1σ (MAD)", color: C.env, opacity: 0.3, fmt: dec }]
-              : [],
+              : []),
             { key: "avg", type: "bar", name: String(chosen.year), color: C.amber, fmt: dec },
             ...(band && !rows.some(r => r.normal_mad != null)
               ? [{ key: "normal", type: "line", name: "Normal", color: C.teal,
@@ -220,7 +220,7 @@ function SeasonAgainstNormal({ seasons, year, onYear, selected, onPick }) {
               : (band && rows.some(r => r.normal_mad != null)
                   ? [{ key: "normal_mad", type: "line", name: "Normal (MAD)", color: C.teal,
                       dash: true, width: 2, fmt: dec }]
-                  : []),
+                  : [])),
           ]} />
         <div className="chartStats">
           <Stat k="Peak month" v={peak ? MONTHS[peak.month - 1] : "—"} tone="acc"
