@@ -292,7 +292,7 @@ class GuardEndToEnd(unittest.TestCase):
 
     @needs_git
     def test_a_dead_same_page_anchor_is_an_error(self):
-        root = self.repo({"README.md": "# Firecal\n\n[jump](#nope)\n"}, commit=("README.md",))
+        root = self.repo({"README.md": "# Pyro-Harmony\n\n[jump](#nope)\n"}, commit=("README.md",))
         code, report = self.run_guard(root)
         self.assertEqual(code, 1)
         self.assertIn("names no heading in this file", report)
@@ -330,7 +330,7 @@ class GuardEndToEnd(unittest.TestCase):
         # nobody else can see, so it is not scanned at all.
         root = self.repo({
             ".gitignore": "scratch/\n",
-            "README.md": "# Firecal\n",
+            "README.md": "# Pyro-Harmony\n",
             "scratch/skill.md": "[gone](missing.md)\n",
         }, commit=("README.md", ".gitignore"))
         code, report = self.run_guard(root)
