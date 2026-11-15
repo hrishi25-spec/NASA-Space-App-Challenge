@@ -139,6 +139,33 @@ function describeUpload(m) {
 }
 
 export default function App() {
+  const [meta, setMeta] = useState({ n: 0 }), [bbox, setBbox] = useState(null), [pick, setPick] = useState(false);
+  const [cal, setCal] = useState([]), [pts, setPts] = useState([]), [cl, setCl] = useState([]), [an, setAn] = useState(null), [fc, setFc] = useState(null);
+  const [day, setDay] = useState(null), [span, setSpan] = useState(1), [busy, setBusy] = useState(false), [err, setErr] = useState(null);
+  // A month picked from the Anomalies chart ({year, month}), or null. It is a filter on the
+  // range the map and the rail read, kept separate from `day` so the calendar can say "March"
+  // instead of "the 1st", and so a 31-day span can be told apart from a hand-set one.
+  const [monthSel, setMonthSel] = useState(null);
+  const [live, setLive] = useState(null), [diagKey, setDiagKey] = useState(0), [yearSel, setYearSel] = useState("all");
+  // What the last upload said about each file (accepted/rejected + why): a fact about that
+  // response, so it lives in component state and is dropped by the next dataset change --
+  // unlike `meta.load`, which describes the dataset and must survive a refresh.
+  const [uploadNote, setUploadNote] = useState(null);
+  // Bumped whenever the dataset itself is replaced. The reload effect keyed on meta.n alone
+  // would not re-run when the next dataset has the same hotspot count, leaving the cursor day
+  // null and the calendar empty, so the dataset gets its own version counter.
+  const [dataKey, setDataKey] = useState(0);
+  // The basemap the console opens on. A slow connection starts on vector tiles -- the lightest
+  // choice -- and every visitor can switch freely afterwards (`SLOW_LINK` explains the probe).
+  const [tiles, setTiles] = useState(SLOW_LINK ? "vector" : "sat"), [tab, setTab] = useState("calendar");
+  // Curated AOI presets: the picker sets the bbox filter and flies the camera. `fly` carries
+  // a nonce so picking the same region twice still re-flies.
+  const [regions, setRegions] = useState([]), [presetKey, setPresetKey] = useState(null), [fly, setFly] = useState(null);
+  // Local FIRMS archives offered by the API (see GET /datasets): null while the listing is in
+  // flight, [] when this machine has none.
+  const [archives, setArchives] = useState(null);
+  const flyNonce = useRef(0);
+  const bb = bbox?.join(",");
   // ----------------------------------------------------- URL PARAMETER HANDLING ----------------
   // Read URL query params on mount so the console can be restored from a shared link.
   // We decode the most important state: bbox, monthSel/day, yearSel, and dataKey.
@@ -205,34 +232,6 @@ export default function App() {
 
   // ----------------------------------------------------- END URL PARAMETER HANDLING -------
 
-  const [meta, setMeta] = useState({ n: 0 }), [bbox, setBbox] = useState(null), [pick, setPick] = useState(false);
-  const [cal, setCal] = useState([]), [pts, setPts] = useState([]), [cl, setCl] = useState([]), [an, setAn] = useState(null), [fc, setFc] = useState(null);
-  const [day, setDay] = useState(null), [span, setSpan] = useState(1), [busy, setBusy] = useState(false), [err, setErr] = useState(null);
-  // A month picked from the Anomalies chart ({year, month}), or null. It is a filter on the
-  // range the map and the rail read, kept separate from `day` so the calendar can say "March"
-  // instead of "the 1st", and so a 31-day span can be told apart from a hand-set one.
-  const [monthSel, setMonthSel] = useState(null);
-  const [live, setLive] = useState(null), [diagKey, setDiagKey] = useState(0), [yearSel, setYearSel] = useState("all");
-  // What the last upload said about each file (accepted/rejected + why): a fact about that
-  // response, so it lives in component state and is dropped by the next dataset change --
-  // unlike `meta.load`, which describes the dataset and must survive a refresh.
-  const [uploadNote, setUploadNote] = useState(null);
-  // Bumped whenever the dataset itself is replaced. The reload effect keyed on meta.n alone
-  // would not re-run when the next dataset has the same hotspot count, leaving the cursor day
-  // null and the calendar empty, so the dataset gets its own version counter.
-  const [dataKey, setDataKey] = useState(0);
-  // The basemap the console opens on. A slow connection starts on vector tiles -- the lightest
-  // choice -- and every visitor can switch freely afterwards (`SLOW_LINK` explains the probe).
-  const [tiles, setTiles] = useState(SLOW_LINK ? "vector" : "sat"), [tab, setTab] = useState("calendar");
-  // Curated AOI presets: the picker sets the bbox filter and flies the camera. `fly` carries
-  // a nonce so picking the same region twice still re-flies.
-  const [regions, setRegions] = useState([]), [presetKey, setPresetKey] = useState(null), [fly, setFly] = useState(null);
-  // Local FIRMS archives offered by the API (see GET /datasets): null while the listing is in
-  // flight, [] when this machine has none.
-  const [archives, setArchives] = useState(null);
-  const flyNonce = useRef(0);
-  const bb = bbox?.join(",");
-
   useEffect(() => { api("/meta").then(setMeta).catch(() => { /* intro card covers the down state */ }); }, []);
   useEffect(() => { api("/regions").then(setRegions).catch(() => setRegions([])); }, []);
   // The FIRMS archives on this machine. `null` until the listing arrives, so the opening card
@@ -265,7 +264,6 @@ export default function App() {
     setFc(null); api("/forecast", { bbox: bb }).then(setFc).catch(() => setFc(null));
     setYearSel("all");
     setDiagKey(k => k + 1);
-    setDiagKey(k => k + 1);
   }, [meta.n, dataKey, bb]);
   // Open one of the real FIRMS archives this machine holds. The backend reads a bounded slice
   // of the file and reports what it read, so the console can say how much of the archive is on
@@ -277,7 +275,7 @@ export default function App() {
       // MERGE_ALL is not an id: it asks the API to read every archive at once into one record,
       // split by size (the API's default budget for a merge is the store's whole row cap).
       const query = datasetId === MERGE_ALL ? "all=true" : "id=" + encodeURIComponent(datasetId);
-      const r = await fetch("/api/datasets/load? " + query, { method: "POST" });
+      const r = await fetch("/api/datasets/load?" + query, { method: "POST" });
       if (!r.ok) throw new Error(await errMsg(r));
       datasetChanged(await r.json());
     } catch (e) {
@@ -379,7 +377,7 @@ export default function App() {
         {regions.map(r => <option key={r.key} value={r.key}>{r.name}</option>)}
       </select>}
       <button className={"btn" + (pick ? " on" : "")} onClick={() => setPick(!pick)}>{pick ? "Pick 2 corners…" : "Select area"}</button>
-      {bbox && <button className="btn" onClick={() => gotoRegion("")}>Clear</button>
+      {bbox && <button className="btn" onClick={() => gotoRegion("")}>Clear</button>}
     </header>
 
     {err && <div className="banner">⚠ {err}</div>}
@@ -409,7 +407,7 @@ export default function App() {
                 <button className="btn" onClick={() => loadArchive(a.id)} disabled={busy}
                   title={a.name}>{a.label} — {fmtBytes(a.bytes)}</button>
                 <div style={{ fontSize: 11, color: "var(--mut)", marginTop: 2 }}>{coverageLine(a.coverage)}</div>
-                {warn && <div style={{ fontSize: 11, color: "var(--bad)" }}>⚠ {warn}</div>
+                {warn && <div style={{ fontSize: 11, color: "var(--bad)" }}>⚠ {warn}</div>}
               </div>;
             })}
           </div>
@@ -427,7 +425,7 @@ export default function App() {
           })()}
         </> : <div className="hint">
           No local archives found. Put FIRMS exports in <code>.data/</code> (the directory <code>train.py</code> reads), or upload CSVs below.
-        </div>
+        </div>}
       <div className="hint" style={{ marginTop: 10 }}>
         Upload NASA FIRMS archive CSVs (MODIS C6.1 / VIIRS S-NPP + NOAA-20/21). Confidence scales unified, low-confidence drops,
         per-sensor rescaling over the overlap period, ESFP footprint normalization.
@@ -481,7 +479,7 @@ export default function App() {
                         {f.sensor} · {f.kind}{f.mb >= 1 ? ` · ${f.mb} MB` : ""} — {fmt(f.rows_read)} of ~{fmt(f.rows_estimate)} rows · {share}% of the slice
                       </div>
                       {coverageLine(cov) && <div style={{ fontSize: 11, color: "var(--mut)" }}>{coverageLine(cov)}</div>}
-                      {warn && <div style={{ fontSize: 11, color: "var(--bad)" }}>⚠ {warn}</div>
+                      {warn && <div style={{ fontSize: 11, color: "var(--bad)" }}>⚠ {warn}</div>}
                     </div>;
                   })}
                   {skipped.map(f => <div key={f.file} style={{ padding: "5px 0", borderTop: "1px solid var(--sh-lite)" }}>
@@ -493,7 +491,7 @@ export default function App() {
                 </div>
               </details>;
             })()}
-          </div>
+          </div>}
           <div className="panel">
             <h3>Selection</h3>
             <div className="kv"><span className="mut">AOI</span><b>{bbox ? `${bbox[0].toFixed(2)}, ${bbox[1].toFixed(2)} → ${bbox[2].toFixed(2)}, ${bbox[3].toFixed(2)}` : "global"}</b></div>
@@ -513,7 +511,7 @@ export default function App() {
               No detections in this AOI — the open archive may not cover it.
               <button className="btn sm" style={{ marginTop: 6, width: "100%" }}
                 onClick={() => gotoRegion("")}>Clear area</button>
-            </div>
+            </div>}
           </div>
           <div className="panel">
             <h3>Clustering <span className="mut">DBSCAN</span></h3>
@@ -549,7 +547,7 @@ export default function App() {
           <BriefingPanel bbox={bb} onPickDay={setDay} refreshKey={diagKey} mini />
           <div className="panel">
             <h3>Anomalies <span className="mut">critical periods</span></h3>
-            {!an ? <span className="hint">Analyzing…</span> : an.note ? <span className="hint">{an.note}</span> : <>>
+            {!an ? <span className="hint">Analyzing…</span> : an.note ? <span className="hint">{an.note}</span> : <>
               {monthSel && <div className="hint" style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 4 }}>
                 Filtered to <b>{monthLabel}</b>
                 <button className="btn sm" onClick={() => pickMonth(null)}>Clear</button>
@@ -570,8 +568,7 @@ export default function App() {
                   and chart code stays out of the shell -- so this opens the tab that owns it. */}
               {an.monthly?.length > 0 && <button className="btn sm" style={{ marginTop: 6 }}
                 onClick={() => setTab("anomalies")}>Monthly chart</button>}
-            </>
-            </h3>}
+            </>}
           </div>
         </div>
 
@@ -580,7 +577,7 @@ export default function App() {
           <div className="tabs">
             {DRAWER_TABS.map(t => <button key={t.id} role="tab" aria-selected={tab === t.id}
               className={"tab" + (tab === t.id ? " on" : "")} onClick={() => setTab(t.id)}
-              onMouseEnter={() => t.prefetch?.()} onFocus={() => t.prefetch?.()}>\n              {t.label}\n            </button>)}
+              onMouseEnter={() => t.prefetch?.()} onFocus={() => t.prefetch?.()}>{t.label}</button>)}
             {tab === "calendar" && <span className="tools" style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
               <span className="hint">Year</span>
               <select value={yearSel} onChange={e => { setYearSel(e.target.value); setMonthSel(null); }}>
@@ -612,6 +609,6 @@ export default function App() {
         <LivePanel onLoaded={setLive} wide bbox={bb} region={preset?.key} onDatasetChanged={datasetChanged}
           liveRegions={meta.live_regions} />
       </div>
-    </>
+    </>}
   </>;
 }
