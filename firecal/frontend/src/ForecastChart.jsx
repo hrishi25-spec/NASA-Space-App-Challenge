@@ -20,12 +20,9 @@ export default function ForecastChart({ series, model, coverage, checkpoint, mod
   // Row range into `series`: null means the whole record. Held in absolute indices so a second,
   // tighter drag inside a zoomed view composes instead of re-zooming from the full series.
   const [zoom, setZoom] = useState(null);
-  // Filter series to the selected month if a month is chosen
-  let workSeries = series;
-  if (monthSel) {
-    const prefix = `${monthSel.year}-${String(monthSel.month).padStart(2, "0")}`;
-    workSeries = series.filter(d => d.date.startsWith(prefix));
-  }
+  // `monthSel` is deliberately ignored: the forecast is about the future, so filtering the
+  // series down to a past calendar month would blank the tab exactly when a month is picked.
+  const workSeries = series;
   if (!workSeries || !workSeries.length)
     return <span className="hint">No calendar data yet — open a local archive or upload FIRMS CSVs to fit a forecast.</span>;
 
@@ -61,7 +58,7 @@ export default function ForecastChart({ series, model, coverage, checkpoint, mod
         <b>{observed} observed · {lookahead}-day forecast</b></span>
       {hasBand && nominal != null && <span className="kv"><span className="mut">Interval</span>
         <b>{pct(nominal)}{emp.length ? ` · measured ${pct(Math.min(...emp))}–${pct(Math.max(...emp))}` : ""}</b></span>}
-      {zoom && <span className="kv"><span className="mut">Showing</span>
+      {zoom && rows.length > 0 && <span className="kv"><span className="mut">Showing</span>
         <b>{rows[0].date} → {rows[rows.length - 1].date}</b></span>}
     </div>
     {scored_on && scored_on !== "global" && <div className="hint" style={{ marginTop: 6 }}>
@@ -90,7 +87,7 @@ export default function ForecastChart({ series, model, coverage, checkpoint, mod
       </select>
       {zoom && <button className="btn sm" onClick={() => setZoom(null)}>Reset zoom</button>}
     </div>
-    {hasBand && coverage?.within_tolerance === false && <div className="hint" style={{ marginTop: 6 }}>
+    {hasBand && emp.length > 0 && coverage?.within_tolerance === false && <div className="hint" style={{ marginTop: 6 }}>
       The nominal {pct(nominal)} band measured {pct(Math.min(...emp))}–{pct(Math.max(...emp))} coverage on the
       held-out block it was scored against — more than a few points off, so read it as indicative
       rather than exactly calibrated.
