@@ -285,6 +285,19 @@ def test_every_archive_merges_into_one_record_over_every_file(archive_root):
     assert merged_span > 2 * head_span
 
 
+def test_a_year_load_keeps_only_that_year(archive_root):
+    """`year=2024` is the third way in: every archive holding the year, merged and then cut to
+    it. The fixture's year-long export starts in 2024 and runs into 2025, so a merge that only
+    trimmed at the edges would still answer with 2025 days."""
+    m = client.post("/datasets/load", params={"year": 2024}).json()
+    assert m["load"]["year"] == 2024
+    assert m["load"]["merged"] is True
+    assert m["start"].startswith("2024") and m["end"].startswith("2024")
+    assert (main.DF["date"].dt.year == 2024).all()
+    # A year no export holds is a refused request, not an empty record.
+    assert client.post("/datasets/load", params={"year": 1999}).status_code == 400
+
+
 def test_the_merge_budget_follows_file_size_not_an_equal_split():
     """The split is by bytes, and it never exceeds what the caller asked for. An equal split
     would spend most of the budget on a 136 KB export while a 1.87 GB year got the same few

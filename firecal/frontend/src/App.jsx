@@ -238,6 +238,21 @@ export default function App() {
   // can say it is still looking instead of claiming there are none.
   useEffect(() => { api("/datasets").then(d => setArchives(d.items || [])).catch(() => setArchives([])); }, []);
 
+  // One button per calendar year the inventory actually holds. A merge of everything is the
+  // wrong answer when the question is "2024", and the years are exactly what the per-file
+  // coverage already knows -- `files` counts the exports holding the year, `global` says at
+  // least one of them covers the whole inventory's ground rather than a regional window.
+  const yearOptions = useMemo(() => {
+    const byYear = new Map();
+    (archives || []).forEach(a => (a.coverage?.years || []).forEach(y => {
+      const entry = byYear.get(y.year) || { year: y.year, files: 0, global: false };
+      entry.files += 1;
+      if (!y.thin) entry.global = true;
+      byYear.set(y.year, entry);
+    }));
+    return [...byYear.values()].sort((a, b) => a.year - b.year);
+  }, [archives]);
+
   // The picked preset, or whichever preset the current bbox matches: a hand-picked box that
   // happens to line up with a preset gets that region's facts too, so the panel describes
   // the AOI rather than the click that created it.
@@ -268,13 +283,16 @@ export default function App() {
   // Open one of the real FIRMS archives this machine holds. The backend reads a bounded slice
   // of the file and reports what it read, so the console can say how much of the archive is on
   // screen rather than implying it holds all of it.
-  async function loadArchive(datasetId) {
-    if (!datasetId) return;
+  async function loadArchive(datasetId, year) {
+    if (!datasetId && !year) return;
     setBusy(true); setDay(null); setMonthSel(null); setErr(null);
     try {
       // MERGE_ALL is not an id: it asks the API to read every archive at once into one record,
       // split by size (the API's default budget for a merge is the store's whole row cap).
-      const query = datasetId === MERGE_ALL ? "all=true" : "id=" + encodeURIComponent(datasetId);
+      // `year` is the same merge narrowed to one calendar year by the API, which decides the
+      // files by their own coverage -- so the console never guesses which export holds it.
+      const query = year ? "year=" + year
+        : datasetId === MERGE_ALL ? "all=true" : "id=" + encodeURIComponent(datasetId);
       const r = await fetch("/api/datasets/load?" + query, { method: "POST" });
       if (!r.ok) throw new Error(await errMsg(r));
       datasetChanged(await r.json());
@@ -361,9 +379,16 @@ export default function App() {
         <input type="file" multiple accept=".csv,.txt" onChange={upload} />
         <button className="btn primary" disabled={busy}>{busy ? "SYNCING…" : "Upload CSVs"}</button>
       </label>
-      {archives?.length > 0 && <select value="" onChange={e => loadArchive(e.target.value)} disabled={busy}
-        title="Open a FIRMS archive from this machine (a bounded slice of the selected file), or merge them all">
+      {archives?.length > 0 && <select value="" onChange={e => e.target.value.startsWith("year:")
+          ? loadArchive(null, Number(e.target.value.slice(5)))
+          : loadArchive(e.target.value)} disabled={busy}
+        title="Open one calendar year (every archive that holds it), one archive, or all of them merged">
         <option value="">{busy ? "Opening…" : "Local archives…"}</option>
+        {yearOptions.length > 0 && <optgroup label="Year">
+          {yearOptions.map(y => <option key={y.year} value={"year:" + y.year}>
+            Year {y.year} — all sensors
+          </option>)}
+        </optgroup>}
         {archives.length > 1 && <option value={MERGE_ALL}>
           All {archives.length} archives merged — every sensor, every year
         </option>}
@@ -395,11 +420,21 @@ export default function App() {
             window holds, sampled from the file (a ⚠ marks a year that covers a fraction of the ground the others do).
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            {archives.length > 1 && <button className="btn primary" onClick={() => loadArchive(MERGE_ALL)} disabled={busy}
+            {yearOptions.map(y => <button key={y.year} className="btn primary"
+              onClick={() => loadArchive(null, y.year)} disabled={busy}
+              title={`Merge every archive that holds ${y.year} into one record`}>
+              {y.year}
+              <span style={{ display: "block", fontSize: 11, color: y.global ? "var(--mut)" : "var(--bad)" }}>
+                {y.files} archive{y.files === 1 ? "" : "s"}{y.global ? "" : " · ⚠ regional window only"}
+              </span>
+            </button>)}
+            {archives.length > 1 && <button className="btn" onClick={() => loadArchive(MERGE_ALL)} disabled={busy}
               title="Read a bounded slice of every archive into one record — all sensors, all years">
               Merge all {archives.length} archives — every sensor, every year
             </button>}
           </div>
+          <details style={{ marginTop: 9 }}>
+            <summary className="hint" style={{ cursor: "pointer" }}>Individual archives ({archives.length})</summary>
           <div style={{ display: "flex", flexDirection: "column", gap: 9, marginTop: 9 }}>
             {archives.map(a => {
               const warn = coverageWarn(a.coverage);
@@ -423,6 +458,7 @@ export default function App() {
               ({yearsRange(years)}). Merging them puts a regional window in the same record as the global years.
             </div>;
           })()}
+          </details>
         </> : <div className="hint">
           No local archives found. Put FIRMS exports in <code>.data/</code> (the directory <code>train.py</code> reads), or upload CSVs below.
         </div>}
@@ -450,6 +486,8 @@ export default function App() {
                 {!meta.load.merged && meta.load.mb >= 1 && <span className="mut"> · {meta.load.mb} MB</span>}</b></div>
             <div className="kv"><span className="mut">Slice</span>
               <b>{fmt(meta.load.rows_kept)} of ~{fmt(meta.load.rows_estimate)} rows{meta.load.spread ? " · spread" : ""}{meta.load.capped ? <span title="The reader stopped at the row cap; the rest of this file was not read"> · capped</span> : ""}</b></div>
+            {meta.load.year && <div className="kv"><span className="mut">Year</span>
+              <b>{meta.load.year}{meta.load.regional_only ? " · regional window only" : ""}</b></div>}
             {meta.load.files && (() => {
               // The inventory this merge was drawn from (GET /datasets), so the summary can say
               // how much of the machine the record actually covers, not just what arrived.

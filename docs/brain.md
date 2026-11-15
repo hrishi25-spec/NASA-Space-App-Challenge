@@ -10,7 +10,7 @@ Satellites have tracked active fires for 20+ years, but the record is fragmented
 
 | Thing | State |
 |---|---|
-| Tests | 148 passing — 73 API smoke + 34 security + 41 local-archive, run in-process via `TestClient` |
+| Tests | 149 passing — 73 API smoke + 34 security + 42 local-archive, run in-process via `TestClient` |
 | Frontend build | Clean, including the prebuild lazy-export, adaptive-detail, chart-layout and orbital-drift guards |
 | Startup weight | Import ≈ 2.2 s, baseline RSS ≈ 104 MB (dev machine; re-measured ≈ 0.8 s / 103.5 MB on the Windows checkout after the LightGBM work). `lightgbm` is lazily imported and unloaded at start-up, so it adds nothing here |
 | Layout | Arranged per the repo standard; see [decisions/0001](decisions/0001-repository-layout.md) |

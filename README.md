@@ -436,7 +436,7 @@ dev proxy). Interactive docs at `/docs` (Swagger UI).
     │   ├── train_data.py           ← headless run of every model over your own CSVs + a Markdown report
     │   ├── model/                  ← trained checkpoint (gitignored; rebuilt by train.py)     │   ├── test_smoke.py           ← 73-test API smoke suite (encodings, gzip, cache, presets, archive, real-FIRMS schema guard, training, LightGBM forecast + its conformal band, /api prefix)
     │   ├── test_security.py        ← 34-test hardening suite (URL allowlist, upload caps, CORS, CSP hosts)
-    │   ├── test_archives.py        ← 41-test suite for the local-archive picker (inventory, slice, merge, ids, gate, HF bucket)
+    │   ├── test_archives.py        ← 42-test suite for the local-archive picker (inventory, slice, merge, ids, gate, HF bucket)
     │   ├── requirements.txt        ← runtime deps (with security floors)
     │   └── requirements-dev.txt    ← + pytest, httpx (for tests)
     └── frontend/
@@ -569,7 +569,7 @@ scripts/check.sh          # POSIX — or scripts\check.bat on Windows
 Both are thin wrappers around the commands below, which is also what CI runs:
 
 ```bash
-# 148 tests, ~2 min — starts the app in-process via TestClient
+# 149 tests, ~2 min — starts the app in-process via TestClient
 cd firecal/backend
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest -q
@@ -603,7 +603,7 @@ and region-specific, `.env` parsing handles comments/`export`/quotes, and `/arch
 validates the request *before* the key, explains a missing key, builds the area-API URL in
 west,south,east,north order, and merges rows while dropping anything outside the AOI.
 
-**`test_archives.py` (41)** covers the local-archive picker against a purpose-built fixture
+**`test_archives.py` (42)** covers the local-archive picker against a purpose-built fixture
 directory — three archives over two instruments, one of them an S-NPP export that names its
 platform: the inventory order (smallest first) and its labels, that no filesystem path reaches
 the response, that no archive at all is an empty list rather than an error, that a CSV which is

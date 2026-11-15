@@ -629,8 +629,9 @@ def list_datasets():
 
 
 @app.post("/datasets/load")
-def load_dataset(id: str = None, limit: int = None, spread: bool = True, all: bool = False):
-    """Open local archives as the working dataset: one by id, or every archive merged.
+def load_dataset(id: str = None, limit: int = None, spread: bool = True, all: bool = False,
+                 year: int = None):
+    """Open local archives as the working dataset: one by id, one calendar year, or everything.
 
     `limit` is rows *read*, and the reader stops as soon as it has them, so a 1.5 GB file costs
     about what a 50 MB one does. Those rows come from evenly spaced offsets across the whole
@@ -649,11 +650,37 @@ def load_dataset(id: str = None, limit: int = None, spread: bool = True, all: bo
 
     Ids come from GET /datasets and are resolved inside that same inventory: no request value
     is ever joined into a path (see archives.find). POST, so the Origin gate applies.
+
+    `year` is the third way to open the inventory: every archive holding that calendar year,
+    merged under the same budget as `all`, then cut to the year's rows. It is an int, so it can
+    never reach the filesystem; it wins over `id`/`all` when both are sent. A year that only a
+    regional export holds still opens -- `load.regional_only` says so rather than hiding it.
     """
     global DF, _LOAD_INFO
     pulled = (True, "")                  # only overwritten when the bucket was actually asked
     items = archives.scan_all(ARCHIVE_ROOTS)
-    if all:
+    regional_only = False
+    if year is not None:
+        # Coverage is what knows which files hold the year; it is sampled and cached, so this
+        # costs the listing's usual price rather than a read of every file.
+        if not items and ARCHIVE_ROOTS:
+            pulled = archives.hf_pull(ARCHIVE_ROOTS[0])
+            items = archives.scan_all(ARCHIVE_ROOTS)
+        items = archives.attach_coverage(items)
+
+        def holds(item, allow_thin):
+            return any(entry.get("year") == year and (allow_thin or not entry.get("thin"))
+                       for entry in (item.get("coverage") or {}).get("years") or [])
+
+        picked = [item for item in items if holds(item, False)]      # a global record first
+        if not picked:
+            picked = [item for item in items if holds(item, True)]   # only regional windows left
+            regional_only = bool(picked)
+        if not picked:
+            raise HTTPException(400, f"no archive holds {year}; list them with GET /datasets"
+                                     + _bucket_note(pulled))
+        items, merged = picked, True
+    elif all:
         if not items and ARCHIVE_ROOTS:
             pulled = archives.hf_pull(ARCHIVE_ROOTS[0])   # fresh clone: the bucket is the source
             items = archives.scan_all(ARCHIVE_ROOTS)
@@ -695,6 +722,14 @@ def load_dataset(id: str = None, limit: int = None, spread: bool = True, all: bo
         raise HTTPException(400, f"no usable rows in {sliced['rows']:,} of the "
                                  f"{len(sliced.get('files') or [items[0]])} archive(s) read "
                                  "(all low-confidence or not FIRMS columns)")
+    if year is not None:
+        # The slice is spread across each file's whole span, so it holds the year only in
+        # proportion to how much of the file the year is; cut it here, before the dedupe and
+        # the cap, or a merged record would answer a one-year question with other years' days.
+        parts = [h[h["date"].dt.year == year] for h in parts]
+        parts = [h for h in parts if not h.empty]
+        if not parts:
+            raise HTTPException(400, f"no usable rows for {year}")
     DF = pd.concat(parts).drop_duplicates(["lat", "lon", "time", "sensor"]).reset_index(drop=True)
     if len(DF) > MAX_ROWS:
         DF = DF.tail(MAX_ROWS).reset_index(drop=True)
@@ -721,6 +756,10 @@ def load_dataset(id: str = None, limit: int = None, spread: bool = True, all: bo
             "file": item["name"], "sensor": item["sensor"], "kind": item["kind"],
             "mb": item["mb"], "capped": sliced["capped"],
         })
+    if year is not None:
+        _LOAD_INFO["year"] = year
+        if regional_only:
+            _LOAD_INFO["regional_only"] = True
     return meta()
 
 
