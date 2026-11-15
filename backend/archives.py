@@ -50,7 +50,7 @@ SENSORS = {
 # The bucket this console also reads from. The bucket is the source and `<root>/hf` the
 # destination, so a machine with no `.data/` (every fresh clone, every CI run with network)
 # still has the harmonized year to open -- the database case.
-HF_BUCKET = "hf://buckets/hriishiibanerjee/FIRMS_DATA"
+HF_BUCKET = "hf://buckets/hriishiibanerjee/FIRMS_DEMO"
 HF_BUCKET_PREFIX = "hf://buckets/"    # the spelling both the CLI and the client accept
 HF_BUCKET_ENV = "FIRECAL_HF_BUCKET"   # point at another bucket without editing this file
 HF_CACHE = "hf"                       # cache dir name under a root; inventoried like the rest

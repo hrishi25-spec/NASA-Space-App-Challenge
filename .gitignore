@@ -38,3 +38,6 @@ github setup/
 .DS_Store
 Thumbs.db
 *.swp
+.data
+demo/
+data_raw/
