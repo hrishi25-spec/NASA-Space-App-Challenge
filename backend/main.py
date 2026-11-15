@@ -319,6 +319,7 @@ def cached(func):
     """
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
+        ensure_autoloaded()
         key = (func.__name__, args, tuple(sorted(kwargs.items())))
         hit = _AGG_CACHE.get(key)
         if hit is not None:
@@ -486,6 +487,12 @@ def ensure_harmonized(raw: pd.DataFrame) -> pd.DataFrame:
     """
     cols = {str(c).strip().lower() for c in raw.columns}
     if {"lat", "lon", "time", "date", "sensor", "conf"} <= cols:
+        if not pd.api.types.is_datetime64_any_dtype(raw["date"]):
+            raw = raw.copy()
+            raw["date"] = pd.to_datetime(raw["date"])
+        if not pd.api.types.is_datetime64_any_dtype(raw["time"]):
+            raw = raw.copy()
+            raw["time"] = pd.to_datetime(raw["time"])
         return raw
     return harmonize(raw)
 
@@ -522,7 +529,7 @@ async def _read_capped(f: UploadFile, limit: int) -> bytes:
 
 @app.post("/upload")
 async def upload(files: list[UploadFile] = File(...), demo_transition: bool = False):
-    global DF
+    global DF, _USER_CLEARED
     if not files:
         raise HTTPException(400, "No files uploaded")
     if len(files) > MAX_UPLOAD_FILES:
@@ -582,6 +589,7 @@ async def upload(files: list[UploadFile] = File(...), demo_transition: bool = Fa
     if len(DF) > MAX_ROWS:
         DF = DF.tail(MAX_ROWS).reset_index(drop=True)
     _invalidate()
+    _USER_CLEARED = False
     # A fact about *this* response, not about the dataset: `_invalidate()` has just cleared the
     # dataset's own note, so `upload` rides on this body only and a later `GET /meta` does not
     # carry it (unlike `load`, which describes the archive the record was opened from).
@@ -610,8 +618,10 @@ def list_datasets():
     The picker the console opens on. Absolute paths are not in the response: a relative id and
     a byte count are all a caller needs, and a path is not a thing to publish. An empty local
     folder is the normal answer on a fresh clone and in the container image, where the archives
-    (10 GB, git-ignored) simply are not there -- in that case the Hugging Face bucket is pulled
-    first (archives.hf_pull), because the shared record is the database of last resort.
+    (10 GB, git-ignored) simply are not there -- in that case the Hugging Face bucket is checked.
+    In streaming mode (FIRECAL_HF_MODE=stream, or automatically when the cache root is read-only),
+    the bucket's parquet files are listed directly with metadata and coverage taken from the
+    parquet footer, without downloading the files to disk.
 
     Every entry also carries a `coverage` block: per calendar year, the latitude/longitude box,
     the 2° cells and the row counts that year actually holds, and across the inventory a
@@ -622,9 +632,15 @@ def list_datasets():
     archives, so the listing stays quick; a file that cannot be sampled says why in place.
     """
     items = archives.scan_all(ARCHIVE_ROOTS)
-    if not items and ARCHIVE_ROOTS:
-        archives.hf_pull(ARCHIVE_ROOTS[0])       # nothing local: fetch the bucket, rescan
-        items = archives.scan_all(ARCHIVE_ROOTS)
+    if not items:
+        mode = archives.hf_mode(ARCHIVE_ROOTS[0] if ARCHIVE_ROOTS else None)
+        if mode == "stream":
+            items = archives.scan_remote_bucket()
+        elif ARCHIVE_ROOTS:
+            archives.hf_pull(ARCHIVE_ROOTS[0])       # nothing local: fetch the bucket, rescan
+            items = archives.scan_all(ARCHIVE_ROOTS)
+            if not items:
+                items = archives.scan_remote_bucket()
     return {"items": [archives.public(item) for item in archives.attach_coverage(items)]}
 
 
@@ -656,16 +672,23 @@ def load_dataset(id: str = None, limit: int = None, spread: bool = True, all: bo
     never reach the filesystem; it wins over `id`/`all` when both are sent. A year that only a
     regional export holds still opens -- `load.regional_only` says so rather than hiding it.
     """
-    global DF, _LOAD_INFO
+    global DF, _LOAD_INFO, _USER_CLEARED
     pulled = (True, "")                  # only overwritten when the bucket was actually asked
     items = archives.scan_all(ARCHIVE_ROOTS)
     regional_only = False
+    mode = archives.hf_mode(ARCHIVE_ROOTS[0] if ARCHIVE_ROOTS else None)
+
     if year is not None:
         # Coverage is what knows which files hold the year; it is sampled and cached, so this
         # costs the listing's usual price rather than a read of every file.
-        if not items and ARCHIVE_ROOTS:
-            pulled = archives.hf_pull(ARCHIVE_ROOTS[0])
-            items = archives.scan_all(ARCHIVE_ROOTS)
+        if not items:
+            if mode == "stream":
+                items = archives.scan_remote_bucket()
+            elif ARCHIVE_ROOTS:
+                pulled = archives.hf_pull(ARCHIVE_ROOTS[0])
+                items = archives.scan_all(ARCHIVE_ROOTS)
+                if not items:
+                    items = archives.scan_remote_bucket()
         items = archives.attach_coverage(items)
 
         def holds(item, allow_thin):
@@ -679,33 +702,56 @@ def load_dataset(id: str = None, limit: int = None, spread: bool = True, all: bo
         if not picked:
             raise HTTPException(400, f"no archive holds {year}; list them with GET /datasets"
                                      + _bucket_note(pulled))
-        items, merged = picked, True
+        items, merged = picked, len(picked) > 1
     elif all:
-        if not items and ARCHIVE_ROOTS:
-            pulled = archives.hf_pull(ARCHIVE_ROOTS[0])   # fresh clone: the bucket is the source
-            items = archives.scan_all(ARCHIVE_ROOTS)
+        if not items:
+            if mode == "stream":
+                items = archives.scan_remote_bucket()
+            elif ARCHIVE_ROOTS:
+                pulled = archives.hf_pull(ARCHIVE_ROOTS[0])   # fresh clone: the bucket is the source
+                items = archives.scan_all(ARCHIVE_ROOTS)
+                if not items:
+                    items = archives.scan_remote_bucket()
         if not items:
             raise HTTPException(400, "no local archives to merge; list them with GET /datasets"
                                      + _bucket_note(pulled))
-        merged = True
+        merged = len(items) > 1
     else:
         item = archives.find(items, id or "")
-        if item is None and ARCHIVE_ROOTS:
-            # Not on disk: pull the Hugging Face bucket and resolve again -- the database
-            # answers on demand, so an id nobody has ever downloaded here is still openable.
-            pulled = archives.hf_pull(ARCHIVE_ROOTS[0])
-            items = archives.scan_all(ARCHIVE_ROOTS)
-            item = archives.find(items, id or "")
+        if item is None:
+            if mode == "stream":
+                items = archives.scan_remote_bucket()
+                item = archives.find(items, id or "")
+            elif ARCHIVE_ROOTS:
+                # Not on disk: pull the Hugging Face bucket and resolve again -- the database
+                # answers on demand, so an id nobody has ever downloaded here is still openable.
+                pulled = archives.hf_pull(ARCHIVE_ROOTS[0])
+                items = archives.scan_all(ARCHIVE_ROOTS)
+                item = archives.find(items, id or "")
+                if item is None:
+                    items = archives.scan_remote_bucket()
+                    item = archives.find(items, id or "")
         if item is None:
             raise HTTPException(404, "no such local archive; list them with GET /datasets"
                                      + _bucket_note(pulled))
         items, merged = [item], False
-    limit = min(max(limit or (MAX_ROWS if merged else archives.DEFAULT_LIMIT),
-                    archives.MIN_LIMIT), MAX_ROWS)
+
+    is_remote = any(it.get("_remote") for it in items)
+    default_limit = archives.remote_limit() if is_remote else (MAX_ROWS if merged else archives.DEFAULT_LIMIT)
+    limit = min(max(limit or default_limit, archives.MIN_LIMIT), MAX_ROWS)
     if not _LOAD_SLOTS.acquire(blocking=False):
         raise HTTPException(429, "another archive is opening; retry in a moment")
     try:
-        if merged:
+        if is_remote:
+            try:
+                sliced = archives.read_remote_slice(items[0], limit, spread=spread)
+            except ValueError as e:
+                if "already running" in str(e) or "in progress" in str(e):
+                    raise HTTPException(429, str(e))
+                raise HTTPException(400, f"{items[0]['name']}: remote read failed ({e})")
+            except Exception as e:
+                raise HTTPException(400, f"{items[0]['name']}: remote read failed ({e})")
+        elif merged:
             sliced = archives.read_merge(items, limit, spread=spread)
         else:
             try:
@@ -734,6 +780,7 @@ def load_dataset(id: str = None, limit: int = None, spread: bool = True, all: bo
     if len(DF) > MAX_ROWS:
         DF = DF.tail(MAX_ROWS).reset_index(drop=True)
     _invalidate()
+    _USER_CLEARED = False
     # `rows_estimate` is measured from each file's size and its own record width, and the console
     # prints it as the approximate total the slice came out of: the difference between the three
     # weeks it holds and the year it does not is exactly what an operator would otherwise
@@ -743,6 +790,21 @@ def load_dataset(id: str = None, limit: int = None, spread: bool = True, all: bo
         "rows_estimate": sliced["estimate"], "spread": sliced["spread"],
         "limit": limit, "merged": merged,
     }
+    if merged:
+        sensors = sorted({entry["sensor"] for entry in sliced["files"]})
+        _LOAD_INFO.update({
+            "file": f"{len(sliced['files'])} archives · {len(sensors)} sensors",
+            "sensors": sensors, "archives": len(sliced["files"]),
+            "files": sliced["files"], "skipped": sliced["skipped"],
+        })
+    else:
+        item = items[0]
+        _LOAD_INFO.update({
+            "file": item["name"], "sensor": item["sensor"], "kind": item["kind"],
+            "mb": item["mb"], "capped": sliced["capped"],
+        })
+    if year is not None:
+        _LOAD_INFO["year"] = year
     if merged:
         sensors = sorted({entry["sensor"] for entry in sliced["files"]})
         _LOAD_INFO.update({
@@ -773,12 +835,13 @@ def demo(mode: str = "standard", region: str = None):
     the test suite is built on, and it keeps `/demo` a documented API endpoint rather than a
     hidden path in the code. `region` scopes it to a preset AOI, so the panels have something to
     show for any region in the catalog."""
-    global DF
+    global DF, _USER_CLEARED
     if region is not None and region not in REGIONS:
         raise HTTPException(400, f"unknown region {region!r}; expected one of: {region_keys()}")
     frames = _transition_frames(region) if mode == "transition" else _demo_frames(region)
     DF = pd.concat(frames).reset_index(drop=True)
     _invalidate()
+    _USER_CLEARED = False
     return meta()
 
 
@@ -871,13 +934,113 @@ def archive(region: str = None, bbox: str = None, source: str = "VIIRS_S-NPP",
     return m
 
 
+AUTOLOAD_ENV = "FIRECAL_AUTOLOAD"
+AUTOLOAD_TIMEOUT_ENV = "FIRECAL_AUTOLOAD_TIMEOUT"
+DEFAULT_AUTOLOAD_TIMEOUT = 15.0
+
+_USER_CLEARED = False
+_AUTOLOAD_LOCK = threading.Lock()
+_AUTOLOAD_FAILED_AT = 0.0
+_AUTOLOAD_FAIL_REASON = ""
+
+
+def is_autoload_enabled() -> bool:
+    """Whether FIRECAL_AUTOLOAD is enabled ('1')."""
+    return os.environ.get(AUTOLOAD_ENV, "").strip() == "1"
+
+
+def ensure_autoloaded() -> None:
+    """Lazy single-flight autoload of the default bucket parquet on first need.
+
+    Called before data endpoints. When FIRECAL_AUTOLOAD=1 and local archives are empty,
+    loads the default bucket parquet. Concurrent requests wait on the lock rather than
+    starting a second load. If the wait times out, answers 503 with Retry-After.
+    DELETE /data sets _USER_CLEARED so cleared data is not resurrected.
+    """
+    global DF, _LOAD_INFO, _USER_CLEARED, _AUTOLOAD_FAILED_AT, _AUTOLOAD_FAIL_REASON
+    if not is_autoload_enabled() or _USER_CLEARED:
+        return
+    if not DF.empty:
+        return
+
+    # Check if local archives exist
+    local_items = archives.scan_all(ARCHIVE_ROOTS)
+    if local_items:
+        return
+
+    try:
+        timeout = float(os.environ.get(AUTOLOAD_TIMEOUT_ENV, DEFAULT_AUTOLOAD_TIMEOUT))
+    except (ValueError, TypeError):
+        timeout = DEFAULT_AUTOLOAD_TIMEOUT
+
+    if not _AUTOLOAD_LOCK.acquire(timeout=timeout):
+        raise HTTPException(status_code=503, detail="Dataset autoload in progress; retry in a moment",
+                            headers={"Retry-After": "3"})
+    try:
+        if not DF.empty or _USER_CLEARED:
+            return
+        if _AUTOLOAD_FAILED_AT and time.monotonic() - _AUTOLOAD_FAILED_AT < archives.REMOTE_FAILURE_TTL:
+            raise HTTPException(status_code=503,
+                                detail=f"Dataset autoload failed: {_AUTOLOAD_FAIL_REASON}; retry in a moment",
+                                headers={"Retry-After": "60"})
+
+        items = archives.scan_remote_bucket()
+        if not items:
+            _AUTOLOAD_FAILED_AT = time.monotonic()
+            _AUTOLOAD_FAIL_REASON = "no remote bucket parquet files found"
+            raise HTTPException(status_code=503,
+                                detail=f"Dataset autoload failed: {_AUTOLOAD_FAIL_REASON}; retry in a moment",
+                                headers={"Retry-After": "10"})
+
+        item = items[0]
+        limit = archives.remote_limit()
+        sliced = archives.read_remote_slice(item, limit, spread=True)
+        parts = [h for h in (ensure_harmonized(frame) for frame in sliced["frames"]) if not h.empty]
+        if not parts:
+            _AUTOLOAD_FAILED_AT = time.monotonic()
+            _AUTOLOAD_FAIL_REASON = "no usable rows in remote parquet"
+            raise HTTPException(status_code=503,
+                                detail=f"Dataset autoload failed: {_AUTOLOAD_FAIL_REASON}; retry in a moment",
+                                headers={"Retry-After": "10"})
+
+        DF = pd.concat(parts).drop_duplicates(["lat", "lon", "time", "sensor"]).reset_index(drop=True)
+        if len(DF) > MAX_ROWS:
+            DF = DF.tail(MAX_ROWS).reset_index(drop=True)
+        _invalidate()
+        _USER_CLEARED = False
+        _AUTOLOAD_FAILED_AT = 0.0
+        _AUTOLOAD_FAIL_REASON = ""
+        _LOAD_INFO = {
+            "rows_read": sliced["rows"], "rows_kept": int(len(DF)),
+            "rows_estimate": sliced["estimate"], "spread": sliced["spread"],
+            "limit": limit, "merged": False,
+            "file": item["name"], "sensor": item["sensor"], "kind": item["kind"],
+            "mb": item["mb"], "capped": sliced["capped"],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        _AUTOLOAD_FAILED_AT = time.monotonic()
+        _AUTOLOAD_FAIL_REASON = str(e)
+        raise HTTPException(status_code=503,
+                            detail=f"Dataset autoload failed: {e}; retry in a moment",
+                            headers={"Retry-After": "5"}) from e
+    finally:
+        _AUTOLOAD_LOCK.release()
+
+
 @app.delete("/data")
 def clear():
-    global DF; DF = EMPTY_DF.copy(); _invalidate(); return meta()
+    global DF, _USER_CLEARED
+    DF = EMPTY_DF.copy()
+    _USER_CLEARED = True
+    _invalidate()
+    return meta()
 
 
 @app.get("/meta")
 def meta():
+    ensure_autoloaded()
     # `live_regions` rides along so the console's live panel offers exactly the allowlist
     # this server enforces. The two were separate hand-kept lists, which is a 400 waiting
     # for whoever edits one of them.
@@ -1744,8 +1907,9 @@ def forecast(bbox: str = None, horizon: int = 30):
     days = hit["checkpoint"].get("days") or []
     span = _day_spans(days)
     scope = hit["checkpoint"].get("scored_on") or "global"
+    prior_label = prior_name if prior else f"{prior_name} prior"
     payload = {
-        "model": f"LightGBM (global archive model) day(s) {span} · {prior_name} beyond",
+        "model": f"LightGBM (global archive model) day(s) {span} · {prior_label} beyond",
         "method": "blend",
         "model_reason": f"stored backtest earns day(s) {span} of {horizon} on {scope} scores; "
                         f"the rest keeps the seasonal prior",

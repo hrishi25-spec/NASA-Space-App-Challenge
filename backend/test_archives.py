@@ -86,6 +86,8 @@ def bucket_pull_cannot_reach_the_network(monkeypatch):
     monkeypatch.setattr(
         archives, "hf_pull",
         lambda root, timeout=archives.HF_SYNC_TIMEOUT: (False, "tests: bucket is unreachable"))
+    monkeypatch.setattr(archives, "hub_client", lambda: None)
+    monkeypatch.setattr(archives, "hub_fs", lambda token=None: None)
 
 
 # ------------------------------------------------------------------ the inventory
@@ -776,3 +778,266 @@ def test_the_firms_puller_resumes_instead_of_refetching(tmp_path, monkeypatch):
     assert sum(1 for line in second if line.startswith("latitude")) == 1
     assert asked == ["2024-01-01", "2024-01-06", "2024-01-11", "2024-01-16"]
     assert (out / fa.PROGRESS_FILE).is_file()
+
+
+# ------------------------------------------------------------------ remote streaming & autoload
+
+
+def _make_fake_parquet_bytes(num_days=3, per_day=4, row_groups=3):
+    """Generate in-memory zstd-compressed parquet bytes in the harmonized bucket shape."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rows = []
+    origin = pd.Timestamp("2024-10-01")
+    for i in range(num_days * per_day):
+        day = origin + pd.Timedelta(days=i // per_day)
+        rows.append({
+            "lat": float(10 + i % 80),
+            "lon": float(-100 + i % 170),
+            "time": day + pd.Timedelta(hours=10, minutes=15),
+            "date": day,
+            "sensor": "MODIS+VIIRS",
+            "sat": "Terra",
+            "conf": 80.0,
+            "frp": 10.5,
+            "brightness": 320.0,
+            "bt": 320.0,
+            "esfp": 1.0,
+            "pixel_km2": 1.0,
+        })
+    df = pd.DataFrame(rows)
+    table = pa.Table.from_pandas(df)
+    buf = io.BytesIO()
+    group_size = max(1, len(df) // row_groups)
+    pq.write_table(table, buf, row_group_size=group_size, compression="zstd")
+    return buf.getvalue()
+
+
+class _FakeStreamHub:
+    def __init__(self, bucket, files):
+        self.bucket = bucket
+        self.files = files
+
+    def list_bucket_tree(self, bucket, recursive=True, token=None):
+        return self.files
+
+
+class _FakeStreamFs:
+    def __init__(self, data_by_path):
+        self.data_by_path = data_by_path
+
+    def open(self, path, mode="rb"):
+        for k, v in self.data_by_path.items():
+            if k in path:
+                return io.BytesIO(v)
+        raise FileNotFoundError(f"not found: {path}")
+
+
+def test_read_only_root_auto_detection(tmp_path, monkeypatch):
+    """A read-only cache directory (e.g. Vercel serverless /var/task) automatically
+    selects streaming mode without needing FIRECAL_HF_MODE=stream explicitly."""
+    monkeypatch.delenv("FIRECAL_HF_MODE", raising=False)
+    # Writable root -> sync
+    assert archives.is_root_writable(tmp_path) is True
+    assert archives.hf_mode(tmp_path) == "sync"
+
+    # Explicit FIRECAL_HF_MODE=stream
+    monkeypatch.setenv("FIRECAL_HF_MODE", "stream")
+    assert archives.hf_mode(tmp_path) == "stream"
+
+    # Mock unwritable root
+    monkeypatch.delenv("FIRECAL_HF_MODE", raising=False)
+    monkeypatch.setattr(archives, "is_root_writable", lambda root: False)
+    assert archives.hf_mode(tmp_path) == "stream"
+
+
+def test_streaming_listing(tmp_path, monkeypatch):
+    """When local inventory is empty and FIRECAL_HF_MODE=stream, GET /datasets
+    lists bucket parquet files as normal entries without downloading them."""
+    parquet_bytes = _make_fake_parquet_bytes(num_days=3, per_day=4)
+    fake_file = type("File", (), {"type": "file", "path": BUCKET_PARQUET, "size": len(parquet_bytes)})()
+    hub = _FakeStreamHub(archives.bucket_id(), [fake_file])
+    fs = _FakeStreamFs({BUCKET_PARQUET: parquet_bytes})
+
+    monkeypatch.setattr(archives, "hub_client", lambda: hub)
+    monkeypatch.setattr(archives, "hub_fs", lambda token=None: fs)
+    monkeypatch.setattr(main, "ARCHIVE_ROOTS", [tmp_path / ".data"])
+    monkeypatch.setenv("FIRECAL_HF_MODE", "stream")
+
+    archives.forget_bucket_attempts()
+
+    r = client.get("/datasets")
+    assert r.status_code == 200
+    items = r.json()["items"]
+    assert len(items) == 1
+    item = items[0]
+    assert item["id"] == f"hf/{BUCKET_PARQUET}"
+    assert item["sensor"] == "MODIS+VIIRS"
+    assert item["kind"] == "archive"
+    assert item["bytes"] == len(parquet_bytes)
+    assert "years" in item["coverage"]
+    assert len(item["coverage"]["years"]) > 0
+
+    # Ensure nothing was written locally
+    assert not (tmp_path / ".data").exists() or not list((tmp_path / ".data").glob("**/*"))
+
+
+def test_remote_spread_load(tmp_path, monkeypatch):
+    """POST /datasets/load?id=hf/<name> works in streaming mode, populating main.DF
+    within the limit without writing any files locally."""
+    parquet_bytes = _make_fake_parquet_bytes(num_days=5, per_day=10, row_groups=5)
+    fake_file = type("File", (), {"type": "file", "path": BUCKET_PARQUET, "size": len(parquet_bytes)})()
+    hub = _FakeStreamHub(archives.bucket_id(), [fake_file])
+    fs = _FakeStreamFs({BUCKET_PARQUET: parquet_bytes})
+
+    monkeypatch.setattr(archives, "hub_client", lambda: hub)
+    monkeypatch.setattr(archives, "hub_fs", lambda token=None: fs)
+    monkeypatch.setattr(main, "ARCHIVE_ROOTS", [tmp_path / ".data"])
+    monkeypatch.setattr(archives, "MIN_LIMIT", 10)
+    monkeypatch.setenv("FIRECAL_HF_MODE", "stream")
+    monkeypatch.setenv("FIRECAL_REMOTE_LIMIT", "25")
+
+    archives.forget_bucket_attempts()
+
+    # Load remote dataset
+    r = client.post("/datasets/load", params={"id": f"hf/{BUCKET_PARQUET}"})
+    assert r.status_code == 200
+    m = r.json()
+    assert m["n"] <= 25
+    assert m["load"]["rows_kept"] <= 25
+    assert m["load"]["file"] == BUCKET_PARQUET
+    assert len(main.DF) == m["n"]
+    assert not (tmp_path / ".data").exists() or not list((tmp_path / ".data").glob("**/*"))
+
+
+def test_single_flight_autoload(tmp_path, monkeypatch):
+    """When FIRECAL_AUTOLOAD=1 and inventory is empty, data endpoints lazily load
+    the remote bucket parquet with single-flight concurrency lock."""
+    parquet_bytes = _make_fake_parquet_bytes(num_days=3, per_day=4)
+    fake_file = type("File", (), {"type": "file", "path": BUCKET_PARQUET, "size": len(parquet_bytes)})()
+    hub = _FakeStreamHub(archives.bucket_id(), [fake_file])
+    fs = _FakeStreamFs({BUCKET_PARQUET: parquet_bytes})
+
+    monkeypatch.setattr(archives, "hub_client", lambda: hub)
+    monkeypatch.setattr(archives, "hub_fs", lambda token=None: fs)
+    monkeypatch.setattr(main, "ARCHIVE_ROOTS", [tmp_path / ".data"])
+    monkeypatch.setenv("FIRECAL_HF_MODE", "stream")
+    monkeypatch.setenv("FIRECAL_AUTOLOAD", "1")
+
+    # Start cold
+    main.DF = pd.DataFrame()
+    main._USER_CLEARED = False
+    main._invalidate()
+    archives.forget_bucket_attempts()
+
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        f1 = ex.submit(client.get, "/meta")
+        f2 = ex.submit(client.get, "/meta")
+        r1 = f1.result()
+        r2 = f2.result()
+
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert r1.json()["n"] == 12
+    assert r2.json()["n"] == 12
+
+
+def test_autoload_cleared_flag(tmp_path, monkeypatch):
+    """DELETE /data sets the _USER_CLEARED flag so autoload does not resurrect data."""
+    parquet_bytes = _make_fake_parquet_bytes(num_days=3, per_day=4)
+    fake_file = type("File", (), {"type": "file", "path": BUCKET_PARQUET, "size": len(parquet_bytes)})()
+    hub = _FakeStreamHub(archives.bucket_id(), [fake_file])
+    fs = _FakeStreamFs({BUCKET_PARQUET: parquet_bytes})
+
+    monkeypatch.setattr(archives, "hub_client", lambda: hub)
+    monkeypatch.setattr(archives, "hub_fs", lambda token=None: fs)
+    monkeypatch.setattr(main, "ARCHIVE_ROOTS", [tmp_path / ".data"])
+    monkeypatch.setenv("FIRECAL_HF_MODE", "stream")
+    monkeypatch.setenv("FIRECAL_AUTOLOAD", "1")
+
+    # Start cold
+    main.DF = pd.DataFrame()
+    main._USER_CLEARED = False
+    main._invalidate()
+    archives.forget_bucket_attempts()
+
+    # Cold autoload via /meta
+    r = client.get("/meta")
+    assert r.status_code == 200 and r.json()["n"] == 12
+
+    # User explicitly clears data
+    r_del = client.delete("/data", headers={"Origin": "http://testserver"})
+    assert r_del.status_code == 200
+    assert main._USER_CLEARED is True
+    assert len(main.DF) == 0
+
+    # Subsequent /meta must stay empty, NOT resurrect
+    r_after = client.get("/meta")
+    assert r_after.status_code == 200
+    assert r_after.json()["n"] == 0
+
+    # /calendar also returns empty
+    r_cal = client.get("/calendar")
+    assert r_cal.status_code == 200
+    assert r_cal.json() == []
+
+
+def test_autoload_timeout_503(tmp_path, monkeypatch):
+    """If autoload lock cannot be acquired within bounded wait, answer 503 with Retry-After."""
+    monkeypatch.setattr(main, "ARCHIVE_ROOTS", [tmp_path / ".empty"])
+    monkeypatch.setenv("FIRECAL_AUTOLOAD", "1")
+    monkeypatch.setenv("FIRECAL_AUTOLOAD_TIMEOUT", "0.05")
+    main.DF = pd.DataFrame()
+    main._USER_CLEARED = False
+    main._invalidate()
+
+    acquired = main._AUTOLOAD_LOCK.acquire(blocking=False)
+    assert acquired
+    try:
+        r = client.get("/meta")
+        assert r.status_code == 503
+        assert "Retry-After" in r.headers
+        assert r.headers["Retry-After"] == "3"
+        assert "autoload in progress" in r.json()["detail"].lower()
+    finally:
+        main._AUTOLOAD_LOCK.release()
+
+
+def test_no_path_or_token_leaks(tmp_path, monkeypatch):
+    """Responses must not leak local filesystem paths, HF_TOKEN, or credentialed URLs."""
+    secret_token = "hf_secret_token_abcdef123456"
+    monkeypatch.setenv("HF_TOKEN", secret_token)
+    monkeypatch.setenv("FIRECAL_HF_MODE", "stream")
+    monkeypatch.setenv("FIRECAL_AUTOLOAD", "1")
+    monkeypatch.setattr(main, "ARCHIVE_ROOTS", [tmp_path / ".data"])
+
+    parquet_bytes = _make_fake_parquet_bytes(num_days=3, per_day=4)
+    fake_file = type("File", (), {"type": "file", "path": BUCKET_PARQUET, "size": len(parquet_bytes)})()
+    hub = _FakeStreamHub(archives.bucket_id(), [fake_file])
+    fs = _FakeStreamFs({BUCKET_PARQUET: parquet_bytes})
+
+    monkeypatch.setattr(archives, "hub_client", lambda: hub)
+    monkeypatch.setattr(archives, "hub_fs", lambda token=None: fs)
+
+    main.DF = pd.DataFrame()
+    main._USER_CLEARED = False
+    main._invalidate()
+    archives.forget_bucket_attempts()
+
+    for path in ["/datasets", "/meta", "/calendar"]:
+        r = client.get(path)
+        body = r.text
+        assert secret_token not in body
+        assert str(tmp_path) not in body
+        for h_k, h_v in r.headers.items():
+            assert secret_token not in h_v
+            assert str(tmp_path) not in h_v
+
+    # Load endpoint
+    r_load = client.post("/datasets/load", params={"id": f"hf/{BUCKET_PARQUET}"})
+    body = r_load.text
+    assert secret_token not in body
+    assert str(tmp_path) not in body
+

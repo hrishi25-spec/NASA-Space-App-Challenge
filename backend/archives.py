@@ -69,6 +69,15 @@ PULL_FAILURES_MAX = 8                 # bounded: one entry per (destination, buc
 _PULL_LOCK = threading.Lock()
 _PULL_FAILURES: dict[tuple[str, str], tuple[float, tuple[bool, str]]] = {}
 
+# Streaming mode: ranged reads over HTTP directly from the bucket without writing to disk.
+HF_MODE_ENV = "FIRECAL_HF_MODE"       # 'stream' or 'sync'; defaults to 'stream' if root not writable
+REMOTE_LIMIT_ENV = "FIRECAL_REMOTE_LIMIT"  # default row cap for remote streaming load
+DEFAULT_REMOTE_LIMIT = 400_000
+REMOTE_FAILURE_TTL = 60.0
+_REMOTE_LOCK = threading.Lock()
+_REMOTE_FAILURES: dict[str, tuple[float, str]] = {}
+_REMOTE_COVERAGE_CACHE: dict[str, dict] = {}
+
 # What a frame must carry to be trusted as this API's record: either a raw FIRMS export or
 # the harmonized shape `harmonize()` produces (what the bucket stores).
 HARMONIZED_COLUMNS = {"lat", "lon", "time", "date", "sensor", "conf"}
@@ -163,6 +172,7 @@ def scan(root: Path) -> list[dict]:
     couple of MB, instant to open), while the area archives are gigabytes. The picker puts the
     ones that open immediately at the top.
     """
+    root = Path(root)
     try:
         found = sorted([*root.rglob("*.csv"), *root.rglob("*.parquet")])
     except OSError:                                   # unreadable or not a directory
@@ -201,6 +211,8 @@ def find(items: list[dict], dataset_id: str) -> dict | None:
     for item in items:
         if item["id"] != dataset_id:
             continue
+        if item.get("_remote"):
+            return item
         path = item["_path"].resolve()
         if not path.is_relative_to(item["_root"]):
             return None
@@ -291,7 +303,7 @@ def _read_spread(path: Path, columns: list[str], per_step: int, steps: int, size
     return frames, sum(len(frame) for frame in frames)
 
 
-def _read_parquet(path: Path, limit: int, spread: bool = True) -> dict:
+def _read_parquet(path, limit: int, spread: bool = True) -> dict:
     """`limit` rows from a parquet file -- columnar, so the byte-seek games are unnecessary.
 
     A parquet read is already bounded by row groups: the sequential branch pulls batches until
@@ -303,7 +315,7 @@ def _read_parquet(path: Path, limit: int, spread: bool = True) -> dict:
     """
     import pyarrow.parquet as pq
     try:
-        pf = pq.ParquetFile(path)
+        pf = path if isinstance(path, pq.ParquetFile) else pq.ParquetFile(path)
     except Exception as e:
         raise ValueError(f"unreadable parquet: {e}") from e
     columns = [field.name for field in pf.schema_arrow]
@@ -482,6 +494,234 @@ def _pull_with_client(hub, bucket: str, dest: Path) -> tuple[bool, str]:
 def forget_bucket_attempts():
     """Forget what the last pulls answered. The suite calls this between fake buckets."""
     _PULL_FAILURES.clear()
+    _REMOTE_FAILURES.clear()
+    _REMOTE_COVERAGE_CACHE.clear()
+
+
+def remote_limit() -> int:
+    """Row cap for a remote streaming load: FIRECAL_REMOTE_LIMIT or 400,000."""
+    try:
+        return int(os.environ.get(REMOTE_LIMIT_ENV, DEFAULT_REMOTE_LIMIT))
+    except (ValueError, TypeError):
+        return DEFAULT_REMOTE_LIMIT
+
+
+def is_root_writable(root: Path) -> bool:
+    """Check if a directory (or its nearest existing parent) is writable."""
+    try:
+        target = Path(root)
+        while not target.exists() and target.parent != target:
+            target = target.parent
+        if not os.access(target, os.W_OK):
+            return False
+        test_dir = root if root.is_dir() else target
+        test_file = test_dir / f".write_test_{os.getpid()}_{threading.get_ident()}.tmp"
+        try:
+            test_file.touch(exist_ok=True)
+            test_file.unlink(missing_ok=True)
+            return True
+        except OSError:
+            return False
+    except Exception:
+        return False
+
+
+def hf_mode(root: Path | None = None) -> str:
+    """'stream' or 'sync'. FIRECAL_HF_MODE wins; falls back to 'stream' if root is read-only."""
+    env = (os.environ.get(HF_MODE_ENV) or "").strip().lower()
+    if env in ("stream", "streaming"):
+        return "stream"
+    if env in ("sync", "pull"):
+        return "sync"
+    if root is not None and not is_root_writable(root):
+        return "stream"
+    return "sync"
+
+
+def hub_fs():
+    """`HfFileSystem` instance configured with HF_TOKEN (if present)."""
+    try:
+        from huggingface_hub import HfFileSystem
+    except ImportError:
+        return None
+    token = os.environ.get("HF_TOKEN") or None
+    return HfFileSystem(token=token)
+
+
+def remote_file_coverage(pf, bucket_file_name: str) -> dict:
+    """Coverage sampled from remote parquet footer and row groups without downloading whole file."""
+    if bucket_file_name in _REMOTE_COVERAGE_CACHE:
+        return _REMOTE_COVERAGE_CACHE[bucket_file_name]
+
+    total = pf.metadata.num_rows
+    groups = pf.metadata.num_row_groups
+    cols = [field.name for field in pf.schema_arrow]
+    lat_col = "latitude" if "latitude" in cols else "lat" if "lat" in cols else None
+    lon_col = "longitude" if "longitude" in cols else "lon" if "lon" in cols else None
+    date_col = next((c for c in ("time", "acq_date", "date") if c in cols), None)
+    if not lat_col or not lon_col or not date_col:
+        cov = {"unavailable": "no latitude/longitude/date columns", "years": [], "thin_years": []}
+        _REMOTE_COVERAGE_CACHE[bucket_file_name] = cov
+        return cov
+
+    sample_steps = min(4, groups)
+    chosen_groups = _spread_groups(pf, cols, sample_steps) if sample_steps > 1 else [0]
+
+    frames = []
+    need_cols = [lat_col, lon_col, date_col]
+    for g in chosen_groups:
+        try:
+            part = pf.read_row_group(g, columns=need_cols).to_pandas()
+            frames.append(part)
+        except Exception:
+            continue
+
+    frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if frame.empty:
+        cov = {"unavailable": "no rows read in sample", "years": [], "thin_years": []}
+        _REMOTE_COVERAGE_CACHE[bucket_file_name] = cov
+        return cov
+
+    lat = pd.to_numeric(frame[lat_col], errors="coerce")
+    lon = pd.to_numeric(frame[lon_col], errors="coerce")
+    when = pd.to_datetime(frame[date_col], errors="coerce")
+    ok = lat.notna() & lon.notna() & when.notna()
+    lat, lon, when = lat[ok].to_numpy(float), lon[ok].to_numpy(float), when[ok]
+    if not len(lat):
+        cov = {"unavailable": "no usable rows in sample", "years": [], "thin_years": []}
+        _REMOTE_COVERAGE_CACHE[bucket_file_name] = cov
+        return cov
+
+    cells = (np.floor((lat + 90.0) / CELL_DEG).astype(np.int64) * int(360 / CELL_DEG)
+             + np.floor((lon + 180.0) / CELL_DEG).astype(np.int64))
+    years = when.dt.year.to_numpy()
+    out = []
+    rows = len(lat)
+    for year in sorted(set(years.tolist())):
+        sel = years == year
+        share = float(sel.sum()) / len(years)
+        out.append({
+            "year": int(year),
+            "rows_sampled": int(sel.sum()),
+            "rows_estimate": int(round(total * share)),
+            "lat": [round(float(lat[sel].min()), 2), round(float(lat[sel].max()), 2)],
+            "lon": [round(float(lon[sel].min()), 2), round(float(lon[sel].max()), 2)],
+            "cells": int(np.unique(cells[sel]).size),
+        })
+    cov = {
+        "sampled": rows < total,
+        "rows_sampled": int(rows),
+        "rows_estimate": int(total),
+        "years": out,
+        "thin_years": [],
+    }
+    _REMOTE_COVERAGE_CACHE[bucket_file_name] = cov
+    return cov
+
+
+def scan_remote_bucket(bucket: str | None = None) -> list[dict]:
+    """List parquet files in the bucket without downloading them.
+
+    Takes size, schema and coverage from the parquet footer and sampled row groups.
+    A failed listing is remembered for REMOTE_FAILURE_TTL (60 s).
+    """
+    bucket = bucket or bucket_id()
+    rem = _REMOTE_FAILURES.get(bucket)
+    if rem and time.monotonic() - rem[0] < REMOTE_FAILURE_TTL:
+        return []
+
+    hub = hub_client()
+    if hub is None:
+        _REMOTE_FAILURES[bucket] = (time.monotonic(), f"{bucket}: no huggingface_hub client")
+        return []
+
+    token = os.environ.get("HF_TOKEN") or None
+    try:
+        files = [item for item in hub.list_bucket_tree(bucket, recursive=True, token=token)
+                 if getattr(item, "type", "file") == "file" and item.path.lower().endswith(".parquet")]
+    except Exception as e:
+        _REMOTE_FAILURES[bucket] = (time.monotonic(), f"{bucket}: {type(e).__name__}: {str(e)[:300]}")
+        return []
+
+    if not files:
+        return []
+
+    fs = hub_fs()
+    if fs is None:
+        _REMOTE_FAILURES[bucket] = (time.monotonic(), f"{bucket}: cannot instantiate HfFileSystem")
+        return []
+
+    items = []
+    for f in sorted(files, key=lambda x: getattr(x, "size", 0) or 0):
+        name = Path(f.path).name
+        low = name.lower()
+        stem = name[:-8] if low.endswith(".parquet") else name
+        parts = stem.split("_")
+        kind = KINDS.get(parts[1], parts[1]) if len(parts) > 1 else "archive"
+        code = parts[2] if len(parts) > 2 else ""
+        sensor = SENSORS.get(code, code or "MODIS+VIIRS")
+        download = parts[3] if len(parts) > 3 else ""
+        label = f"{sensor} · {kind}" + (f" · {download}" if download else "")
+        size = getattr(f, "size", 0) or 0
+
+        remote_path = f"buckets/{bucket}/{f.path}"
+        coverage = None
+        if f.path in _REMOTE_COVERAGE_CACHE:
+            coverage = _REMOTE_COVERAGE_CACHE[f.path]
+        else:
+            try:
+                with fs.open(remote_path, "rb") as fh:
+                    import pyarrow.parquet as pq
+                    pf = pq.ParquetFile(fh)
+                    coverage = remote_file_coverage(pf, f.path)
+            except Exception as e:
+                coverage = {"unavailable": f"{type(e).__name__}: {str(e)[:200]}", "years": [], "thin_years": []}
+
+        items.append({
+            "id": f"hf/{name}",
+            "name": name,
+            "folder": "hf",
+            "root": "hf",
+            "sensor": sensor,
+            "kind": kind,
+            "label": label,
+            "bytes": size,
+            "mb": round(size / 1e6),
+            "coverage": coverage,
+            "_remote": True,
+            "_bucket": bucket,
+            "_name": f.path,
+        })
+    return items
+
+
+def read_remote_slice(item: dict, limit: int, spread: bool = True) -> dict:
+    """Read a bounded slice from a remote parquet file in the bucket over HTTP."""
+    bucket = item.get("_bucket") or bucket_id()
+    rem = _REMOTE_FAILURES.get(bucket)
+    if rem and time.monotonic() - rem[0] < REMOTE_FAILURE_TTL:
+        raise ValueError(f"remote load previously failed: {rem[1]}")
+
+    fs = hub_fs()
+    if fs is None:
+        raise ValueError("huggingface_hub is not available for streaming")
+
+    if not _REMOTE_LOCK.acquire(blocking=False):
+        raise ValueError("another remote load is already running; retry in a moment")
+
+    try:
+        remote_path = f"buckets/{bucket}/{item['_name']}"
+        with fs.open(remote_path, "rb") as fh:
+            import pyarrow.parquet as pq
+            pf = pq.ParquetFile(fh)
+            sliced = _read_parquet(pf, limit, spread=spread)
+            _REMOTE_FAILURES.pop(bucket, None)
+            return sliced
+    except Exception as e:
+        _REMOTE_FAILURES[bucket] = (time.monotonic(), f"{bucket}: {type(e).__name__}: {str(e)[:300]}")
+        raise
+    finally:
+        _REMOTE_LOCK.release()
 
 
 def hf_pull(root: Path, timeout: int = HF_SYNC_TIMEOUT) -> tuple[bool, str]:
@@ -734,6 +974,10 @@ def attach_coverage(items: list[dict]) -> list[dict]:
     touched: set[Path] = set()
     rows_out: list[dict] = []
     for item in items:
+        if item.get("_remote"):
+            coverage = item.get("coverage") or {"years": [], "thin_years": []}
+            rows_out.append({**item, "coverage": coverage})
+            continue
         root = item["_root"]
         cache = caches.setdefault(root, _read_coverage_cache(root))
         try:
@@ -786,7 +1030,7 @@ def attach_coverage(items: list[dict]) -> list[dict]:
     with COVERAGE_LOCK:
         for root in touched:
             cache = caches[root]
-            keep = {item["id"] for item in rows_out if item["_root"] == root}
+            keep = {item["id"] for item in rows_out if item.get("_root") == root}
             cache["files"] = {k: v for k, v in cache["files"].items() if k in keep}
             _write_coverage_cache(root, cache)
     return rows_out

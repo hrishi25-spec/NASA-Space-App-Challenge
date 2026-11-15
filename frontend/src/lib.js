@@ -8,12 +8,31 @@ const CACHE_MAX = 200;
 
 export function invalidateApiCache() { cache.clear(); }
 
+async function fetchWithRetry(url, options = {}, retries = 5) {
+  let attempt = 0;
+  while (true) {
+    const r = await fetch(url, options);
+    if (r.status === 503 && attempt < retries) {
+      attempt++;
+      const retryHeader = r.headers.get("retry-after");
+      const retrySec = retryHeader ? parseFloat(retryHeader) : null;
+      const delay = (retrySec && !isNaN(retrySec) ? retrySec * 1000 : 1000 * Math.pow(1.5, attempt));
+      await new Promise(res => setTimeout(res, delay));
+      continue;
+    }
+    if (!r.ok) {
+      const msg = await errMsg(r);
+      throw new Error(msg || `${r.status} ${r.statusText}`);
+    }
+    return await r.json();
+  }
+}
+
 export const api = (p, q = {}) => {
   const url = "/api" + p + "?" + new URLSearchParams(Object.entries(q).filter(([, v]) => v != null));
   const hit = cache.get(url);
   if (hit) return hit;
-  const promise = fetch(url)
-    .then(r => { if (!r.ok) throw new Error(r.status + " " + r.statusText); return r.json(); })
+  const promise = fetchWithRetry(url)
     .catch(e => { cache.delete(url); throw e; });   // a failure must never be cached
   cache.set(url, promise);
   if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);

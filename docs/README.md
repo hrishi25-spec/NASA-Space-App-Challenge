@@ -10,5 +10,6 @@
 | [AGENTS.md](AGENTS.md) | House rules for AI coding agents working in this repository |
 | [decisions/](decisions/) | Architecture Decision Records — why the repo is arranged this way |
 | [decisions/0005-flatten-repository-layout.md](decisions/0005-flatten-repository-layout.md) | Why `firecal/` was removed and backend/frontend became top-level siblings |
+| [decisions/0006-huggingface-streaming-and-stateless-instances.md](decisions/0006-huggingface-streaming-and-stateless-instances.md) | Hugging Face bucket streaming and stateless serverless instances |
 
 Install steps, the API contract and troubleshooting stay in the root [README.md](../README.md).

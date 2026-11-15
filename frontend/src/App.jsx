@@ -139,7 +139,7 @@ function describeUpload(m) {
 }
 
 export default function App() {
-  const [meta, setMeta] = useState({ n: 0 }), [bbox, setBbox] = useState(null), [pick, setPick] = useState(false);
+  const [meta, setMeta] = useState({ n: 0 }), [metaLoading, setMetaLoading] = useState(true), [bbox, setBbox] = useState(null), [pick, setPick] = useState(false);
   const [cal, setCal] = useState([]), [pts, setPts] = useState([]), [cl, setCl] = useState([]), [an, setAn] = useState(null), [fc, setFc] = useState(null);
   const [day, setDay] = useState(null), [span, setSpan] = useState(1), [busy, setBusy] = useState(false), [err, setErr] = useState(null);
   // A month picked from the Anomalies chart ({year, month}), or null. It is a filter on the
@@ -232,7 +232,12 @@ export default function App() {
 
   // ----------------------------------------------------- END URL PARAMETER HANDLING -------
 
-  useEffect(() => { api("/meta").then(setMeta).catch(() => { /* intro card covers the down state */ }); }, []);
+  useEffect(() => {
+    setMetaLoading(true);
+    api("/meta")
+      .then(m => { setMeta(m); setMetaLoading(false); })
+      .catch(() => { setMetaLoading(false); /* intro card covers the down state */ });
+  }, []);
   useEffect(() => { api("/regions").then(setRegions).catch(() => setRegions([])); }, []);
   // The FIRMS archives on this machine. `null` until the listing arrives, so the opening card
   // can say it is still looking instead of claiming there are none.
@@ -344,7 +349,12 @@ export default function App() {
     try {
       const r = await fetch("/api/upload", { method: "POST", body: fd });
       if (!r.ok) setErr("Upload failed: " + await errMsg(r));
-      else { const m = await r.json(); datasetChanged(m); setUploadNote(describeUpload(m)); }
+      else {
+        const m = await r.json();
+        datasetChanged(m);
+        const desc = describeUpload(m);
+        setUploadNote(desc ? `${desc} — Note: on serverless, uploads live in instance memory and may not persist across instances.` : null);
+      }
     } catch { setErr("Upload failed — could not reach the backend."); }
     setBusy(false); e.target.value = "";
   }
@@ -375,7 +385,7 @@ export default function App() {
         <span>WINDOW <b>{meta.start} → {meta.end}</b></span>
         <span>SENSORS <b>{Object.entries(meta.sensors).map(([k, v]) => `${k} ${fmt(v)}`).join(" · ")}</b></span>
       </div>}
-      <label className="filebtn">
+      <label className="filebtn" title="Upload NASA FIRMS active-fire CSVs (MODIS C6.1 / VIIRS). Note: on serverless, uploads live in instance memory and may not persist across instances.">
         <input type="file" multiple accept=".csv,.txt" onChange={upload} />
         <button className="btn primary" disabled={busy}>{busy ? "SYNCING…" : "Upload CSVs"}</button>
       </label>
@@ -411,7 +421,7 @@ export default function App() {
     {!meta.n ? <div className="panel" style={{ margin: 18, maxWidth: 760 }}>
       <h3>Standby — choose a dataset</h3>
       <p style={{ margin: "4px 0 10px" }}>Pyro-Harmony harmonizes MODIS + VIIRS active-fire records into one burning-activity calendar: climatology, the Sensor Transition Illusion diagnostic, live FIRMS clustering, and an Incident Commander briefing.</p>
-      {archives === null ? <div className="hint">Looking for FIRMS archives on this machine…</div>
+      {metaLoading || archives === null ? <div className="hint">Loading the shared record from Hugging Face…</div>
         : archives.length ? <>
           <div className="hint" style={{ marginBottom: 8 }}>
             Found {archives.length} FIRMS archive{archives.length === 1 ? "" : "s"} on this machine. Opening one reads a
@@ -465,6 +475,9 @@ export default function App() {
       <div className="hint" style={{ marginTop: 10 }}>
         Upload NASA FIRMS archive CSVs (MODIS C6.1 / VIIRS S-NPP + NOAA-20/21). Confidence scales unified, low-confidence drops,
         per-sensor rescaling over the overlap period, ESFP footprint normalization.
+        <div style={{ marginTop: 4, color: "var(--mut)" }}>
+          Note: On serverless deployments, uploaded data lives in instance memory and may not persist across different instances.
+        </div>
       </div>
     </div> : <>
 

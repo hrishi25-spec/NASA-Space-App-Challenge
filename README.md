@@ -319,7 +319,7 @@ Thin selections answer **`200` with a `note`** rather than failing, and every pa
 │   ├── requirements.txt · requirements-dev.txt
 │   ├── test_smoke.py               ← 73-test API smoke suite
 │   ├── test_security.py            ← 34-test hardening suite
-│   └── test_archives.py            ← 42-test suite for the local-archive picker
+│   └── test_archives.py            ← 49-test suite for the local-archive picker
 └── frontend/
     ├── index.html · package.json · package-lock.json · vite.config.js
     ├── scripts/                    ← four prebuild guards (below)
@@ -346,7 +346,7 @@ scripts/check.sh          # POSIX — scripts\check.bat on Windows
 It runs exactly what CI runs:
 
 ```bash
-# 149 tests, ~2 min: starts the app in-process via TestClient
+# 156 tests, ~2 min: starts the app in-process via TestClient
 cd backend && .venv/bin/pytest -q
 
 # Frontend production build: prebuild runs the four guards, then Vite bundles
@@ -361,7 +361,7 @@ The backend suite needs **no archive and no trained model**; fixtures are built 
 
 - `test_smoke.py` (73): every endpoint end to end, the three CSV encodings, gzip, cache invalidation, region presets, a real FIRMS schema-drift guard, training, the LightGBM forecast and its conformal band.
 - `test_security.py` (34): URL allowlist, upload caps, origin gate, CORS, CSP hosts checked against what the map really loads.
-- `test_archives.py` (42): the picker, the bounded and spread slice reader, the merge, traversal-proof ids, coverage flags and the Hugging Face bucket.
+- `test_archives.py` (49): the picker, the bounded and spread slice reader, the merge, traversal-proof ids, coverage flags and the Hugging Face bucket.
 
 The four zero-dependency **prebuild guards** catch failures no type checker feels:
 
